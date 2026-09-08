@@ -1,0 +1,94 @@
+name: tradetally-local-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tradetally-local-dev-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${DB_USER:?DB_USER must be set in .env.dev}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env.dev}
+      POSTGRES_DB: ${DB_NAME:?DB_NAME must be set in .env.dev}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username=$$POSTGRES_USER --dbname=$$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: /api
+    container_name: tradetally-local-dev-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: ${DB_USER:?DB_USER must be set in .env.dev}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env.dev}
+      DB_NAME: ${DB_NAME:?DB_NAME must be set in .env.dev}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env.dev}
+      BROKER_ENCRYPTION_KEY: ${BROKER_ENCRYPTION_KEY:?BROKER_ENCRYPTION_KEY must be set in .env.dev}
+      VITE_API_URL: /api
+      INSTANCE_NAME: ${INSTANCE_NAME:-TradeTally Local Development}
+      INSTANCE_URL: ${INSTANCE_URL:-http://localhost:8081}
+      APP_URL: ${APP_URL:-http://localhost:8081}
+      BASE_URL: ${BASE_URL:-http://localhost:8081}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8081}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8081,http://localhost:5173}
+      BILLING_ENABLED: "false"
+      FEATURES_BILLING_ENABLED: "false"
+      RUN_MIGRATIONS: ${RUN_MIGRATIONS:-true}
+      ENABLE_BROKER_SYNC_SCHEDULER: "false"
+      ENABLE_TRIAL_EMAILS: "false"
+      ENABLE_RETENTION_EMAILS: "false"
+      ENABLE_BACKUP_SCHEDULER: "false"
+      ENABLE_PRICE_MONITORING: "false"
+      ENABLE_TRADE_ENRICHMENT: "false"
+      ENABLE_JOB_RECOVERY: "false"
+      ENABLE_OPTIONS_SCHEDULER: "false"
+      ENABLE_CATEGORY_SCHEDULER: "false"
+      ENABLE_DIVIDEND_SCHEDULER: "false"
+      ENABLE_EARNINGS_SCHEDULER: "false"
+      ENABLE_NEWS_SCHEDULER: "false"
+      ENABLE_DASHBOARD_CACHE_WARMER: "false"
+      ENABLE_STOCK_SCANNER: "false"
+    ports:
+      - "127.0.0.1:8081:80"
+    volumes:
+      - uploads:/app/backend/uploads
+      - backups:/app/backend/src/data/backups
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/api/v1/server/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+
+  adminer:
+    image: adminer:latest
+    container_name: tradetally-local-dev-adminer
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    ports:
+      - "127.0.0.1:8082:8080"
+
+volumes:
+  postgres-data:
+  uploads:
+  backups:

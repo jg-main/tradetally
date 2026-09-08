@@ -6,11 +6,13 @@ docker-compose.override.yml
 docker-test
 *dev.yaml
 *dev2.yaml
+!docker-compose.custom-dev.yaml
 
 # Secrets and local environment
 .env
 .env.*
 !.env.example
+!.env.dev.example
 *.key
 *.pem
 *.p12
