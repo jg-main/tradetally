@@ -19,7 +19,7 @@ permission:
   websearch: ask
   webfetch: ask
   bash:
-    "*": ask
+    "*": allow
     "git status*": allow
     "git diff*": allow
     "git log*": allow
