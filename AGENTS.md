@@ -164,15 +164,33 @@ At completion, report:
 - Do not commit, push, merge, tag, or rewrite history unless explicitly requested by the user for the current task.
 - Never force-push.
 
-## Kilo agents
+## Kilo development workflow
 
-Project-specific Kilo agents live under `.kilo/agents/`.
+Project-specific Kilo configuration lives under `.kilo/`.
 
-Use them as targeted helpers rather than attempting to run the full requirement in one autonomous pass:
+Use `/dev <task>` as the normal lightweight development workflow. The command runs the `developer` agent, which may delegate bounded tasks to `planning`, `research`, and `reviewer` through Kilo's subagent/task mechanism.
 
-- `quality-lead` — primary milestone implementer for the Quality Profiles project.
-- `quality-backend` — backend/schema/API/evaluator specialist.
-- `quality-frontend` — Vue/UI specialist for profile and trade-quality flows.
-- `quality-reviewer` — read-only requirement/test/safety reviewer.
+Agents:
 
-The repository also contains `.agents/skills/`; preserve those existing skills. They are not a replacement for the project-specific Kilo agent definitions above.
+- `developer` — primary implementation agent and lightweight orchestrator. Project default model: DeepSeek V4 Flash.
+- `planning` — read-only implementation planner. Project default model: GLM 4.7 Flash through OpenRouter.
+- `research` — read-only repository/external research agent. Project default model: MiniMax M3 through OpenRouter.
+- `reviewer` — independent read-only code/requirement reviewer. Project default model: Step 3.7 Flash through OpenRouter.
+
+The project pins model IDs in agent Markdown files, but provider credentials/API keys must remain in the user's global/local Kilo provider configuration and must never be committed to this repository.
+
+The `/dev` workflow is intentionally simple:
+
+```text
+scope
+  -> planning when non-trivial
+  -> targeted research when needed
+  -> developer implementation + tests
+  -> reviewer
+  -> developer fixes + retest
+  -> stop and report
+```
+
+Do not use Kilo's deprecated dedicated Orchestrator mode for this workflow. Full-tool primary agents can delegate directly to subagents.
+
+The repository also contains `.agents/skills/`; preserve those existing skills and use them when relevant. They are complementary to the Kilo agents above.
