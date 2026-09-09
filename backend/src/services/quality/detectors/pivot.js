@@ -107,7 +107,15 @@ function detectPivot({ bars, rangeStartIndex, rangeEndIndex, parameters = {} }) 
   const rangeEnd = Math.min(bars.length - 1, rangeEndIndex);
   const recentStart = Math.max(rangeStartIndex, rangeEnd - recentTouchWindow + 1);
 
-  const allSwingHighs = findSwingHighs(bars, { left: swingLeft, right: swingRight });
+  // Structural swing highs are bounded by rangeEnd: a touch/level candidate is
+  // only confirmed when ALL of its swing_right confirmation bars lie at or
+  // before rangeEnd (D-1). Bars after rangeEnd can never confirm or disqualify
+  // a pivot.
+  const allSwingHighs = findSwingHighs(bars, {
+    left: swingLeft,
+    right: swingRight,
+    maxIndex: rangeEnd
+  });
   const inRangeHighs = allSwingHighs.filter(
     (point) => point.index >= rangeStartIndex && point.index <= rangeEnd
   );

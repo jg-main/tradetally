@@ -34,7 +34,15 @@ function detectedPayload() {
     profileVersion: { id: 'version-1', versionNumber: 1, schemaVersion: 1 },
     setupCriterionKeys: ['leader', 'prior_move', 'base_duration', 'higher_lows', 'range_contraction', 'volume_contraction', 'ma_trend', 'pivot_quality'],
     detectedBaseStart: { date: '2026-03-12', price: 102 },
-    detectedPivot: { date: '2026-03-12', price: 102, detectionConfidence: 'high', method: 'cluster' },
+    detectedPivot: {
+      date: '2026-03-12',
+      price: 102,
+      detectionConfidence: 'high',
+      method: 'cluster',
+      derivedFromBaseStart: '2026-03-12'
+    },
+    pivotBaseStartDate: '2026-03-12',
+    pivotBaseStartSource: 'detected',
     evidence: { symbol: 'TEST', source: 'finnhub', sessionCount: 130 },
     requiredUserInputs: ['leader_confirmed', 'base_start', 'pivot'],
     unavailableEvidence: []
@@ -208,5 +216,106 @@ describe('SetupQualitySection', () => {
     expect(wrapper.text()).toContain('User Adjusted')
     expect(wrapper.get('[data-testid="base-start-date-input"]').element.value).toBe('2026-03-10')
     expect(wrapper.text()).toContain('Draft progress')
+  })
+
+  it('displays profile + version from the persisted evaluation after a reload (no prepare needed)', async () => {
+    const persisted = evaluationResult({
+      profile_name: 'Canonical BO',
+      version_number: 1
+    })
+    mockStoreInstance.evaluations = [persisted]
+    mockStoreInstance.evaluation = persisted
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([persisted])
+
+    const wrapper = mountSection()
+    await flushPromises()
+
+    expect(wrapper.text()).toContain('Canonical BO v1')
+    expect(wrapper.get('[data-testid="setup-grade"]').text()).toBe('A')
+  })
+
+  it('drill-down reads persisted camelCase rawValue/scoringValue aggregate fields', async () => {
+    const persisted = evaluationResult({
+      results: {
+        setup: {
+          score: 75,
+          grade: 'B',
+          compliance: 'PASS',
+          coverage: 100,
+          criterionResults: [
+            {
+              key: 'range_contraction',
+              status: 'PASS',
+              score: 75,
+              required: true,
+              weight: 15,
+              scoringValue: 0.5769,
+              rawValue: 0.5769,
+              message: 'Recent range contracted.',
+              evidence: { contraction_ratio: 0.5769 }
+            }
+          ]
+        }
+      }
+    })
+    mockStoreInstance.evaluations = [persisted]
+    mockStoreInstance.evaluation = persisted
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([persisted])
+
+    const wrapper = mountSection()
+    await flushPromises()
+
+    // rawValue/scoringValue are present in the drill-down (textContent includes
+    // the collapsed <details> payload).
+    expect(wrapper.text()).toContain('0.5769')
+    expect(wrapper.text()).toContain('Recent range contracted.')
+  })
+
+  it('an adjusted Base Start re-detects the Pivot from that Base Start before it can be confirmed', async () => {
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([])
+    mockStoreInstance.prepare
+      .mockResolvedValueOnce(detectedPayload())
+      .mockResolvedValueOnce({
+        ...detectedPayload(),
+        detectedPivot: {
+          date: '2026-03-18',
+          price: 103.5,
+          detectionConfidence: 'high',
+          method: 'cluster',
+          derivedFromBaseStart: '2026-03-10'
+        },
+        pivotBaseStartDate: '2026-03-10',
+        pivotBaseStartSource: 'user_adjusted',
+        evaluation: {
+          id: 'eval-1',
+          status: 'draft',
+          user_inputs: { base_start: { date: '2026-03-10', source: 'user_adjusted' } }
+        }
+      })
+
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-setup"]').trigger('click')
+    await flushPromises()
+
+    // Confirm the detected Base Start first (machine date), then adjust it to
+    // an earlier session.
+    await wrapper.get('[data-testid="adjust-base-start"]').trigger('click')
+    await wrapper.get('[data-testid="base-start-date-input"]').setValue('2026-03-10')
+    await flushPromises()
+
+    // The previously detected Pivot was derived from 2026-03-12, so confirming
+    // it as machine-detected is no longer valid until re-detection.
+    expect(wrapper.find('[data-testid="confirm-pivot"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="detect-pivot-with-base"]').exists()).toBe(true)
+
+    await wrapper.get('[data-testid="detect-pivot-with-base"]').trigger('click')
+    await flushPromises()
+
+    expect(mockStoreInstance.prepare).toHaveBeenLastCalledWith('trade-1', {
+      confirmedBaseStart: { date: '2026-03-10', source: 'user_adjusted' }
+    })
+    expect(wrapper.text()).toContain('103.5')
+    expect(wrapper.get('[data-testid="confirm-pivot"]').exists()).toBe(true)
   })
 })

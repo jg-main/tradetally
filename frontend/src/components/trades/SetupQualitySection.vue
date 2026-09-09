@@ -166,6 +166,7 @@
           </p>
           <div class="mt-2 flex flex-wrap gap-2">
             <button
+              v-if="!pivotNeedsBaseReDetect"
               type="button"
               class="rounded-md bg-primary-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-primary-700"
               data-testid="confirm-pivot"
@@ -180,6 +181,24 @@
               @click="adjustPivot"
             >
               Adjust
+            </button>
+          </div>
+          <div
+            v-if="pivotNeedsBaseReDetect"
+            class="mt-2 flex flex-wrap items-center gap-2 rounded-md bg-amber-50 px-2 py-1.5 text-xs text-amber-800 dark:bg-amber-900/20 dark:text-amber-300"
+          >
+            <span>
+              The detected Pivot was derived from a different Base Start. Re-detect it against the
+              current Base Start before confirming it as machine-detected (or adjust the Pivot
+              manually).
+            </span>
+            <button
+              type="button"
+              class="rounded-md bg-amber-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-amber-700"
+              data-testid="detect-pivot-with-base"
+              @click="detectPivotForConfirmedBase"
+            >
+              Detect Pivot using confirmed Base Start
             </button>
           </div>
         </template>
@@ -339,6 +358,12 @@ const profileLabel = computed(() => {
   if (prep && prep.profile && prep.profileVersion) {
     return `${prep.profile.name} v${prep.profileVersion.versionNumber}`
   }
+  // A persisted evaluation (page reload, no fresh prepare) carries the profile
+  // name/version metadata from the evaluations list endpoint.
+  const ev = evaluation.value
+  if (ev && ev.profile_name && ev.version_number !== undefined && ev.version_number !== null) {
+    return `${ev.profile_name} v${ev.version_number}`
+  }
   return null
 })
 
@@ -347,6 +372,17 @@ const hasPersistedResults = computed(() => !!(evaluation.value && evaluation.val
 
 const canEvaluate = computed(() => {
   return leader.value !== null && !!baseStartInput.value && !!pivotInput.value
+})
+
+// A machine-detected Pivot can only be confirmed as detected_confirmed when it
+// was derived from the currently selected Base Start.
+const pivotNeedsBaseReDetect = computed(() => {
+  const prep = prepared.value
+  const base = baseStartInput.value
+  if (!prep || !base) return false
+  const detected = prep.detectedPivot
+  if (!detected) return false
+  return detected.derivedFromBaseStart !== base.date
 })
 
 const setupSummary = computed(() => {
@@ -408,6 +444,7 @@ function confirmBaseStart() {
   baseStartInput.value = { date: prepared.value.detectedBaseStart.date, source: 'detected_confirmed' }
   baseStartDateInput.value = prepared.value.detectedBaseStart.date
   baseStartAdjusted.value = false
+  realignPivotToBase()
 }
 
 function adjustBaseStart() {
@@ -419,6 +456,41 @@ function adjustBaseStart() {
     baseStartInput.value = { date: baseStartDateInput.value, source: 'user_adjusted' }
   } else {
     baseStartInput.value = null
+  }
+  realignPivotToBase()
+}
+
+// Once the Base Start changes away from the one a confirmed Pivot was derived
+// from, that Pivot confirmation is no longer valid for this evidence context
+// and is cleared until the user re-detects or manually adjusts the Pivot.
+function realignPivotToBase() {
+  const detected = prepared.value && prepared.value.detectedPivot
+  const baseDate = baseStartInput.value && baseStartInput.value.date
+  if (!pivotInput.value) return
+  if (!detected || !baseDate || detected.derivedFromBaseStart !== baseDate) {
+    pivotInput.value = null
+    pivotAdjusted.value = false
+    pivotPriceInput.value = ''
+  }
+}
+
+// Server-side Pivot re-detection against the confirmed/adjusted Base Start on
+// the SAME evidence snapshot (prepare stores the coherent context).
+async function detectPivotForConfirmedBase() {
+  if (!baseStartInput.value || !baseStartInput.value.date) return
+  try {
+    const payload = await store.prepare(props.trade.id, {
+      confirmedBaseStart: {
+        date: baseStartInput.value.date,
+        source: baseStartInput.value.source
+      }
+    })
+    prepared.value = payload
+    pivotInput.value = null
+    pivotAdjusted.value = false
+    pivotPriceInput.value = ''
+  } catch (err) {
+    // store.error is already surfaced in the template
   }
 }
 
@@ -454,6 +526,7 @@ function adjustPivot() {
 watch(baseStartDateInput, (date) => {
   if (baseStartAdjusted.value && date) {
     baseStartInput.value = { date, source: 'user_adjusted' }
+    realignPivotToBase()
   }
 })
 
@@ -487,8 +560,7 @@ async function runEvaluate() {
         pivot: {
           price: Number(pivotInput.value.price),
           date: pivotInput.value.date || undefined,
-          source: pivotInput.value.source,
-          detectionConfidence: pivotInput.value.detectionConfidence || undefined
+          source: pivotInput.value.source
         }
       }
     })
@@ -545,11 +617,19 @@ function scoreOrNa(row) {
   return row.status === 'NOT_APPLICABLE' ? 'N/A' : 'no score'
 }
 
+// Persisted aggregates use camelCase rawValue/scoringValue; evaluator
+// fragments (and legacy draft shapes) use raw_value/scoring_value. Normalize
+// explicitly in this one place.
+function rowValue(row, camelKey, snakeKey) {
+  if (row[camelKey] !== undefined && row[camelKey] !== null) return row[camelKey]
+  return row[snakeKey] ?? null
+}
+
 function evidenceText(row) {
   const payload = {
     status: row.status,
-    raw_value: row.raw_value ?? null,
-    scoring_value: row.scoring_value ?? null,
+    rawValue: rowValue(row, 'rawValue', 'raw_value'),
+    scoringValue: rowValue(row, 'scoringValue', 'scoring_value'),
     message: row.message || null,
     evidence: row.evidence || null
   }
@@ -559,7 +639,8 @@ function evidenceText(row) {
 function reasonLabel(reason) {
   const labels = {
     daily_ohlcv: 'Daily OHLCV data unavailable',
-    entry_session_bar: 'No daily bar for the trade entry session'
+    entry_session_bar: 'No daily bar for the trade entry session',
+    evidence_completeness: 'Daily market data could not be verified against a provider'
   }
   return labels[reason] || reason
 }

@@ -292,3 +292,128 @@ describe('resolveSetupBoundary', () => {
     expect(boundary).toBeNull();
   });
 });
+
+// Point-in-time regression coverage: swing-point right-window confirmation
+// must be bounded by the detector's observation end (D-1 / range end). Bars
+// after that bound can never confirm or disqualify a swing point.
+describe('bounded swing detection (no post-D-1 right-window confirmation)', () => {
+  const DETECT_PARAMS = {
+    detection_lookback: 60,
+    swing_high_left: 3,
+    swing_high_right: 3,
+    max_post_high_advance_pct: 5
+  };
+
+  test('the bounded index predicates require every right-window bar to lie at or before maxIndex', () => {
+    const bars = buildBars('2026-01-01', [
+      candle(10), // 0
+      candle(20, 22, 19), // 1 swing high candidate (unbounded)
+      candle(19), // 2
+      candle(18), // 3
+      candle(5), // 4 (would confirm candidate 1 when observed)
+      candle(30) // 5 (would deny candidate 1 when observed)
+    ]);
+    // Unbounded (whole array): index 1's right window is bars [2..4] -> high 22
+    // >= bars 2..4, so it is a swing high (bar 5 is outside its window).
+    expect(isSwingHighAtIndex(bars, 1, 1, 3)).toBe(true);
+    // Bounded at index 3: right window would need bars 4..5 -> beyond bound.
+    expect(isSwingHighAtIndex(bars, 1, 1, 3, 3)).toBe(false);
+    // Bounded at index 4: right window [2..4] all at or before 4.
+    expect(isSwingHighAtIndex(bars, 1, 1, 3, 4)).toBe(true);
+  });
+
+  test('a candidate whose right window would need bars after D-1 is never a swing high', () => {
+    const rows = [];
+    for (let i = 0; i < 6; i += 1) rows.push(candle(80 + i * 3)); // climb 0..5
+    rows.push(candle(99.5, 100, 97)); // 6 high would only confirm using 9..11
+    rows.push(candle(98, 98, 95)); // 7
+    rows.push(candle(97, 97, 94)); // 8 D-1
+    rows.push(candle(99, 60, 95)); // 9 quiet post-boundary
+    rows.push(candle(98, 55, 94)); // 10
+    rows.push(candle(99, 50, 95)); // 11
+    const bars = buildBars('2026-01-01', rows);
+    // The near-end high (index 6) needs bars 9..11 to confirm; under a D-1
+    // bound of 8 it is NOT a swing high, so no Base Start is proposed.
+    expect(isSwingHighAtIndex(bars, 6, 3, 3)).toBe(true); // unbounded view
+    expect(isSwingHighAtIndex(bars, 6, 3, 3, 8)).toBe(false); // bounded at D-1
+    expect(detectBaseStart({ bars, endIndex: 8, parameters: DETECT_PARAMS })).toBeNull();
+  });
+
+  test('mutating every bar after the detector endIndex cannot change Base Start detection', () => {
+    // Candidate swing high at index 5 whose right window [6..8] lies entirely
+    // at or before D-1 (index 8). Bars 9+ must never matter.
+    function candidateRows(postHigh) {
+      const rows = [];
+      for (let i = 0; i < 5; i += 1) rows.push(candle(80 + i * 4)); // climb 0..4
+      rows.push(candle(99.5, 100, 97)); // 5 candidate
+      rows.push(candle(98, 98, 95)); // 6
+      rows.push(candle(97, 97, 94)); // 7
+      rows.push(candle(96, 96, 93)); // 8 D-1
+      rows.push(candle(98, postHigh, 95)); // 9 post-boundary
+      rows.push(candle(97, postHigh + 5, 94)); // 10
+      rows.push(candle(99, postHigh + 10, 95)); // 11
+      return rows;
+    }
+    const quiet = buildBars('2026-01-01', candidateRows(60));
+    const loud = buildBars('2026-01-01', candidateRows(500));
+
+    const quietDetected = detectBaseStart({ bars: quiet, endIndex: 8, parameters: DETECT_PARAMS });
+    const loudDetected = detectBaseStart({ bars: loud, endIndex: 8, parameters: DETECT_PARAMS });
+    expect(quietDetected).not.toBeNull();
+    expect(quietDetected.index).toBe(5);
+    expect(loudDetected).toEqual(quietDetected);
+  });
+
+  test('mutating every bar after rangeEndIndex cannot change Pivot detection', () => {
+    const baseRows = () => [
+      candle(90, 92, 88), // 0
+      candle(93, 94, 91), // 1
+      candle(99, 100, 97), // 2 structural high (100)
+      candle(96, 97, 93), // 3
+      candle(95, 96, 92), // 4
+      candle(99.5, 100.2, 98), // 5 structural high (100.2)
+      candle(96, 97, 93), // 6
+      candle(94, 95, 91), // 7 D-1
+      candle(98, 101, 95), // 8 post-range
+      candle(99, 900, 96) // 9 post-range
+    ];
+    const params = {
+      swing_left: 2,
+      swing_right: 2,
+      cluster_tolerance_pct: 2,
+      minimum_touches: 2,
+      recent_touch_window: 10
+    };
+    const quietBars = buildBars('2026-01-01', baseRows());
+    const baseline = detectPivot({ bars: quietBars, rangeStartIndex: 0, rangeEndIndex: 7, parameters: params });
+    expect(baseline).not.toBeNull();
+    expect(baseline.method).toBe('cluster');
+
+    const mutated = quietBars.map((bar, index) =>
+      index > 7 ? { ...bar, open: 1, high: 999, low: 1, close: 990, volume: 9 } : bar
+    );
+    const after = detectPivot({ bars: mutated, rangeStartIndex: 0, rangeEndIndex: 7, parameters: params });
+    expect(after).toEqual(baseline);
+  });
+
+  test('pivot fallback stays bounded to the final recent window of the range', () => {
+    const bars = buildBars('2026-01-01', [
+      candle(10, 20, 9),
+      candle(11, 25, 10),
+      candle(12, 24, 11),
+      candle(13, 23, 12),
+      candle(1000, 1001, 999) // post-range high must never become the pivot
+    ]);
+    const params = {
+      swing_left: 2,
+      swing_right: 2,
+      cluster_tolerance_pct: 2,
+      minimum_touches: 2,
+      recent_touch_window: 10
+    };
+    const detection = detectPivot({ bars, rangeStartIndex: 0, rangeEndIndex: 3, parameters: params });
+    expect(detection).not.toBeNull();
+    expect(detection.method).toBe('recent_daily_high');
+    expect(detection.pivot.price).toBe(25); // highest high within the range
+  });
+});

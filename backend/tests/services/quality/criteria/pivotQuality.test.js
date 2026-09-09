@@ -107,4 +107,57 @@ describe('Setup criterion: pivot_quality', () => {
     const noBoundary = evaluate({ criterion: CONFIG, setup: { pivot: { price: 100 } }, bars });
     expect(noBoundary.status).toBe('UNKNOWN');
   });
+
+  // Custom bars for the spec 21.1 tolerance semantics: structural highs at
+  // chosen prices relative to the confirmed pivot. The two touch highs sit in
+  // the recent window (indices 24 and 29 of the 2..32 base).
+  function customTouchBars({ belowPrice, abovePrice, priorResolutionCloseAt = null }) {
+    const rows = [];
+    for (let i = 0; i <= BASE_END_INDEX; i += 1) {
+      if (i === 24) {
+        rows.push([belowPrice - 0.5, belowPrice, belowPrice - 2, belowPrice - 0.6, 1_000_000]);
+      } else if (i === 29) {
+        rows.push([abovePrice - 0.5, abovePrice, abovePrice - 2, abovePrice - 0.6, 1_000_000]);
+      } else if (i === priorResolutionCloseAt) {
+        rows.push([100.4, 102.6, 99, 101.6, 1_000_000]); // close > pivot * 1.01, high outside band
+      } else if (i === BASE_END_INDEX) {
+        rows.push([96, 99, 95, 98, 1_000_000]);
+      } else if (i >= 22 && i <= 31) {
+        rows.push([94, 96, 93, 95, 1_000_000]);
+      } else {
+        rows.push([93, 95, 91, 94, 1_000_000]);
+      }
+    }
+    return buildBars('2026-01-01', rows);
+  }
+
+  test('a high 1% BELOW and a high 1% ABOVE the pivot both count as touches (spec 21.1)', () => {
+    const bars = customTouchBars({ belowPrice: 99, abovePrice: 101 }); // pivot 100, tolerance 2%
+    const result = evaluate({ criterion: CONFIG, setup: setup(100), bars });
+    expect(result.status).toBe('PASS');
+    expect(result.scoring_value.resistance_touches).toBe(2);
+    expect(result.evidence.touch_count).toBe(2);
+  });
+
+  test('highs outside the configured tolerance do not count as touches', () => {
+    // 2.5% below/above the pivot are outside the 2% tolerance band.
+    const bars = customTouchBars({ belowPrice: 97.5, abovePrice: 102.5 });
+    const result = evaluate({ criterion: CONFIG, setup: setup(100), bars });
+    expect(result.status).toBe('FAIL'); // not UNKNOWN: the pivot itself is valid
+    expect(result.scoring_value.resistance_touches).toBe(0);
+  });
+
+  test('the prior-resolution close rule stays independent of touch tolerance', () => {
+    const bars = customTouchBars({
+      belowPrice: 99,
+      abovePrice: 101,
+      priorResolutionCloseAt: 12
+    });
+    const result = evaluate({ criterion: CONFIG, setup: setup(100), bars });
+    expect(result.status).toBe('FAIL');
+    // Touches are unaffected by the prior-resolution close.
+    expect(result.scoring_value.resistance_touches).toBe(2);
+    expect(result.scoring_value.no_prior_resolution).toBe(false);
+    expect(result.evidence.prior_resolution).toBe(true);
+  });
 });

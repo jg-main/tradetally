@@ -15,10 +15,14 @@
 //   no pre-breakout daily close exceeds the pivot by more than
 //     prior_close_tolerance_pct
 //
-// A touch is a structural swing high inside the base whose high approaches the
-// confirmed pivot from below within cluster_tolerance_pct (resistance-touch
-// semantics; the same tolerance used by the detection cluster). Structural
-// highs are detected strictly inside the base range (no look-ahead past D-1).
+// A touch is a structural swing high inside the base whose high lies within
+// the configured cluster/touch tolerance of the CONFIRMED pivot
+// (spec section 21.1: |high - pivot| / pivot <= tolerance). The tolerance band
+// is symmetric: a high slightly ABOVE a user-confirmed pivot still counts as a
+// touch when it is inside the tolerance. The separate prior-resolution rule
+// (no pre-breakout daily CLOSE above the pivot plus its configured tolerance)
+// is evaluated independently below. Structural highs are detected strictly
+// inside the base range (no look-ahead past D-1).
 //
 // Scoring uses the profile's composite envelope; scoring_value is the
 // component-input object: { resistance_touches, recent_touch, d1_proximity,
@@ -90,11 +94,14 @@ function evaluate({ key = 'pivot_quality', criterion = {}, setup = {}, bars = []
 
   const structuralHighs = structuralHighsInRange(bars, rangeStart, rangeEnd, swingLeft, swingRight);
 
-  // Resistance touches: structural highs that approach the confirmed pivot
-  // from below within the configured cluster/touch tolerance.
-  const touchFloor = pivotPrice * (1 - clusterTolerancePct / 100);
+  // Resistance touches: structural highs within the configured tolerance of the
+  // confirmed pivot (symmetric band — a high slightly above the pivot still
+  // counts when it is inside the tolerance, per spec section 21.1).
+  const toleranceFraction = clusterTolerancePct / 100;
   const touches = structuralHighs.filter(
-    (high) => high.price >= touchFloor && high.price <= pivotPrice
+    (high) =>
+      high.price >= pivotPrice * (1 - toleranceFraction) &&
+      high.price <= pivotPrice * (1 + toleranceFraction)
   );
 
   const recentStartIndex = Math.max(rangeStart, rangeEnd - recentTouchWindow + 1);

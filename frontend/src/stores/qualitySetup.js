@@ -23,12 +23,13 @@ export const useQualitySetupStore = defineStore('qualitySetup', () => {
     error.value = err?.response?.data?.error || err?.message || 'Setup Quality request failed'
   }
 
-  async function prepare(tradeId, { profileId } = {}) {
+  async function prepare(tradeId, { profileId, confirmedBaseStart } = {}) {
     preparing.value = true
     error.value = null
     try {
       const response = await api.post(`/trades/${tradeId}/quality/prepare`, {
-        profileId: profileId || undefined
+        profileId: profileId || undefined,
+        confirmedBaseStart: confirmedBaseStart || undefined
       })
       prepared.value = response.data
       return response.data

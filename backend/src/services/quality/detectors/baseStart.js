@@ -45,12 +45,14 @@ function qualifyCandidate(bars, candidateIndex, endIndex, allowancePct) {
 /**
  * Detects a proposed Base Start.
  *
+ * Point-in-time: swing-high detection is bounded by `endIndex`, so a candidate
+ * is only confirmed as a structural swing high when ALL of its
+ * `swing_high_right` confirmation bars lie at or before endIndex. Bars after
+ * endIndex can never confirm or disqualify a candidate.
+ *
  * @param {object} params
  * @param {Array} params.bars - normalized daily bars (chronological).
- * @param {number} params.endIndex - index of the session to treat as D-1
- *   (the provisional boundary before the pivot is confirmed uses the session
- *   before the trade's initial entry session; the authoritative boundary uses
- *   the real base end once the pivot is confirmed).
+ * @param {number} params.endIndex - index of the session to treat as D-1.
  * @param {object} params.parameters - detector parameters read from the
  *   profile base_duration criterion: detection_lookback, swing_high_left,
  *   swing_high_right, max_post_high_advance_pct.
@@ -66,8 +68,15 @@ function detectBaseStart({ bars, endIndex, parameters = {} }) {
   const swingHighRight = requireParam(parameters, 'swing_high_right');
   const allowancePct = requireParam(parameters, 'max_post_high_advance_pct');
 
-  const searchStart = Math.max(0, endIndex - lookback);
-  const swingHighs = findSwingHighs(bars, { left: swingHighLeft, right: swingHighRight });
+  // A configured `lookback` of N sessions covers exactly N sessions:
+  // [endIndex - N + 1, endIndex]. Candidates are swing highs whose
+  // confirmation windows lie entirely at or before endIndex.
+  const searchStart = Math.max(0, endIndex - lookback + 1);
+  const swingHighs = findSwingHighs(bars, {
+    left: swingHighLeft,
+    right: swingHighRight,
+    maxIndex: endIndex
+  });
   const candidates = swingHighs.filter(
     (point) => point.index >= searchStart && point.index <= endIndex
   );

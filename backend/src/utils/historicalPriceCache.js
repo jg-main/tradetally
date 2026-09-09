@@ -10,9 +10,15 @@ const db = require('../config/database');
  * @param {string} symbol
  * @param {string} startDate - YYYY-MM-DD
  * @param {string} endDate - YYYY-MM-DD
+ * @param {object} [options]
+ * @param {boolean} [options.preserveNullVolume=false] - when true, sessions
+ *   whose stored volume is NULL keep volume null instead of being coerced to 0.
+ *   Legacy consumers rely on the current 0-coercion; Setup Quality uses this
+ *   flag so missing volume can never be mistaken for a real zero-volume
+ *   session. Default behavior is unchanged.
  * @returns {Promise<Array>} Array of {time, open, high, low, close, volume}
  */
-async function getRange(symbol, startDate, endDate) {
+async function getRange(symbol, startDate, endDate, options = {}) {
   const result = await db.query(
     `SELECT price_date, open, high, low, close, volume
      FROM historical_prices
@@ -27,7 +33,12 @@ async function getRange(symbol, startDate, endDate) {
     high: parseFloat(row.high),
     low: parseFloat(row.low),
     close: parseFloat(row.close),
-    volume: parseInt(row.volume) || 0
+    volume:
+      row.volume === null || row.volume === undefined
+        ? options.preserveNullVolume
+          ? null
+          : 0
+        : parseFloat(row.volume)
   }));
 }
 

@@ -14,9 +14,17 @@
 // The left/right window sizes are always read from the caller's profile
 // criterion parameters (canonical BO: 3/3 for Base Start and Prior Move,
 // 2/2 for Pivot and Higher Lows). Window sizes are never hard-coded here.
+//
+// Point-in-time rule: swing detection may OPTIONALLY be bounded by an
+// observation end (maxIndex). A structural swing point at index i with
+// right-side window `right` is only confirmed when EVERY confirmation bar
+// through i + right lies at or before maxIndex. Detectors that evaluate a
+// range ending at D-1 pass maxIndex = that D-1 so post-D-1 bars can never
+// confirm (or disqualify) a swing point.
 
-function isSwingHighAtIndex(bars, index, left, right) {
-  if (index < left || index > bars.length - right - 1) return false;
+function isSwingHighAtIndex(bars, index, left, right, maxIndex = bars.length - 1) {
+  const bound = Math.min(maxIndex, bars.length - 1);
+  if (index < left || index > bound - right) return false;
   const high = bars[index].high;
   for (let j = index - left; j < index; j += 1) {
     if (!(high > bars[j].high)) return false;
@@ -27,8 +35,9 @@ function isSwingHighAtIndex(bars, index, left, right) {
   return true;
 }
 
-function isSwingLowAtIndex(bars, index, left, right) {
-  if (index < left || index > bars.length - right - 1) return false;
+function isSwingLowAtIndex(bars, index, left, right, maxIndex = bars.length - 1) {
+  const bound = Math.min(maxIndex, bars.length - 1);
+  if (index < left || index > bound - right) return false;
   const low = bars[index].low;
   for (let j = index - left; j < index; j += 1) {
     if (!(low < bars[j].low)) return false;
@@ -40,19 +49,18 @@ function isSwingLowAtIndex(bars, index, left, right) {
 }
 
 /**
- * Structural swing highs over the full normalized bar array. Confirmation is
- * strictly local to the bars themselves; callers that need point-in-time
- * guarantees must additionally restrict the returned indices to the range
- * observable at evaluation time.
+ * Structural swing highs over the normalized bar array, optionally bounded so
+ * no confirmation bar lies after `maxIndex`.
  *
  * @param {Array} bars - normalized daily bars [{date, high, ...}]
- * @param {object} windows - { left, right }
+ * @param {object} options - { left, right, maxIndex }
  * @returns {Array<{index:number,date:string,price:number}>}
  */
-function findSwingHighs(bars, { left = 2, right = 2 } = {}) {
+function findSwingHighs(bars, { left = 2, right = 2, maxIndex } = {}) {
+  const bound = Number.isInteger(maxIndex) ? Math.min(maxIndex, bars.length - 1) : bars.length - 1;
   const results = [];
-  for (let i = 0; i < bars.length; i += 1) {
-    if (isSwingHighAtIndex(bars, i, left, right)) {
+  for (let i = 0; i <= bound; i += 1) {
+    if (isSwingHighAtIndex(bars, i, left, right, bound)) {
       results.push({ index: i, date: bars[i].date, price: bars[i].high });
     }
   }
@@ -60,12 +68,14 @@ function findSwingHighs(bars, { left = 2, right = 2 } = {}) {
 }
 
 /**
- * Structural swing lows over the full normalized bar array.
+ * Structural swing lows over the normalized bar array, optionally bounded so
+ * no confirmation bar lies after `maxIndex`.
  */
-function findSwingLows(bars, { left = 2, right = 2 } = {}) {
+function findSwingLows(bars, { left = 2, right = 2, maxIndex } = {}) {
+  const bound = Number.isInteger(maxIndex) ? Math.min(maxIndex, bars.length - 1) : bars.length - 1;
   const results = [];
-  for (let i = 0; i < bars.length; i += 1) {
-    if (isSwingLowAtIndex(bars, i, left, right)) {
+  for (let i = 0; i <= bound; i += 1) {
+    if (isSwingLowAtIndex(bars, i, left, right, bound)) {
       results.push({ index: i, date: bars[i].date, price: bars[i].low });
     }
   }
