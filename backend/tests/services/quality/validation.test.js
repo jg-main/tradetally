@@ -74,6 +74,26 @@ describe('assertScoringConfig', () => {
     }, 'c')).toThrow(/duplicate key/);
   });
 
+  it('rejects composite envelopes whose component weights have no positive total', () => {
+    expect(() => assertScoringConfig({
+      type: 'composite',
+      components: [
+        { key: 'a', weight: 0, scoring: { type: 'binary', pass_score: 100, fail_score: 0 } },
+        { key: 'b', weight: 0, scoring: { type: 'binary', pass_score: 100, fail_score: 0 } }
+      ]
+    }, 'c')).toThrow(/positive usable total/);
+  });
+
+  it('accepts composite envelopes with at least one positive-weight component', () => {
+    expect(() => assertScoringConfig({
+      type: 'composite',
+      components: [
+        { key: 'evidence', weight: 0, scoring: { type: 'binary', pass_score: 100, fail_score: 0 } },
+        { key: 'scored', weight: 100, scoring: { type: 'binary', pass_score: 100, fail_score: 0 } }
+      ]
+    }, 'c')).not.toThrow();
+  });
+
   it('rejects unknown scoring types and non-object scoring', () => {
     expect(() => assertScoringConfig({ type: 'magic', pass_score: 100, fail_score: 0 }, 'c')).toThrow(/one of/);
     expect(() => assertScoringConfig(null, 'c')).toThrow(/must be an object/);
@@ -197,5 +217,32 @@ describe('assertProfileVersionConfiguration', () => {
         { key: 'evidence_only', weight: 0 }
       ] }
     }))).not.toThrow();
+  });
+
+  it('rejects a profile criterion whose nested composite scoring has no positive weight', () => {
+    expect(() => assertProfileVersionConfiguration(versionConfig({
+      setup: { criteria: [
+        {
+          key: 'a',
+          weight: 100,
+          scoring: {
+            type: 'composite',
+            components: [
+              {
+                key: 'nested',
+                weight: 1,
+                scoring: {
+                  type: 'composite',
+                  components: [
+                    { key: 'x', weight: 0, scoring: { type: 'binary', pass_score: 100, fail_score: 0 } },
+                    { key: 'y', weight: 0, scoring: { type: 'binary', pass_score: 100, fail_score: 0 } }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      ] }
+    }))).toThrow(/positive usable total/);
   });
 });

@@ -118,10 +118,18 @@ function normalizeCriterionRows(dimension, dimensionConfig, dimResult) {
     }
 
     if (entry.status === CRITERION_STATUS.PASS || entry.status === CRITERION_STATUS.FAIL) {
-      if (entry.score === null || entry.score === undefined) {
-        throw new Error(`criterion "${entry.key}" requires a numeric score for status ${entry.status}`);
-      }
-      if (configured.weight > 0 && configured.scoring) {
+      if (configured.weight > 0) {
+        // Positive-weight criteria always carry a profile-derived score. The
+        // score must be present and equal to what the immutable scoring
+        // envelope derives from scoring_value.
+        if (entry.score === null || entry.score === undefined) {
+          throw new Error(
+            `criterion "${entry.key}" has positive weight and requires a numeric score derived from its profile scoring configuration`
+          );
+        }
+        if (!configured.scoring) {
+          throw new Error(`criterion "${entry.key}" has positive weight but no scoring configuration`);
+        }
         const derived = deriveScoreForCriterion({
           status: entry.status,
           scoring: configured.scoring,
@@ -137,8 +145,17 @@ function normalizeCriterionRows(dimension, dimensionConfig, dimResult) {
         }
         normalizedScore = derived.score;
       } else {
-        // Zero-weight / scoreless criterion carried as non-scoring evidence.
-        normalizedScore = entry.score;
+        // Zero-weight enabled criteria are compliance/evidence-only: the
+        // score is optional (null allowed) and, when present, must be a
+        // finite number in 0..100.
+        if (
+          entry.score !== null &&
+          entry.score !== undefined &&
+          !(typeof entry.score === 'number' && Number.isFinite(entry.score) && entry.score >= 0 && entry.score <= 100)
+        ) {
+          throw new Error(`criterion "${entry.key}" score must be a number between 0 and 100 or null`);
+        }
+        normalizedScore = entry.score ?? null;
       }
     } else {
       if (entry.score !== null && entry.score !== undefined) {

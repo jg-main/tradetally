@@ -63,8 +63,16 @@ describe('validateCriterionResult', () => {
     expect(validateCriterionResult(base({ key: undefined })).valid).toBe(false);
   });
 
+  it('accepts PASS/FAIL with a null score (scoreless zero-weight results)', () => {
+    for (const status of [CRITERION_STATUS.PASS, CRITERION_STATUS.FAIL]) {
+      const { valid, errors } = validateCriterionResult(base({ status, score: null }));
+      expect(valid).toBe(true);
+      expect(errors).toEqual([]);
+    }
+  });
+
   it('rejects out-of-range or non-numeric scores', () => {
-    for (const score of [-1, 101, '90', null, undefined]) {
+    for (const score of [-1, 101, '90', Number.NaN]) {
       const { valid } = validateCriterionResult(base({ score }));
       expect(valid).toBe(false);
     }

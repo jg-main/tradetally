@@ -114,6 +114,7 @@ function assertScoringConfig(scoring, label, depth = 0) {
         throw new Error(`${label} scoring.components must be a non-empty array`);
       }
       const seenKeys = new Set();
+      let totalWeight = 0;
       scoring.components.forEach((component, index) => {
         if (!isObject(component)) {
           throw new Error(`${label} scoring.components[${index}] must be an object`);
@@ -130,8 +131,14 @@ function assertScoringConfig(scoring, label, depth = 0) {
             `${label} scoring.components.${component.key}.weight must be a non-negative finite number`
           );
         }
+        totalWeight += component.weight;
         assertScoringConfig(component.scoring, `${label} scoring.components.${component.key}`, depth + 1);
       });
+      if (!(totalWeight > 0)) {
+        throw new Error(
+          `${label} composite scoring component weights must have a positive usable total`
+        );
+      }
       return;
     }
     default:

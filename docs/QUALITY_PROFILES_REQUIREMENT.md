@@ -2659,6 +2659,8 @@ composite          object keyed by component.key with component inputs
 
 The persisted PASS/FAIL score must agree with the profile scoring configuration applied to `scoring_value`; caller-supplied scores are never trusted. UNKNOWN / NOT_APPLICABLE results carry no numeric `score` and no `scoring_value` is used.
 
+Zero-weight enabled criteria (`weight = 0`, no `scoring` envelope) are compliance/evidence-only: they may return PASS/FAIL with `score: null`, contribute nothing to Quality score or coverage weight, and their status remains authoritative for Compliance when `required`. Positive-weight criteria always require a profile-derived PASS/FAIL score.
+
 Allowed criterion status values:
 
 ```text

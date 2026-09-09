@@ -7,12 +7,21 @@
 //   {
 //     key: string,                       // criterion key from the profile version config
 //     status: 'PASS'|'FAIL'|'NOT_APPLICABLE'|'UNKNOWN',
-//     score: number|null,                // 0-100; required for PASS/FAIL, null otherwise
-//     scoring_value: number|string|object|null, // NEW normalized scoring input
+//     score: number|null,                // 0-100 for scored PASS/FAIL; null for
+//                                        // scoreless (zero-weight) results and for
+//                                        // NOT_APPLICABLE/UNKNOWN
+//     scoring_value: number|string|object|null, // normalized scoring input
 //     raw_value: any|null,               // measured value backing the decision
 //     evidence: object|null,             // drill-down evidence snapshot
 //     message: string|null               // human-readable summary
 //   }
+//
+// PASS/FAIL scores are derived from the criterion's immutable profile
+// `scoring` envelope. Positive-weight criteria always carry a profile-derived
+// numerical score. Zero-weight enabled criteria (weight 0, no scoring
+// envelope) are compliance/evidence-only: they may return PASS/FAIL with
+// score null, contribute nothing to Quality score or coverage, and their
+// status remains authoritative for Compliance when required.
 //
 // `scoring_value` is the normalized input to the criterion's immutable
 // profile `scoring` envelope used to derive `score` for PASS/FAIL:
@@ -68,10 +77,22 @@ function validateCriterionResult(result) {
       `status must be one of ${CRITERION_STATUS_VALUES.join(', ')}; got ${JSON.stringify(result.status)}`
     );
   } else if (isKnownStatus(result.status)) {
-    // PASS/FAIL carry a numerical quality score (0-100). FAIL may still carry
-    // a non-zero score; compliance and score are independent.
-    if (!isFiniteScore(result.score) || result.score < 0 || result.score > MAX_SCORE) {
-      errors.push(`${result.status} requires a numeric score between 0 and ${MAX_SCORE}`);
+    // PASS/FAIL may carry a numerical quality score OR be scoreless (null).
+    // Positive-weight criteria always derive their score from the profile
+    // scoring configuration (enforced by evaluationService against the actual
+    // criterion config); zero-weight compliance/evidence-only criteria may
+    // return PASS/FAIL with score null. When a score is present it must be a
+    // finite number in 0..100; FAIL may still carry a non-zero score because
+    // compliance and quality score are independent.
+    if (result.score !== null && result.score !== undefined) {
+      const validScore =
+        typeof result.score === 'number' &&
+        Number.isFinite(result.score) &&
+        result.score >= 0 &&
+        result.score <= MAX_SCORE;
+      if (!validScore) {
+        errors.push(`${result.status} score must be a number between 0 and ${MAX_SCORE} or null`);
+      }
     }
   } else if (result.score !== undefined && result.score !== null) {
     // NOT_APPLICABLE/UNKNOWN never contribute a score.

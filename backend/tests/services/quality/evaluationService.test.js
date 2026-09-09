@@ -71,6 +71,31 @@ function canonicalAllPassFixture() {
   return { config, results };
 }
 
+const ZERO_WEIGHT_CONFIG = {
+  dimensions: {
+    setup: {
+      minimum_coverage: 70,
+      criteria: [
+        {
+          key: 'scored',
+          enabled: true,
+          required: true,
+          weight: 100,
+          parameters: {},
+          scoring: { type: 'binary', pass_score: 100, fail_score: 0 }
+        },
+        {
+          key: 'evidence',
+          enabled: true,
+          required: true,
+          weight: 0,
+          parameters: {}
+        }
+      ]
+    }
+  }
+};
+
 describe('summariesFromResults', () => {
   it('mirrors dimension results into flat summary columns', () => {
     const results = {
@@ -305,6 +330,81 @@ describe('evaluationService', () => {
         results
       });
       expect(saved).toBeNull();
+      expect(db.query.mock.calls).toHaveLength(1);
+    });
+  });
+
+  describe('saveResult — zero-weight scoreless criteria', () => {
+    function mockLookup() {
+      db.query.mockResolvedValueOnce({
+        rows: [{ id: 'eval-1', status: 'draft', configuration: ZERO_WEIGHT_CONFIG }]
+      });
+      db.query.mockResolvedValueOnce({ rows: [{ id: 'eval-1', status: 'completed' }] });
+    }
+
+    it('accepts a scoreless required zero-weight FAIL and keeps Compliance FAIL', async () => {
+      mockLookup();
+
+      const saved = await evaluationService.saveResult('eval-1', 'user-1', {
+        status: 'completed',
+        results: {
+          setup: {
+            criterionResults: [
+              { key: 'scored', status: 'PASS', score: 100 },
+              { key: 'evidence', status: 'FAIL', score: null }
+            ]
+          }
+        }
+      });
+      expect(saved.status).toBe('completed');
+
+      const [, params] = db.query.mock.calls[1];
+      const persisted = params[3];
+      const evidenceRow = persisted.setup.criterionResults.find((row) => row.key === 'evidence');
+      expect(evidenceRow.status).toBe('FAIL');
+      expect(evidenceRow.score).toBeNull();
+      expect(params[7]).toBe(100); // setup_score
+      expect(params[9]).toBe('FAIL'); // setup_compliance
+      expect(params[10]).toBe(100); // setup_coverage
+    });
+
+    it('keeps a zero-weight criterion from affecting score or coverage', async () => {
+      mockLookup();
+
+      await evaluationService.saveResult('eval-1', 'user-1', {
+        status: 'completed',
+        results: {
+          setup: {
+            criterionResults: [
+              { key: 'scored', status: 'PASS', score: 100 },
+              { key: 'evidence', status: 'PASS', score: null }
+            ]
+          }
+        }
+      });
+
+      const [, params] = db.query.mock.calls[1];
+      expect(params[7]).toBe(100); // setup_score
+      expect(params[9]).toBe('PASS'); // setup_compliance
+      expect(params[10]).toBe(100); // setup_coverage
+    });
+
+    it('rejects a positive-weight PASS without a profile-derived score', async () => {
+      db.query.mockResolvedValueOnce({
+        rows: [{ id: 'eval-1', status: 'draft', configuration: ZERO_WEIGHT_CONFIG }]
+      });
+
+      await expect(evaluationService.saveResult('eval-1', 'user-1', {
+        status: 'completed',
+        results: {
+          setup: {
+            criterionResults: [
+              { key: 'scored', status: 'PASS', score: null },
+              { key: 'evidence', status: 'PASS', score: null }
+            ]
+          }
+        }
+      })).rejects.toThrow(/positive weight and requires a numeric score/);
       expect(db.query.mock.calls).toHaveLength(1);
     });
   });

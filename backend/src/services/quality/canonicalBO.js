@@ -46,20 +46,29 @@ const CANONICAL_BO_DESCRIPTION =
   'consolidation (higher lows, contracting ranges, declining volume) while preserving ' +
   'its intermediate-term uptrend, resolving above a clear pivot.';
 
-// Shared scoring shapes used by more than one criterion.
-const BINARY_100_0 = { type: 'binary', pass_score: 100, fail_score: 0 };
-const CONTRACTION_BANDS = {
-  type: 'step',
-  mode: 'lte',
-  default_score: 0,
-  thresholds: [
-    { value: 0.4, score: 100 },
-    { value: 0.55, score: 90 },
-    { value: 0.7, score: 75 },
-    { value: 0.85, score: 50 },
-    { value: 1.0, score: 25 }
-  ]
-};
+// Scoring factory functions. Each call returns a FRESH object so every
+// criterion/component owns an independent scoring configuration: mutating one
+// criterion's scoring in an editable copy can never alias another criterion's
+// scoring (structuredClone preserves aliasing, so the source graph must not
+// share mutable nested references).
+function binaryScoring(passScore, failScore) {
+  return { type: 'binary', pass_score: passScore, fail_score: failScore };
+}
+
+function contractionBands() {
+  return {
+    type: 'step',
+    mode: 'lte',
+    default_score: 0,
+    thresholds: [
+      { value: 0.4, score: 100 },
+      { value: 0.55, score: 90 },
+      { value: 0.7, score: 75 },
+      { value: 0.85, score: 50 },
+      { value: 1.0, score: 25 }
+    ]
+  };
+}
 
 // Weights are stored as integer percentages and sum to 100 per dimension.
 const CANONICAL_BO_CONFIG = {
@@ -77,7 +86,7 @@ const CANONICAL_BO_CONFIG = {
             source: 'user_asserted'
           },
           // Section 13: YES = 100 / NO = 0.
-          scoring: BINARY_100_0
+          scoring: binaryScoring(100, 0)
         },
         {
           key: 'prior_move',
@@ -121,7 +130,7 @@ const CANONICAL_BO_CONFIG = {
           },
           // Section 15.5: binary v1 — in-range duration (10-40 sessions) = 100,
           // otherwise 0. The in-range rule comes from the parameters above.
-          scoring: BINARY_100_0
+          scoring: binaryScoring(100, 0)
         },
         {
           key: 'higher_lows',
@@ -156,7 +165,7 @@ const CANONICAL_BO_CONFIG = {
             require_full_windows: true
           },
           // Section 17.4 (value = contraction ratio).
-          scoring: CONTRACTION_BANDS
+          scoring: contractionBands()
         },
         {
           key: 'volume_contraction',
@@ -170,7 +179,7 @@ const CANONICAL_BO_CONFIG = {
             require_full_windows: true
           },
           // Section 18.3 (value = volume ratio).
-          scoring: CONTRACTION_BANDS
+          scoring: contractionBands()
         },
         {
           key: 'ma_trend',
@@ -236,7 +245,7 @@ const CANONICAL_BO_CONFIG = {
                 key: 'recent_touch',
                 weight: 20,
                 // Recent touch within final window: YES 100 / NO 0.
-                scoring: BINARY_100_0
+                scoring: binaryScoring(100, 0)
               },
               {
                 key: 'd1_proximity',
@@ -256,7 +265,7 @@ const CANONICAL_BO_CONFIG = {
                 key: 'no_prior_resolution',
                 weight: 20,
                 // No pre-breakout close materially above the pivot: YES 100 / NO 0.
-                scoring: BINARY_100_0
+                scoring: binaryScoring(100, 0)
               }
             ]
           }
@@ -274,7 +283,7 @@ const CANONICAL_BO_CONFIG = {
           weight: 10,
           parameters: {},
           // Section 23: entry in the breakout session = 100, otherwise 0.
-          scoring: BINARY_100_0
+          scoring: binaryScoring(100, 0)
         },
         {
           key: 'trigger_compliance',
@@ -289,7 +298,7 @@ const CANONICAL_BO_CONFIG = {
           // Section 24 defines trigger evidence and compliance. The canonical
           // quality scoring for this compliance-only rule is binary:
           // PASS = 100 / FAIL = 0 (no partial credit).
-          scoring: BINARY_100_0
+          scoring: binaryScoring(100, 0)
         },
         {
           key: 'volume_pace',
@@ -371,7 +380,7 @@ const CANONICAL_BO_CONFIG = {
           // Section 29 defines stop compliance/UNKNOWN. The canonical quality
           // scoring for this compliance-only rule is binary:
           // PASS = 100 / FAIL = 0 (no partial credit).
-          scoring: BINARY_100_0
+          scoring: binaryScoring(100, 0)
         },
         {
           key: 'stop_width',
@@ -479,7 +488,7 @@ const CANONICAL_BO_CONFIG = {
           // stop history. The canonical quality scoring for this
           // compliance-only rule is binary: PASS = 100 / FAIL = 0
           // (no partial credit).
-          scoring: BINARY_100_0
+          scoring: binaryScoring(100, 0)
         },
         {
           key: 'post_partial_breakeven',

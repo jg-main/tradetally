@@ -425,4 +425,54 @@ describe('Canonical BO scoring configuration', () => {
       }
     });
   });
+
+  it('returns editable copies whose scoring objects are independent per criterion', () => {
+    const copy = getCanonicalBOConfig();
+
+    // Editing the leader's binary scoring must not change any other binary
+    // criterion's scoring in the same copy.
+    const leader = copy.dimensions.setup.criteria.find((c) => c.key === 'leader');
+    leader.scoring.pass_score = 90;
+    leader.scoring.fail_score = 10;
+
+    const setup = Object.fromEntries(copy.dimensions.setup.criteria.map((c) => [c.key, c]));
+    const entry = Object.fromEntries(copy.dimensions.entry.criteria.map((c) => [c.key, c]));
+    const management = Object.fromEntries(copy.dimensions.management.criteria.map((c) => [c.key, c]));
+
+    for (const criterion of [setup.base_duration, entry.breakout_session,
+      entry.trigger_compliance, entry.initial_stop, management.stop_ratchet]) {
+      expect(criterion.scoring.pass_score).toBe(100);
+      expect(criterion.scoring.fail_score).toBe(0);
+    }
+
+    // Pivot Quality binary components are also independent.
+    const pivot = setup.pivot_quality.scoring;
+    expect(pivot.components.find((c) => c.key === 'recent_touch').scoring.pass_score).toBe(100);
+    expect(pivot.components.find((c) => c.key === 'no_prior_resolution').scoring.pass_score).toBe(100);
+  });
+
+  it('keeps range_contraction and volume_contraction scoring independent in copies', () => {
+    const copy = getCanonicalBOConfig();
+    const range = copy.dimensions.setup.criteria.find((c) => c.key === 'range_contraction');
+    const volume = copy.dimensions.setup.criteria.find((c) => c.key === 'volume_contraction');
+
+    range.scoring.default_score = 42;
+    range.scoring.thresholds[0].score = 1;
+
+    expect(volume.scoring.default_score).toBe(0);
+    expect(volume.scoring.thresholds[0].score).toBe(100);
+    expect(range.scoring).not.toBe(volume.scoring);
+  });
+
+  it('still cannot mutate the frozen canonical config through a returned copy', () => {
+    const copy = getCanonicalBOConfig();
+    copy.dimensions.setup.criteria.find((c) => c.key === 'leader').scoring.pass_score = 90;
+    copy.dimensions.setup.criteria.find((c) => c.key === 'range_contraction').scoring.default_score = 99;
+
+    expect(CANONICAL_BO_CONFIG.dimensions.setup.criteria[0].scoring.pass_score).toBe(100);
+    expect(
+      CANONICAL_BO_CONFIG.dimensions.setup.criteria.find((c) => c.key === 'range_contraction').scoring.default_score
+    ).toBe(0);
+    expect(Object.isFrozen(CANONICAL_BO_CONFIG.dimensions.setup.criteria[0].scoring)).toBe(true);
+  });
 });

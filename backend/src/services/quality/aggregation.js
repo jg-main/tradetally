@@ -138,7 +138,15 @@ function aggregateDimension(dimensionConfig, criterionResults, options = {}) {
 
     if (isKnownStatus(status)) {
       knownWeight += weight;
-      weightedScoreSum += result.score * weight;
+      // Zero-weight scoreless criteria are compliance/evidence-only: they must
+      // not contribute to (or corrupt) the weighted score. Positive-weight
+      // criteria always carry a finite profile-derived score.
+      if (weight > 0) {
+        if (typeof result.score !== 'number' || !Number.isFinite(result.score)) {
+          throw new Error(`criterion "${key}" has positive weight but no numeric score`);
+        }
+        weightedScoreSum += result.score * weight;
+      }
     } else if (isUnknownStatus(status)) {
       unknownWeight += weight;
     } else if (isNotApplicableStatus(status)) {

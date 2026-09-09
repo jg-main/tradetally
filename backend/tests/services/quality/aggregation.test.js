@@ -324,3 +324,72 @@ describe('assertDimensionConfig', () => {
     expect(() => assertDimensionConfig({ criteria: [{ weight: 10 }] })).toThrow(/non-empty key/);
   });
 });
+
+describe('zero-weight scoreless criteria', () => {
+  it('keeps a required zero-weight FAIL as Compliance FAIL without NaN arithmetic', () => {
+    const config = configWith([
+      criterion('scored', 100, { required: true }),
+      criterion('evidence', 0, { required: true })
+    ]);
+    const out = aggregateDimension(config, [
+      result('scored', CRITERION_STATUS.PASS, 80),
+      result('evidence', CRITERION_STATUS.FAIL, null)
+    ]);
+
+    expect(out.score).toBe(80);
+    expect(out.coverage).toBe(100);
+    expect(out.compliance).toBe(COMPLIANCE.FAIL);
+    expect(Number.isNaN(out.score)).toBe(false);
+  });
+
+  it('keeps a required zero-weight UNKNOWN as Compliance INCOMPLETE without reducing coverage', () => {
+    const config = configWith([
+      criterion('scored', 100, { required: true }),
+      criterion('evidence', 0, { required: true })
+    ]);
+    const out = aggregateDimension(config, [
+      result('scored', CRITERION_STATUS.PASS, 100),
+      result('evidence', CRITERION_STATUS.UNKNOWN, null)
+    ]);
+
+    expect(out.score).toBe(100);
+    expect(out.coverage).toBe(100);
+    expect(out.compliance).toBe(COMPLIANCE.INCOMPLETE);
+  });
+
+  it('lets zero-weight criteria contribute nothing to score or coverage', () => {
+    const without = aggregateDimension(
+      configWith([criterion('a', 100, { required: true })]),
+      [result('a', CRITERION_STATUS.PASS, 80)]
+    );
+    const withEvidence = aggregateDimension(
+      configWith([
+        criterion('a', 100, { required: true }),
+        criterion('evidence', 0, { required: true })
+      ]),
+      [
+        result('a', CRITERION_STATUS.PASS, 80),
+        result('evidence', CRITERION_STATUS.PASS, null)
+      ]
+    );
+
+    expect(withEvidence.score).toBe(without.score);
+    expect(withEvidence.coverage).toBe(without.coverage);
+    expect(withEvidence.compliance).toBe(COMPLIANCE.PASS);
+  });
+
+  it('reports full coverage and no score when only zero-weight scoreless criteria exist', () => {
+    const config = configWith([criterion('evidence', 0, { required: true })]);
+    const out = aggregateDimension(config, [result('evidence', CRITERION_STATUS.PASS, null)]);
+
+    expect(out.score).toBeNull();
+    expect(out.coverage).toBe(100);
+    expect(out.compliance).toBe(COMPLIANCE.PASS);
+  });
+
+  it('rejects a positive-weight known-status result without a numeric score', () => {
+    const config = configWith([criterion('a', 100, { required: true })]);
+    expect(() => aggregateDimension(config, [result('a', CRITERION_STATUS.PASS, null)]))
+      .toThrow(/positive weight but no numeric score/);
+  });
+});
