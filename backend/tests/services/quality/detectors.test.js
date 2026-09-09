@@ -32,16 +32,16 @@ describe('dailyEvidence normalizeDailyBars', () => {
     const raw = [
       { time: 1700000000, open: 1, high: 2, low: 1, close: 2, volume: 10 },
       { time: 1699990000, open: 1, high: 2, low: 1, close: 1, volume: 9 },
-      { time: 1700000000, open: 1, high: 2, low: 1, close: 2, volume: 10 },
-      { time: 1700086400, open: null, high: 2, low: 1, close: 2, volume: 10 },
+      { time: 1700000000, open: 1, high: 2, low: 1, close: 2, volume: 10 }, // duplicate session
+      { time: 1700086400, open: null, high: 2, low: 1, close: 2, volume: 10 }, // non-positive open -> dropped
       { time: 1700172800, open: 1, high: 3, low: 1, close: 3, volume: null }
     ];
     const bars = normalizeDailyBars(raw);
-    expect(bars).toHaveLength(3);
+    expect(bars).toHaveLength(2);
     expect(bars[0].date < bars[1].date).toBe(true);
-    expect(bars[1].date < bars[2].date).toBe(true);
-    expect(bars[1].volume).toBe(10);
-    expect(bars[2].volume).toBe(null);
+    expect(bars[0].close).toBe(1); // earliest of the duplicated session wins
+    expect(bars[0].volume).toBe(9);
+    expect(bars[1].volume).toBe(null);
   });
 
   test('indexByDate returns session indexes', () => {

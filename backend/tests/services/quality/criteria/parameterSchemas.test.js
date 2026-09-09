@@ -9,6 +9,8 @@ const { detectBaseStart } = require('../../../../src/services/quality/detectors/
 const { buildBars, candle } = require('../barFactory');
 
 function setupDimensionConfig() {
+  // getCanonicalBOConfig() returns a fresh graph on each call, so tests can
+  // mutate a criterion without leaking into other tests.
   return getCanonicalBOConfig().dimensions.setup;
 }
 
@@ -84,14 +86,29 @@ describe('parameterSchemas (typed Setup parameter contract)', () => {
     ]);
   });
 
-  test('individual parameter validation supports positive integers and non-negative numbers', () => {
-    expect(validateParameters('pivot_quality', { swing_left: 0 })).toEqual([
+  test('missing required policy fields are rejected (no silent defaults)', () => {
+    const setupConfig = setupDimensionConfig();
+    delete criterionByKey(setupConfig, 'ma_trend').parameters.support_period;
+    expect(validateSetupCriteria(setupConfig)).toEqual([
+      expect.stringMatching(/support_period" is required/)
+    ]);
+
+    const clean = setupDimensionConfig();
+    delete criterionByKey(clean, 'prior_move').parameters.selection;
+    expect(validateSetupCriteria(clean)).toEqual([
+      expect.stringMatching(/selection" is required/)
+    ]);
+  });
+
+  test('individual parameter validation requires the full typed contract', () => {
+    const pivotParams = criterionByKey(setupDimensionConfig(), 'pivot_quality').parameters;
+    expect(validateParameters('pivot_quality', { ...pivotParams, swing_left: 0 })).toEqual([
       expect.stringMatching(/swing_left.*positive integer/)
     ]);
-    expect(validateParameters('pivot_quality', { swing_left: 2 })).toEqual([]);
-    expect(validateParameters('pivot_quality', { max_d1_distance_pct: -1 })).toEqual([
+    expect(validateParameters('pivot_quality', { ...pivotParams, max_d1_distance_pct: -1 })).toEqual([
       expect.stringMatching(/max_d1_distance_pct.*finite non-negative number/)
     ]);
+    expect(validateParameters('pivot_quality', { ...pivotParams })).toEqual([]);
   });
 });
 

@@ -130,14 +130,15 @@ function validateParameters(key, parameters) {
     return errors;
   }
   for (const [paramName, spec] of Object.entries(schema)) {
+    const label = `criterion "${key}" parameter "${paramName}"`;
     if (!Object.prototype.hasOwnProperty.call(parameters, paramName)) {
-      // ma_trend/support_period and boolean toggles may be absent only when a
-      // default is defined by the evaluator; required fields are enforced by
-      // the evaluators themselves. Presence is still validated when present.
+      // Phase 2 is the execution layer for Setup parameters: every parameter a
+      // detector/evaluator interprets is REQUIRED in profile configuration.
+      // Trading-policy fields are never silently defaulted in code.
+      errors.push(`${label} is required`);
       continue;
     }
     const value = parameters[paramName];
-    const label = `criterion "${key}" parameter "${paramName}"`;
     let error = null;
     switch (spec.kind) {
       case 'positiveInteger':
@@ -177,11 +178,20 @@ function validateParameters(key, parameters) {
   return errors;
 }
 
+// Detector/evaluator parameters that Setup detection reads even when the owning
+// criterion is disabled (Base Start and Pivot detection tuning live on
+// base_duration / pivot_quality). Such criteria must still be parameterized.
+const DETECTION_PARAMETER_CRITERIA = ['base_duration', 'pivot_quality'];
+
 /**
  * Validates the Setup dimension criteria of a profile version.
- * Unknown criterion keys / parameters are ignored here (the evaluator registry
- * rejects unknown enabled criteria when they run). Returns an array of
- * violation strings (empty when valid).
+ *
+ * Required parameters are enforced for every ENABLED criterion plus the
+ * detection-owning criteria (base_duration/pivot_quality) even when disabled,
+ * because shared structural detection reads their parameters. Disabled unused
+ * criteria without evaluator-specific parameters do not block execution.
+ * Unknown parameter names inside a known criterion are ignored.
+ * Returns an array of violation strings (empty when valid).
  */
 function validateSetupCriteria(setupConfig) {
   const errors = [];
@@ -189,6 +199,10 @@ function validateSetupCriteria(setupConfig) {
     return errors;
   }
   for (const criterion of setupConfig.criteria) {
+    const enabled = criterion.enabled === undefined ? true : criterion.enabled;
+    if (!enabled && !DETECTION_PARAMETER_CRITERIA.includes(criterion.key)) {
+      continue;
+    }
     errors.push(...validateParameters(criterion.key, criterion.parameters));
   }
   return errors;
@@ -199,5 +213,6 @@ module.exports = {
   validateParameters,
   validateSetupCriteria,
   checkPositiveInteger,
-  checkNonNegativeNumber
+  checkNonNegativeNumber,
+  DETECTION_PARAMETER_CRITERIA
 };

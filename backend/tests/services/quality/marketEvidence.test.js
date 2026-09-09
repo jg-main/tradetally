@@ -24,7 +24,7 @@ const marketData = require('../../../src/utils/finnhub');
 const historicalPriceCache = require('../../../src/utils/historicalPriceCache');
 const yahooFinance = require('../../../src/utils/yahooFinance');
 const alphaVantage = require('../../../src/utils/alphaVantage');
-const { loadDailyEvidence, mergeDailyBars } = require('../../../src/services/quality/marketEvidenceService');
+const { loadDailyEvidence, supplementProviderSessions } = require('../../../src/services/quality/marketEvidenceService');
 
 function cacheRow(date, close, volume = 1000) {
   return { time: Math.floor(new Date(`${date}T00:00:00Z`).getTime() / 1000), open: close - 1, high: close + 1, low: close - 2, close, volume };
@@ -145,22 +145,75 @@ describe('marketEvidenceService.loadDailyEvidence (hardened)', () => {
     expect(cachedMissing.volume).toBeNull();
   });
 
-  test('cache + provider merge is deterministic (provider wins, cache fills gaps)', () => {
+  test('a cache Sunday / cache-only date never enters a verified provider session set', async () => {
+    // 2026-01-04 is a Sunday. The provider correctly omits it; the cache must
+    // not be able to inject it into verified evidence.
+    historicalPriceCache.getRange.mockResolvedValue([cacheRow('2026-01-04', 999)]);
+    marketData.isConfigured.mockReturnValue(true);
+    marketData.getStockCandles.mockResolvedValue([
+      rawCandle('2026-01-05', 10),
+      rawCandle('2026-01-06', 11)
+    ]);
+
+    const result = await loadDailyEvidence({ symbol: 'test', userId: 'u1', fromDate: '2026-01-01', toDate: '2026-01-31' });
+    expect(result.completeness).toBe('verified');
+    expect(result.bars.map((bar) => bar.date)).toEqual(['2026-01-05', '2026-01-06']);
+  });
+
+  test('a stale cache-only weekday never enters the provider session set', async () => {
+    // 2026-01-02 is a weekday the provider does not return for this symbol.
+    historicalPriceCache.getRange.mockResolvedValue([cacheRow('2026-01-02', 500)]);
+    marketData.isConfigured.mockReturnValue(true);
+    marketData.getStockCandles.mockResolvedValue([
+      rawCandle('2026-01-05', 10),
+      rawCandle('2026-01-06', 11)
+    ]);
+
+    const result = await loadDailyEvidence({ symbol: 'test', userId: 'u1', fromDate: '2026-01-01', toDate: '2026-01-31' });
+    expect(result.completeness).toBe('verified');
+    expect(result.bars.map((bar) => bar.date)).toEqual(['2026-01-05', '2026-01-06']);
+  });
+
+  test('provider wins conflicts and only supplements the same provider-confirmed session', () => {
     const provider = [
-      { date: '2026-01-05', high: 10 },
-      { date: '2026-01-06', high: 11 }
+      { date: '2026-01-05', open: 9, high: 11, low: 8, close: 10, volume: null },
+      { date: '2026-01-06', open: 10, high: 12, low: 9, close: 11, volume: 100 }
     ];
     const cache = [
-      { date: '2026-01-04', high: 9 },
-      { date: '2026-01-05', high: 999 }, // conflict: provider wins
-      { date: '2026-01-06', high: 999 }
+      { date: '2026-01-04', open: 1, high: 1, low: 1, close: 1, volume: 9 }, // extra date: ignored
+      { date: '2026-01-05', open: 99, high: 99, low: 99, close: 99, volume: 5000 } // same date: volume supplement only
     ];
-    const merged = mergeDailyBars(provider, cache);
-    expect(merged.map((bar) => [bar.date, bar.high])).toEqual([
-      ['2026-01-04', 9],
-      ['2026-01-05', 10],
-      ['2026-01-06', 11]
+    const merged = supplementProviderSessions(provider, cache);
+    expect(merged).toHaveLength(2); // never two sessions for one date
+    expect(merged.map((bar) => bar.date)).toEqual(['2026-01-05', '2026-01-06']);
+    // Provider OHLC wins; provider-null volume is safely supplemented from the
+    // same provider-confirmed session.
+    expect(merged[0].open).toBe(9);
+    expect(merged[0].volume).toBe(5000);
+    expect(merged[1].volume).toBe(100);
+  });
+
+  test('an extra cache-only date cannot change session-count-sensitive evidence', async () => {
+    const providerCandles = [
+      rawCandle('2026-01-05', 10),
+      rawCandle('2026-01-06', 11),
+      rawCandle('2026-01-07', 12)
+    ];
+    marketData.isConfigured.mockReturnValue(true);
+    marketData.getStockCandles.mockResolvedValue(providerCandles);
+
+    // Without cache extras.
+    historicalPriceCache.getRange.mockResolvedValueOnce([]);
+    const clean = await loadDailyEvidence({ symbol: 'test', userId: 'u1', fromDate: '2026-01-01', toDate: '2026-01-31' });
+    // With cache-only extra dates (including a Sunday with otherwise valid OHLCV).
+    historicalPriceCache.getRange.mockResolvedValueOnce([
+      cacheRow('2026-01-04', 10),
+      cacheRow('2026-01-08', 11)
     ]);
+    const withExtras = await loadDailyEvidence({ symbol: 'test', userId: 'u1', fromDate: '2026-01-01', toDate: '2026-01-31' });
+
+    expect(withExtras.bars).toEqual(clean.bars);
+    expect(withExtras.bars).toHaveLength(3);
   });
 
   test('uses Yahoo Finance and Alpha Vantage as fallbacks when the provider is unavailable', async () => {

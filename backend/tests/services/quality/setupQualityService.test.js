@@ -70,6 +70,22 @@ function installDbRouter(overrides = {}) {
   db.query.mockReset();
   db.query.mockImplementation((sql, params = []) => {
     if (sql.includes('UPDATE trade_quality_evaluations')) {
+      if (sql.includes('setup_score = NULL')) {
+        // clearSetupResults invalidation UPDATE: returns the full row with the
+        // Setup result cleared but evidence/detections/user_inputs preserved.
+        const preserved = params[2];
+        const cleared = {
+          results: preserved === null ? null : typeof preserved === 'string' ? JSON.parse(preserved) : preserved,
+          setup_score: null,
+          setup_grade: null,
+          setup_compliance: null,
+          setup_coverage: null
+        };
+        const base = existingDraft || makeEvaluationRow();
+        const merged = { ...base, ...cleared };
+        if (overrides.trackEvalRow) existingDraft = merged;
+        return { rows: [merged] };
+      }
       if (sql.includes('results = $3')) {
         // saveSetupProgress UPDATE.
         updateCall = { sql, params };
@@ -310,6 +326,117 @@ describe('SetupQualityService.prepare', () => {
     expect(second.evaluation.evidence_snapshot).toEqual(first.evaluation.evidence_snapshot);
     expect(second.detectedBaseStart.date).toBe(first.detectedBaseStart.date);
   });
+
+  test('a larger configured lookback expands the provider fetch request accordingly', async () => {
+    const clone = () => JSON.parse(JSON.stringify(CANONICAL_CONFIG));
+
+    const first = await prepareDraft();
+    const firstWindow = loadDailyEvidence.mock.calls[0][0];
+    expect(firstWindow.fromDate).toBeDefined();
+
+    // A fresh evaluation with an expanded detection/prior lookback must request
+    // a wider history window (no undocumented fixed ceiling).
+    const expandedConfig = clone();
+    expandedConfig.dimensions.setup.criteria.find((c) => c.key === 'base_duration').parameters.detection_lookback = 200;
+    expandedConfig.dimensions.setup.criteria.find((c) => c.key === 'prior_move').parameters.search_lookback = 200;
+    profileService.getCurrentVersion.mockResolvedValue({
+      id: 'version-2',
+      version_number: 1,
+      schema_version: 1,
+      configuration: expandedConfig
+    });
+    existingDraft = null;
+    installDbRouter({ trackEvalRow: true });
+    await prepareDraft();
+
+    const secondWindow = loadDailyEvidence.mock.calls[1][0];
+    expect(secondWindow.fromDate < firstWindow.fromDate).toBe(true);
+  });
+
+  test('an invalid Setup profile (missing required parameter) is rejected with PROFILE_CONFIG_INVALID', async () => {
+    const broken = JSON.parse(JSON.stringify(CANONICAL_CONFIG));
+    delete broken.dimensions.setup.criteria.find((c) => c.key === 'prior_move').parameters.selection;
+    profileService.getCurrentVersion.mockResolvedValue({
+      id: VERSION_ID,
+      version_number: 1,
+      schema_version: 1,
+      configuration: broken
+    });
+    await expect(prepareDraft()).rejects.toMatchObject({ code: 'PROFILE_CONFIG_INVALID' });
+  });
+
+  test('an unsupported ENABLED Setup criterion is rejected before evaluation', async () => {
+    const withExtra = JSON.parse(JSON.stringify(CANONICAL_CONFIG));
+    withExtra.dimensions.setup.criteria.push({
+      key: 'mystery_quality',
+      enabled: true,
+      required: true,
+      weight: 10,
+      parameters: {},
+      scoring: { type: 'binary', pass_score: 100, fail_score: 0 }
+    });
+    profileService.getCurrentVersion.mockResolvedValue({
+      id: VERSION_ID,
+      version_number: 1,
+      schema_version: 1,
+      configuration: withExtra
+    });
+    await expect(prepareDraft()).rejects.toMatchObject({ code: 'PROFILE_CONFIG_INVALID' });
+  });
+
+  test('a disabled unused unsupported criterion does not block execution', async () => {
+    const withDisabled = JSON.parse(JSON.stringify(CANONICAL_CONFIG));
+    withDisabled.dimensions.setup.criteria.push({
+      key: 'future_criterion',
+      enabled: false,
+      required: false,
+      weight: 0,
+      parameters: {}
+    });
+    profileService.getCurrentVersion.mockResolvedValue({
+      id: VERSION_ID,
+      version_number: 1,
+      schema_version: 1,
+      configuration: withDisabled
+    });
+    const result = await prepareDraft();
+    expect(result.detectedBaseStart).not.toBeNull();
+  });
+
+  test('unverified cache-only evidence recovers when a provider later becomes available', async () => {
+    loadDailyEvidence
+      .mockResolvedValueOnce({
+        bars: scenario.bars,
+        source: 'historical_cache',
+        completeness: 'unverified',
+        error: 'cannot verify yet'
+      })
+      .mockResolvedValueOnce({
+        bars: scenario.bars,
+        source: 'finnhub',
+        completeness: 'verified',
+        error: null
+      });
+
+    const first = await prepareDraft();
+    expect(first.evaluation.evidence_snapshot.completeness).toBe('unverified');
+    expect(first.unavailableEvidence).toContain('evidence_completeness');
+
+    // Provider recovers: the second prepare MUST retry the provider chain and
+    // replace the provisional unverified snapshot on the same unevaluated draft.
+    const second = await prepareDraft();
+    expect(loadDailyEvidence).toHaveBeenCalledTimes(2);
+    expect(second.evaluation.id).toBe(first.evaluation.id);
+    expect(second.evaluation.evidence_snapshot.completeness).toBe('verified');
+    expect(second.unavailableEvidence).toEqual([]);
+
+    // Setup can now be evaluated.
+    const result = await SetupQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: second.evaluation.id,
+      userInputs: confirmedFromPrepared(second)
+    });
+    expect(result.evaluation.results.setup).toBeDefined();
+  });
 });
 
 describe('SetupQualityService.evaluate', () => {
@@ -544,5 +671,51 @@ describe('SetupQualityService.evaluate', () => {
         }
       })
     ).rejects.toMatchObject({ code: 'EVIDENCE_UNAVAILABLE' });
+  });
+
+  test('re-prepare with an adjusted Base Start invalidates stale Setup results', async () => {
+    // Evaluate Setup under the machine Base Start (session 70) / detected Pivot.
+    const preparedA = await prepareDraft();
+    const evA = await SetupQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: preparedA.evaluation.id,
+      userInputs: confirmedFromPrepared(preparedA)
+    });
+    expect(evA.evaluation.results.setup).toBeDefined();
+    expect(evA.evaluation.setup_grade).toBe('A');
+
+    // Re-prepare with an adjusted Base Start (session 71): the Pivot is
+    // re-detected from B and the OLD Setup result must be invalidated.
+    const reprepared = await prepareDraft({
+      confirmedBaseStart: { date: scenario.dateAt(71), source: 'user_adjusted' }
+    });
+    expect(reprepared.evaluation.results.setup).toBeUndefined();
+    expect(reprepared.evaluation.results.entry).toBeNull();
+    expect(reprepared.evaluation.results.management).toBeNull();
+    expect(reprepared.evaluation.setup_score).toBeNull();
+    expect(reprepared.evaluation.setup_grade).toBeNull();
+    expect(reprepared.evaluation.setup_compliance).toBeNull();
+    expect(reprepared.evaluation.setup_coverage).toBeNull();
+    // The stale pivot confirmation must not survive in user_inputs.
+    expect(reprepared.evaluation.user_inputs.pivot).toBeUndefined();
+    expect(reprepared.evaluation.user_inputs.base_start).toEqual({
+      date: scenario.dateAt(71),
+      source: 'user_adjusted'
+    });
+    // The new Pivot detection is derived from the adjusted Base Start.
+    expect(reprepared.detectedPivot.derivedFromBaseStart).toBe(scenario.dateAt(71));
+
+    // A reload after re-prepare (GET evaluations row) shows Setup as not
+    // evaluated: no stale grade.
+    const list = await SetupQualityService.listEvaluations(USER_ID, TRADE_ID);
+    expect(list[0].results.setup).toBeUndefined();
+    expect(list[0].setup_grade).toBeNull();
+
+    // Re-evaluate under B produces fresh Setup results.
+    const evB = await SetupQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: reprepared.evaluation.id,
+      userInputs: confirmedFromPrepared(reprepared)
+    });
+    expect(evB.evaluation.results.setup).toBeDefined();
+    expect(evB.evaluation.setup_compliance).toBe('PASS');
   });
 });

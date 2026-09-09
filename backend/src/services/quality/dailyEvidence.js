@@ -38,11 +38,33 @@ function toFinite(value) {
 function isValidRawBar(bar) {
   if (bar === null || typeof bar !== 'object') return false;
   if (!isFiniteNumber(bar.time)) return false;
-  if (!isFiniteNumber(toFinite(bar.open))) return false;
-  if (!isFiniteNumber(toFinite(bar.high))) return false;
-  if (!isFiniteNumber(toFinite(bar.low))) return false;
-  if (!isFiniteNumber(toFinite(bar.close))) return false;
+  const open = toFinite(bar.open);
+  const high = toFinite(bar.high);
+  const low = toFinite(bar.low);
+  const close = toFinite(bar.close);
+  if (open === null || high === null || low === null || close === null) return false;
+  // Mathematically valid equity price bar:
+  //   open/high/low/close > 0
+  //   high >= max(open, close, low)
+  //   low <= min(open, close, high)
+  if (open <= 0 || high <= 0 || low <= 0 || close <= 0) return false;
+  if (high < open || high < close || high < low) return false;
+  if (low > open || low > close) return false;
   return true;
+}
+
+// Normalizes a raw volume into the internal representation:
+//   - null/undefined/non-finite/negative -> null (missing volume evidence).
+//     A negative volume must never become valid share-volume evidence (it
+//     could manufacture a negative contraction ratio and a false PASS).
+//   - finite non-negative volume stays as-is.
+// Volume problems never invalidate the price bar: price criteria keep the
+// session while Volume Contraction becomes UNKNOWN for missing volume.
+function normalizeVolume(value) {
+  if (value === null || value === undefined) return null;
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) return null;
+  return number;
 }
 
 /**
@@ -55,9 +77,10 @@ function isValidRawBar(bar) {
  * - deduplicates by session date keeping the first bar seen for a date
  *   (providers are queried chronologically; later duplicates of the same
  *   session add no information);
- * - drops bars with unusable OHLC/time values;
- * - preserves the raw `volume` value (may be null when a provider does not
- *   report it).
+ * - drops bars with mathematically invalid OHLC/time values (non-positive or
+ *   inverted OHLC can never enter normalized price evidence);
+ * - preserves valid volume, keeps missing volume as null, and NEVER lets
+ *   negative/non-finite volume become valid share-volume evidence.
  */
 function normalizeDailyBars(rawBars) {
   if (!Array.isArray(rawBars)) return [];
@@ -76,7 +99,7 @@ function normalizeDailyBars(rawBars) {
       high: toFinite(bar.high),
       low: toFinite(bar.low),
       close: toFinite(bar.close),
-      volume: bar.volume === null || bar.volume === undefined ? null : toFinite(bar.volume)
+      volume: normalizeVolume(bar.volume)
     });
   }
   return output;

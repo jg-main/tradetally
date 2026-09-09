@@ -22,7 +22,15 @@ const { sliceBars } = require('../../dailyEvidence');
 function meanVolume(bars) {
   let sum = 0;
   for (const bar of bars) {
-    if (bar.volume === null || bar.volume === undefined || !Number.isFinite(bar.volume)) {
+    if (
+      bar.volume === null ||
+      bar.volume === undefined ||
+      !Number.isFinite(bar.volume) ||
+      bar.volume < 0
+    ) {
+      // Missing, non-finite or NEGATIVE volume can never be valid share-volume
+      // evidence (a negative value would manufacture a negative ratio and a
+      // false PASS).
       return null;
     }
     sum += bar.volume;

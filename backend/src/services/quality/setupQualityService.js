@@ -37,20 +37,19 @@ const {
 } = require('./evaluationService');
 const profileService = require('./profileService');
 const { loadDailyEvidence } = require('./marketEvidenceService');
-const { normalizeDailyBars, indexByDate, addCalendarDays } = require('./dailyEvidence');
+const { normalizeDailyBars, indexByDate, addCalendarDays, calendarDaysForSessions } = require('./dailyEvidence');
 const { detectBaseStart } = require('./detectors/baseStart');
 const { detectPivot } = require('./detectors/pivot');
 const { resolveSetupBoundary } = require('./detectors/setupBoundary');
-const { evaluateCriterion } = require('./criterionRegistry');
+const { evaluateCriterion, SETUP_CRITERION_KEYS } = require('./criterionRegistry');
 const { validateSetupCriteria } = require('./criteria/setup/parameterSchemas');
 const { getDateInTimezone } = require('../../utils/timezone');
 
-// Calendar days of daily history requested before the trade's initial entry
-// session. Trading-session durations are always counted from actual bars; this
-// constant only sizes the fetch window (roughly 280 trading sessions), enough
-// for a 60-session Base Start search, a 60-session Prior Move lookback before
-// the Base Start, SMA history, and detector left/right windows with margin.
-const HISTORY_CALENDAR_DAYS = 400;
+// Calendar slack: detector right windows, contraction windows and an extra
+// buffer beyond the pure session requirement, plus holiday gaps absorbed by
+// the session->calendar conversion. Session durations are always counted from
+// actual bars; this constant only sizes the fetch request.
+const HISTORY_SESSION_SLACK = 40;
 const POST_ENTRY_CALENDAR_DAYS = 10;
 const MARKET_TZ = 'America/New_York';
 
@@ -124,16 +123,31 @@ function getSetupDimensionConfig(configuration) {
   return setupConfig;
 }
 
-// Enforces the typed Setup criterion parameter contract (positive-integer
-// windows/lookbacks/periods/counts, finite non-negative tolerances/ratios,
-// supported enum policy values, minimum_sessions <= maximum_sessions, ...)
-// before any detection or evaluation runs. Unsupported profile configurations
-// are rejected instead of silently executing canonical behavior.
+// Enforces the Setup execution contract before any detection or evaluation
+// runs:
+//   - typed Setup criterion parameters (positive-integer windows/lookbacks/
+//     periods/counts, finite non-negative tolerances/ratios, boolean flags,
+//     supported enum policy values, minimum_sessions <= maximum_sessions);
+//   - every parameter a detector/evaluator interprets must be present
+//     (required) — trading-policy fields are never silently defaulted;
+//   - an ENABLED Setup criterion that no evaluator supports is a configuration
+//     error (a clear PROFILE_CONFIG_INVALID), never a runtime 500 from the
+//     criterion registry.
 function assertValidSetupConfiguration(setupConfig) {
   const violations = validateSetupCriteria(setupConfig);
   if (violations.length > 0) {
     throw new SetupQualityInputError(
       `Profile version setup configuration is invalid: ${violations.join('; ')}`,
+      'PROFILE_CONFIG_INVALID'
+    );
+  }
+  const unsupportedEnabled = enabledSetupCriteria(setupConfig)
+    .filter((criterion) => !SETUP_CRITERION_KEYS.includes(criterion.key))
+    .map((criterion) => criterion.key);
+  if (unsupportedEnabled.length > 0) {
+    throw new SetupQualityInputError(
+      `Unsupported enabled Setup criterion key(s): ${unsupportedEnabled.join(', ')}. ` +
+        'No evaluator is implemented for them in Phase 2.',
       'PROFILE_CONFIG_INVALID'
     );
   }
@@ -181,8 +195,40 @@ function findEntrySessionIndex(bars, dateIndexByDate, entryDate) {
   return dateIndexByDate.get(entryDate);
 }
 
-function evidenceWindowDates(entryDate) {
-  const fromDate = addCalendarDays(entryDate, -HISTORY_CALENDAR_DAYS);
+function criterionParameters(setupConfig, key) {
+  const criterion = setupConfig.criteria.find((entry) => entry.key === key);
+  return criterion && criterion.parameters ? criterion.parameters : null;
+}
+
+// Derives the required daily-session history from the immutable Setup
+// configuration: Base Start detection lookback before the breakout, plus the
+// Prior Move search lookback before the Base Start, plus SMA/MA indicator
+// history, plus detector window slack. The resulting session count is then
+// converted into a conservative calendar-day fetch request so a user who
+// enlarges a configured lookback never hits an undocumented fixed 400-day
+// implementation ceiling.
+function requiredHistorySessions(setupConfig) {
+  const baseDuration = criterionParameters(setupConfig, 'base_duration');
+  const priorMove = criterionParameters(setupConfig, 'prior_move');
+  const maTrend = criterionParameters(setupConfig, 'ma_trend');
+
+  const detectionLookback =
+    baseDuration && Number.isInteger(baseDuration.detection_lookback)
+      ? baseDuration.detection_lookback
+      : 60;
+  const priorLookback =
+    priorMove && Number.isInteger(priorMove.search_lookback) ? priorMove.search_lookback : 60;
+  const slowPeriod =
+    maTrend && Number.isInteger(maTrend.slow_period) ? maTrend.slow_period : 20;
+  const slopeLookback =
+    maTrend && Number.isInteger(maTrend.slope_lookback) ? maTrend.slope_lookback : 5;
+
+  return detectionLookback + priorLookback + slowPeriod + slopeLookback + HISTORY_SESSION_SLACK;
+}
+
+function evidenceWindowDates(entryDate, setupConfig) {
+  const sessions = setupConfig ? requiredHistorySessions(setupConfig) : 185;
+  const fromDate = addCalendarDays(entryDate, -calendarDaysForSessions(sessions));
   const toDate = addCalendarDays(entryDate, POST_ENTRY_CALENDAR_DAYS);
   return { fromDate, toDate };
 }
@@ -204,10 +250,8 @@ function parseJsonField(value, label) {
   return null;
 }
 
-// Determines whether a stored evidence snapshot can serve as the single
-// coherent evidence context for an evaluation (same symbol, same entry
-// session, non-empty bars).
-function snapshotIsUsable(snapshot, symbolUpper, entryDate) {
+// Shape check only: bars exist for the same symbol/entry session.
+function snapshotHasShape(snapshot, symbolUpper, entryDate) {
   return (
     snapshot !== null &&
     Array.isArray(snapshot.bars) &&
@@ -215,6 +259,16 @@ function snapshotIsUsable(snapshot, symbolUpper, entryDate) {
     snapshot.entrySessionDate === entryDate &&
     String(snapshot.symbol || '').toUpperCase() === symbolUpper
   );
+}
+
+// Determines whether a stored evidence snapshot is a REUSABLE AUTHORITATIVE
+// scoring snapshot (same symbol, same entry session, non-empty bars AND
+// verified provider completeness). An unverified (cache-only) snapshot is
+// provisional: it is NOT reused — prepare() retries the provider chain so
+// evidence can recover without manual cleanup.
+function snapshotIsUsable(snapshot, symbolUpper, entryDate) {
+  return snapshotHasShape(snapshot, symbolUpper, entryDate) &&
+    completenessFromSnapshot(snapshot) === 'verified';
 }
 
 function evaluationHasResults(evaluation) {
@@ -225,6 +279,54 @@ function evaluationHasResults(evaluation) {
     Object.prototype.hasOwnProperty.call(results, 'setup') &&
     results.setup !== null
   );
+}
+
+function sameBars(a, b) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return a === b;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const x = a[i];
+    const y = b[i];
+    if (
+      x.date !== y.date ||
+      x.open !== y.open ||
+      x.high !== y.high ||
+      x.low !== y.low ||
+      x.close !== y.close ||
+      x.volume !== y.volume
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// True when the staged pivot detection equals the stored detection context
+// (same price/date and the same Base Start it was derived under).
+function stagedPivotMatchesStored(detections, storedDetected) {
+  const stored = storedDetected && storedDetected.pivotDetection;
+  const staged = detections && detections.pivot;
+  if (!stored || !staged) return stored === staged;
+  return (
+    stored.price === staged.price &&
+    stored.date === staged.date &&
+    stored.baseStartDateUsed === staged.derivedFromBaseStart
+  );
+}
+
+// True when a prepare operation changes any semantic dependency that can affect
+// Setup results: evidence context, the confirmed/adjusted Base Start, or the
+// Pivot detection context.
+function prepareChangesSetupContext({ storedSnapshot, reuseStored, bars, storedInputs, storedDetected, stagedBaseStart, detections }) {
+  const evidenceChanged = reuseStored
+    ? !sameBars(bars, storedSnapshot ? storedSnapshot.bars : null)
+    : true;
+  const storedBase = (storedInputs && storedInputs.base_start) || null;
+  const stagedDate = stagedBaseStart ? stagedBaseStart.date : null;
+  const storedDate = storedBase ? storedBase.date : null;
+  const baseStartChanged = stagedDate !== storedDate;
+  const pivotChanged = !stagedPivotMatchesStored(detections, storedDetected);
+  return { evidenceChanged, baseStartChanged, pivotChanged, changed: evidenceChanged || baseStartChanged || pivotChanged };
 }
 
 function completenessFromSnapshot(snapshot) {
@@ -436,15 +538,15 @@ function buildEvidenceSnapshot({ trade, evidence, entryDate, bars, fromDate, toD
 // an existing non-terminal row can be reused.
 //
 // Invariant: ONE evaluation has ONE coherent evidence/detection context.
-//   - When the existing draft already carries a usable evidence snapshot for
-//     the current trade entry session, it is reused (model A) regardless of
-//     whether Setup results have been persisted: prepare() recomputes
-//     detections ONLY against that stored snapshot and never fetches fresh
-//     evidence for it.
-//   - When the existing draft has no usable snapshot and ALREADY holds
-//     persisted results, fresh evidence must not be attached to it: a NEW
-//     draft is created (model B) so refreshed evidence never mixes with the
-//     old evaluation's results/snapshot.
+//   - A VERIFIED stored snapshot is reused (model A) even when Setup results
+//     have been persisted: prepare() recomputes detections ONLY against that
+//     stored snapshot and never fetches fresh evidence for it.
+//   - An UNVERIFIED (cache-only) snapshot is provisional, never authoritative:
+//     prepare() retries the provider chain and, if verified evidence becomes
+//     available, replaces it on the same still-unevaluated draft.
+//   - When the existing draft has a result-bearing snapshot that is NOT
+//     reusable (missing/entry-changed/unverified-with-results), fresh evidence
+//     must not be attached to it: a NEW draft is created (model B).
 async function findEvaluationForPrepare(userId, tradeId, profileVersionId, symbolUpper, entryDate) {
   const db = require('../../config/database');
   const existing = await db.query(
@@ -471,6 +573,8 @@ async function findEvaluationForPrepare(userId, tradeId, profileVersionId, symbo
   if (evaluationHasResults(candidate)) {
     return createEvaluation(userId, tradeId, profileVersionId);
   }
+  // Unverified/no snapshot and no persisted results: reuse the draft and retry
+  // the provider chain (evidence can recover without manual cleanup).
   return candidate;
 }
 
@@ -514,6 +618,45 @@ async function persistPrepareContext(evaluationId, userId, payload) {
   return updated.rows[0];
 }
 
+// Invalidates a stale Setup result when a prepare changed the semantic context
+// (evidence / confirmed Base Start / Pivot detection). The Setup aggregate and
+// flat summary fields are cleared so the old grade is never shown against the
+// new confirmations; the draft id is retained and non-setup result keys (e.g.
+// a future entry/management) are preserved. Run Setup Quality again is then
+// required before Setup is considered evaluated.
+async function clearSetupResults(evaluationId, userId, preservedResults) {
+  const db = require('../../config/database');
+  const updated = await db.query(
+    `
+      UPDATE trade_quality_evaluations
+      SET results = $3,
+          setup_score = NULL,
+          setup_grade = NULL,
+          setup_compliance = NULL,
+          setup_coverage = NULL
+      WHERE id = $1 AND user_id = $2
+        AND status NOT IN ('completed', 'insufficient_data')
+      RETURNING ${EVALUATION_COLUMNS}
+    `,
+    [evaluationId, userId, preservedResults]
+  );
+  if (updated.rows.length === 0) {
+    throw new SetupQualityInputError(
+      'Evaluation could not be updated (it may have reached a terminal state).',
+      'EVALUATION_TERMINAL'
+    );
+  }
+  return updated.rows[0];
+}
+
+function preservedNonSetupResults(results) {
+  const parsed = parseJsonField(results, 'results');
+  if (!parsed || typeof parsed !== 'object') return null;
+  const copy = { ...parsed };
+  delete copy.setup;
+  return Object.keys(copy).length > 0 ? copy : null;
+}
+
 /**
  * Prepares (or re-prepares) the detection context for a Setup Quality
  * evaluation.
@@ -550,7 +693,7 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
   const setupConfig = getSetupDimensionConfig(version.configuration);
   assertValidSetupConfiguration(setupConfig);
 
-  const { fromDate, toDate } = evidenceWindowDates(entryDate);
+  const { fromDate, toDate } = evidenceWindowDates(entryDate, setupConfig);
 
   // Choose the evaluation + evidence pair (model A reuse vs model B refresh).
   const evaluation = await findEvaluationForPrepare(
@@ -632,21 +775,50 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
   });
 
   const existingUserInputs = parseJsonField(evaluation.user_inputs, 'user_inputs') || {};
+  const stagedBaseStart = baseStartForPivot
+    ? { date: baseStartForPivot.date, source: baseStartForPivot.source }
+    : null;
   const userInputs = {
     ...existingUserInputs,
-    ...(baseStartForPivot
-      ? { base_start: { date: baseStartForPivot.date, source: baseStartForPivot.source } }
-      : {})
+    ...(stagedBaseStart ? { base_start: stagedBaseStart } : {})
   };
+
+  // Invalidation rule: if a Setup result is already persisted and this prepare
+  // changes any semantic dependency that can affect Setup results (evidence,
+  // confirmed/adjusted Base Start, or the Pivot detection context), the old
+  // Setup result must not stay represented as valid. The result is cleared
+  // below; the draft id is retained and Run Setup Quality is required again.
+  const storedSnapshot = parseJsonField(evaluation.evidence_snapshot, 'evidence_snapshot');
+  const storedDetected = parseJsonField(evaluation.detected_context, 'detected_context');
+  const hasSetupResult = evaluationHasResults(evaluation);
+  const { baseStartChanged, changed: contextChanged } = prepareChangesSetupContext({
+    storedSnapshot,
+    reuseStored,
+    bars,
+    storedInputs: existingUserInputs,
+    storedDetected,
+    stagedBaseStart,
+    detections
+  });
+  const clearSetup = hasSetupResult && contextChanged;
+
+  // A changed Base Start invalidates any previously confirmed Pivot: never
+  // leave an old pivot confirmation in the persisted user_inputs.
+  if (baseStartChanged) {
+    delete userInputs.pivot;
+  }
 
   const refreshed = await persistPrepareContext(evaluation.id, userId, {
     evidenceSnapshot,
     detectedContext,
     userInputs
   });
+  const finalRow = clearSetup
+    ? await clearSetupResults(evaluation.id, userId, preservedNonSetupResults(evaluation.results))
+    : refreshed;
 
   return {
-    evaluation: toFrontendEvaluation(refreshed),
+    evaluation: toFrontendEvaluation(finalRow),
     profile: {
       id: profile.id,
       name: profile.name
@@ -985,7 +1157,7 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   // were based on; provider history cannot silently change between prepare and
   // evaluate). Only when no stored snapshot exists (e.g. an evaluate called
   // without a prior prepare) is fresh evidence fetched.
-  const { fromDate, toDate } = evidenceWindowDates(entryDate);
+  const { fromDate, toDate } = evidenceWindowDates(entryDate, setupConfig);
   const rawStoredSnapshot = evaluation.evidence_snapshot;
   const storedSnapshot =
     typeof rawStoredSnapshot === 'string'
@@ -1002,11 +1174,18 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     storedSnapshot && Array.isArray(storedSnapshot.bars) && storedSnapshot.bars.length > 0
       ? storedSnapshot.bars
       : null;
-  if (snapshotBars && storedSnapshot.entrySessionDate === entryDate) {
+  // Only a VERIFIED stored snapshot is reused for scoring. An unverified
+  // (cache-only) snapshot is provisional: evaluate() retries the provider chain
+  // so a later provider recovery makes evaluation possible without cleanup.
+  if (
+    snapshotBars &&
+    storedSnapshot.entrySessionDate === entryDate &&
+    completenessFromSnapshot(storedSnapshot) === 'verified'
+  ) {
     evidence = {
       bars: snapshotBars,
       source: storedSnapshot.source || 'stored_snapshot',
-      completeness: completenessFromSnapshot(storedSnapshot),
+      completeness: 'verified',
       error: null
     };
   } else {

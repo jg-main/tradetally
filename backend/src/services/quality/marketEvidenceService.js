@@ -18,23 +18,30 @@
 //     corrupt detector horizons, Base Duration, Prior Move searches,
 //     contraction windows, and SMA history. The Quality path therefore never
 //     uses hasRange().
-//   - When a configured provider/fallback can supply the window, its session
-//     set is authoritative and cache rows only fill dates the provider did not
-//     return (deterministic merge by session date; provider wins conflicts).
-//     The result is marked `completeness: 'verified'`.
+//   - When a configured provider/fallback can supply the window, the
+//     provider-returned dates are the AUTHORITATIVE session identity and the
+//     result is `completeness: 'verified'`. Cache rows may only supplement a
+//     missing field (volume) on a provider-confirmed session; a cache-only
+//     date (a non-session such as a Sunday, or a stale weekday) can never join
+//     a verified provider session set. The orchestrator additionally requires
+//     the provider-confirmed entry session and lets criteria return UNKNOWN
+//     when provider-confirmed history is insufficient for a rule (no session
+//     adjacency is ever invented).
 //   - A partial cache can never prevent fetching a missing entry/base/history
 //     session when an existing provider can supply it.
 //   - When no provider is available, cache rows are returned only as
 //     `completeness: 'unverified'` evidence. Setup evaluation refuses to treat
 //     unverified sessions as consecutive trading sessions: the orchestrator
-//     surfaces UNKNOWN instead of fabricating a score.
+//     surfaces UNKNOWN instead of fabricating a score, and a later prepare
+//     retries the provider chain so evidence can recover without cleanup.
 //   - Missing volume stays missing: the cache is read with
 //     preserveNullVolume and cached zero volumes (which the shared cache uses
 //     to represent missing volume) are treated as missing on the Quality path.
 //     Bars with unknown volume are never written back into the shared cache as
 //     zero-volume observations. Volume Contraction therefore yields UNKNOWN
 //     rather than a fabricated zero-volume PASS.
-//   - Mathematically invalid OHLCV bars are rejected by normalization.
+//   - Mathematically invalid OHLCV bars (non-positive/inverted OHLC, negative
+//     or non-finite volume) are rejected or neutralized by normalization.
 
 const marketData = require('../../utils/finnhub');
 const historicalPriceCache = require('../../utils/historicalPriceCache');
@@ -81,18 +88,29 @@ async function readCachedBars(symbolUpper, fromDate, toDate) {
   }
 }
 
-// Deterministic merge: `primary` (provider) wins per session date; `secondary`
-// (cache) only fills session dates the primary did not return. Output is sorted
-// chronologically by session date.
-function mergeDailyBars(primary, secondary) {
-  const byDate = new Map();
-  for (const bar of secondary || []) {
-    byDate.set(bar.date, bar);
-  }
-  for (const bar of primary || []) {
-    byDate.set(bar.date, bar);
-  }
-  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+// Provider-confirmed sessions are the authoritative session identity for
+// verified Quality evidence. The cache may NEVER introduce a session date the
+// provider did not return (a cache-only date could be a non-session such as a
+// Sunday, or a stale weekday the provider excluded). The only safe cache
+// contribution on the provider path is supplementing a missing field (volume)
+// for a session the provider itself confirmed. Supplementing never creates an
+// extra session.
+function supplementProviderSessions(providerBars, cacheBars) {
+  const cacheByDate = new Map((cacheBars || []).map((bar) => [bar.date, bar]));
+  return providerBars.map((bar) => {
+    if (bar.volume === null || bar.volume === undefined) {
+      const cache = cacheByDate.get(bar.date);
+      if (
+        cache &&
+        typeof cache.volume === 'number' &&
+        Number.isFinite(cache.volume) &&
+        cache.volume > 0
+      ) {
+        return { ...bar, volume: cache.volume };
+      }
+    }
+    return bar;
+  });
 }
 
 async function persistProviderBars(symbolUpper, bars, source) {
@@ -180,11 +198,11 @@ async function loadDailyEvidence({ symbol, userId, fromDate, toDate }) {
   }
 
   if (providerBars && providerBars.length > 0) {
-    // Provider session set is authoritative; the cache only fills dates the
-    // provider omitted. Cached volumes are already surfaced as missing when
-    // the shared cache stored 0 for an unknown volume.
-    const merged = mergeDailyBars(providerBars, cachedBars);
-    await persistProviderBars(symbolUpper, providerBars, providerSource);
+    // The provider's returned session dates ARE the session identity. Cache
+    // rows can only supplement a missing field (volume) on a provider-confirmed
+    // session — never add sessions the provider did not return.
+    const merged = supplementProviderSessions(providerBars, cachedBars);
+    await persistProviderBars(symbolUpper, merged, providerSource);
     return {
       bars: merged,
       source: providerSource,
@@ -212,4 +230,4 @@ async function loadDailyEvidence({ symbol, userId, fromDate, toDate }) {
   };
 }
 
-module.exports = { loadDailyEvidence, mergeDailyBars };
+module.exports = { loadDailyEvidence, supplementProviderSessions };

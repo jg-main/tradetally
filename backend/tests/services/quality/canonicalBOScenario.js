@@ -27,8 +27,12 @@ const PIVOT_PRICE = 102; // base-start/pivot top of the base; touches print ~101
 const PIVOT_TOUCH_INDEX = 89;
 
 function row(high, low, close, volume) {
-  const open = close - 0.4;
-  return [open, high, low, close, volume];
+  // Guarantee a mathematically coherent daily bar (open == close; close clamped
+  // inside [low, high]) so scenario candles satisfy the strict OHLC validity
+  // rules of the Quality evidence layer.
+  const c = Math.min(high, Math.max(low, close));
+  const open = c;
+  return [open, high, low, c, volume];
 }
 
 function buildCanonicalBOSeries({ extraPostBreakout = 10 } = {}) {

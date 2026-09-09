@@ -47,6 +47,39 @@ describe('qualitySetup.controller', () => {
     expect(next).not.toHaveBeenCalled();
   });
 
+  test('prepare forwards confirmedBaseStart through the HTTP boundary untouched', async () => {
+    const payload = { evaluationId: 'eval-1', detectedPivot: { price: 103 } };
+    SetupQualityService.prepare.mockResolvedValue(payload);
+    const req = mockReq({
+      body: {
+        profileId: 'profile-1',
+        confirmedBaseStart: { date: '2026-03-10', source: 'user_adjusted' }
+      }
+    });
+    const res = mockRes();
+    const next = jest.fn();
+
+    await controller.prepareQualitySetup(req, res, next);
+    expect(SetupQualityService.prepare).toHaveBeenCalledWith('user-1', 'trade-1', {
+      profileId: 'profile-1',
+      confirmedBaseStart: { date: '2026-03-10', source: 'user_adjusted' }
+    });
+    expect(res.json).toHaveBeenCalledWith(payload);
+  });
+
+  test('prepare forwards confirmedBaseStart without profileId', async () => {
+    SetupQualityService.prepare.mockResolvedValue({});
+    const req = mockReq({
+      body: { confirmedBaseStart: { date: '2026-03-10', source: 'detected_confirmed' } }
+    });
+    const res = mockRes();
+    await controller.prepareQualitySetup(req, res);
+    expect(SetupQualityService.prepare).toHaveBeenCalledWith('user-1', 'trade-1', {
+      profileId: undefined,
+      confirmedBaseStart: { date: '2026-03-10', source: 'detected_confirmed' }
+    });
+  });
+
   test('evaluate forwards evaluationId + userInputs', async () => {
     const payload = { evaluation: { status: 'draft' } };
     SetupQualityService.evaluate.mockResolvedValue(payload);

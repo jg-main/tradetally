@@ -434,6 +434,10 @@ async function runPrepare() {
   try {
     const payload = await store.prepare(props.trade.id)
     prepared.value = payload
+    // Keep the displayed evaluation in sync with the returned row: a
+    // re-prepare that invalidated stale Setup results must not keep showing
+    // the old grade.
+    evaluation.value = payload.evaluation || evaluation.value
   } catch (err) {
     // store.error is already surfaced in the template
   }
@@ -486,6 +490,9 @@ async function detectPivotForConfirmedBase() {
       }
     })
     prepared.value = payload
+    // Sync the displayed evaluation: the server may have invalidated stale
+    // Setup results when the Base Start context changed.
+    evaluation.value = payload.evaluation || evaluation.value
     pivotInput.value = null
     pivotAdjusted.value = false
     pivotPriceInput.value = ''

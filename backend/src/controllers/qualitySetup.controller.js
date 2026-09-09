@@ -32,8 +32,21 @@ const qualitySetupController = {
   async prepareQualitySetup(req, res, next) {
     try {
       const { id: tradeId } = req.params;
-      const profileId = req.body && req.body.profileId ? String(req.body.profileId) : undefined;
-      const payload = await SetupQualityService.prepare(req.user.id, tradeId, { profileId });
+      const body = req.body || {};
+      const profileId = body.profileId ? String(body.profileId) : undefined;
+      // Forward confirmedBaseStart untouched; SetupQualityService validation is
+      // authoritative (date/session/source checks happen server-side).
+      const confirmedBaseStart =
+        body.confirmedBaseStart && typeof body.confirmedBaseStart === 'object'
+          ? {
+              date: body.confirmedBaseStart.date,
+              source: body.confirmedBaseStart.source
+            }
+          : undefined;
+      const payload = await SetupQualityService.prepare(req.user.id, tradeId, {
+        profileId,
+        confirmedBaseStart
+      });
       return res.json({ ...payload });
     } catch (error) {
       if (error instanceof SetupQualityService.SetupQualityInputError) {
