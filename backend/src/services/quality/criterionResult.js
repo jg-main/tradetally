@@ -8,10 +8,22 @@
 //     key: string,                       // criterion key from the profile version config
 //     status: 'PASS'|'FAIL'|'NOT_APPLICABLE'|'UNKNOWN',
 //     score: number|null,                // 0-100; required for PASS/FAIL, null otherwise
+//     scoring_value: number|string|object|null, // NEW normalized scoring input
 //     raw_value: any|null,               // measured value backing the decision
 //     evidence: object|null,             // drill-down evidence snapshot
 //     message: string|null               // human-readable summary
 //   }
+//
+// `scoring_value` is the normalized input to the criterion's immutable
+// profile `scoring` envelope used to derive `score` for PASS/FAIL:
+//   - binary:            unused (score derives from PASS/FAIL).
+//   - step/piecewise_linear: finite numeric value on the configured curve.
+//   - discrete:          configured outcome-key string.
+//   - composite:         object keyed by component.key whose values are the
+//                        component inputs (boolean for binary components,
+//                        number for step/piecewise, string for discrete).
+// A PASS/FAIL score that contradicts the configured envelope is invalid.
+// UNKNOWN / NOT_APPLICABLE never carry a numeric score.
 //
 // The optional `compliance` field (spec 56 example) is accepted for
 // compatibility but must agree with the status. Aggregation derives the
@@ -76,6 +88,16 @@ function validateCriterionResult(result) {
   if (result.evidence !== undefined && result.evidence !== null) {
     if (typeof result.evidence !== 'object' || Array.isArray(result.evidence)) {
       errors.push('evidence must be an object or null');
+    }
+  }
+
+  if (result.scoring_value !== undefined && result.scoring_value !== null) {
+    const scoringValue = result.scoring_value;
+    const isNumber = typeof scoringValue === 'number' && Number.isFinite(scoringValue);
+    const isString = typeof scoringValue === 'string' && scoringValue.length > 0;
+    const isObject = Object.prototype.toString.call(scoringValue) === '[object Object]';
+    if (!isNumber && !isString && !isObject) {
+      errors.push('scoring_value must be a finite number, non-empty string, plain object, or null');
     }
   }
 

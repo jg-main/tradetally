@@ -198,19 +198,23 @@ describe('Canonical BO scoring configuration', () => {
     }
 
     const entry = byKey(DIMENSIONS.ENTRY);
-    for (const key of ['breakout_session', 'volume_pace', 'range_pace', 'entry_extension', 'stop_width']) {
+    for (const key of Object.keys(entry)) {
       expect(entry[key].scoring).toBeDefined();
     }
-    // Sections 24 and 29 define compliance/evidence rules but no scoring curve.
-    expect(entry.trigger_compliance.scoring).toBeUndefined();
-    expect(entry.initial_stop.scoring).toBeUndefined();
 
     const management = byKey(DIMENSIONS.MANAGEMENT);
-    for (const key of ['partial_timing', 'partial_sizing', 'no_premature_reduction',
-      'post_partial_breakeven', 'trailing_ma']) {
+    for (const key of Object.keys(management)) {
       expect(management[key].scoring).toBeDefined();
     }
-    expect(management.stop_ratchet.scoring).toBeUndefined();
+  });
+
+  it('gives every compliance-only criterion canonical binary scoring (PASS 100 / FAIL 0)', () => {
+    const entry = byKey(DIMENSIONS.ENTRY);
+    expect(entry.trigger_compliance.scoring).toEqual({ type: 'binary', pass_score: 100, fail_score: 0 });
+    expect(entry.initial_stop.scoring).toEqual({ type: 'binary', pass_score: 100, fail_score: 0 });
+
+    const management = byKey(DIMENSIONS.MANAGEMENT);
+    expect(management.stop_ratchet.scoring).toEqual({ type: 'binary', pass_score: 100, fail_score: 0 });
   });
 
   it('encodes the Setup scoring curves exactly', () => {

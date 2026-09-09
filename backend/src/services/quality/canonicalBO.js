@@ -285,9 +285,11 @@ const CANONICAL_BO_CONFIG = {
             allowed_types: ['BO-PIVOT', 'BO-ORH-1', 'BO-ORH-5', 'BO-ORH-60'],
             require_pivot_resolution: true,
             minimum_penetration_pct: 0
-          }
-          // Section 24 defines trigger evidence and compliance but no numeric
-          // scoring curve, so no `scoring` config is attached.
+          },
+          // Section 24 defines trigger evidence and compliance. The canonical
+          // quality scoring for this compliance-only rule is binary:
+          // PASS = 100 / FAIL = 0 (no partial credit).
+          scoring: BINARY_100_0
         },
         {
           key: 'volume_pace',
@@ -365,9 +367,11 @@ const CANONICAL_BO_CONFIG = {
             session: 'regular',
             minimum_buffer_method: 'minimum_tick',
             minimum_buffer_value: 1
-          }
-          // Section 29 defines stop compliance/UNKNOWN but no numeric scoring
-          // curve, so no `scoring` config is attached.
+          },
+          // Section 29 defines stop compliance/UNKNOWN. The canonical quality
+          // scoring for this compliance-only rule is binary:
+          // PASS = 100 / FAIL = 0 (no partial credit).
+          scoring: BINARY_100_0
         },
         {
           key: 'stop_width',
@@ -470,9 +474,12 @@ const CANONICAL_BO_CONFIG = {
           weight: 20,
           parameters: {
             downward_tolerance_ticks: 0
-          }
+          },
           // Section 41 defines the no-lowering rule and UNKNOWN on missing
-          // stop history but no numeric scoring curve.
+          // stop history. The canonical quality scoring for this
+          // compliance-only rule is binary: PASS = 100 / FAIL = 0
+          // (no partial credit).
+          scoring: BINARY_100_0
         },
         {
           key: 'post_partial_breakeven',

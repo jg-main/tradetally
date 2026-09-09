@@ -149,6 +149,7 @@ function aggregateDimension(dimensionConfig, criterionResults, options = {}) {
       key,
       status,
       score: isKnownStatus(status) ? result.score : null,
+      scoringValue: result.scoring_value ?? null,
       weight,
       required,
       applicable,

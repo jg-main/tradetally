@@ -6,22 +6,29 @@
 // produced it and stores the evidence snapshot, detected context, semantic
 // user inputs, and per-dimension results used at evaluation time.
 //
-// Lifecycle invariants (Phase 1 hardening):
+// Lifecycle invariants (Phase 1 final hardening):
 //   - Evaluations are created as `draft` only. Terminal statuses
 //     (`completed` / `insufficient_data`) are produced exclusively through
 //     saveResult(), which validates the terminal payload against the
 //     evaluation's immutable profile-version configuration before persisting.
+//   - Both terminal statuses are immutable: once an evaluation is `completed`
+//     or `insufficient_data`, saveResult() cannot rewrite, upgrade, or replace
+//     it; a later attempt must create a NEW trade_quality_evaluations row.
+//     Draft and future `needs_input` rows remain mutable pre-terminal states.
 //   - createEvaluation() atomically enforces ownership: the trade must belong
 //     to the user and the profile version must belong to a Quality Profile
 //     owned by the same user.
-//   - Completed evaluations are immutable (DB trigger + service guard); a new
-//     calculation always creates a new evaluation row (spec section 6).
-//   - Terminal flat summary columns are derived from validated aggregate
-//     results, never trusted from the caller directly.
+//   - The persisted completed snapshot is NORMALIZED from the immutable
+//     profile-version configuration: every PASS/FAIL criterion score is
+//     derived from (or validated against) the criterion's `scoring` envelope
+//     plus its normalized `scoring_value`, and per-dimension summaries are
+//     recomputed by the aggregation engine. Caller-supplied aggregates are
+//     not trusted.
 
 const db = require('../../config/database');
-const { EVALUATION_STATUS } = require('./constants');
+const { CRITERION_STATUS, EVALUATION_STATUS } = require('./constants');
 const { aggregateDimension } = require('./aggregation');
+const { deriveScoreForCriterion } = require('./scoring');
 
 const EVALUATION_COLUMNS = `
   id, user_id, trade_id, profile_version_id, status,
@@ -33,6 +40,8 @@ const EVALUATION_COLUMNS = `
 `;
 
 const DIMENSION_SUMMARY_KEYS = ['setup', 'entry', 'management'];
+
+const TERMINAL_STATUS_SQL = "e.status NOT IN ('completed', 'insufficient_data')";
 
 // Mirrors the dimension result summaries returned by the aggregation engine
 // into the flat queryable columns on trade_quality_evaluations.
@@ -57,12 +66,18 @@ function sameNullableNumber(a, b) {
   return typeof a === 'number' && typeof b === 'number' && Math.abs(a - b) < 1e-9;
 }
 
-// Recomputes a dimension aggregate from the supplied result's per-criterion
-// states using the evaluation's immutable profile-version configuration, then
-// requires the supplied aggregate summary to match. The caller may not assert
-// a score/grade/compliance/coverage combination that the aggregation engine
-// would not derive for that profile version.
-function assertConsistentDimensionResult(dimension, dimensionConfig, dimResult) {
+// Normalizes the caller-supplied criterion rows for one dimension against the
+// immutable dimension configuration:
+//   - rejects rows whose key is not an enabled configured criterion;
+//   - rejects duplicate keys;
+//   - derives PASS/FAIL scores from the criterion `scoring` envelope and the
+//     row `scoring_value`, rejecting scores that contradict the profile
+//     scoring configuration;
+//   - requires UNKNOWN/NOT_APPLICABLE rows to carry no numeric score;
+//   - preserves raw_value / scoring_value / evidence / message.
+// Omitted enabled criteria are left for the aggregation engine to normalize
+// to UNKNOWN.
+function normalizeCriterionRows(dimension, dimensionConfig, dimResult) {
   if (dimResult === null || typeof dimResult !== 'object' || Array.isArray(dimResult)) {
     throw new Error(`completed results for dimension "${dimension}" must be an object`);
   }
@@ -70,27 +85,79 @@ function assertConsistentDimensionResult(dimension, dimensionConfig, dimResult) 
     throw new Error(`completed results for dimension "${dimension}" require criterionResults`);
   }
 
-  const criterionResults = dimResult.criterionResults.map((entry) => ({
-    key: entry.key,
-    status: entry.status,
-    score: entry.score ?? null,
-    raw_value: entry.rawValue ?? entry.raw_value ?? null,
-    evidence: entry.evidence ?? null,
-    message: entry.message ?? null
-  }));
+  const enabledCriteria = dimensionConfig.criteria.filter(
+    (criterion) => criterion.enabled === undefined || criterion.enabled === true
+  );
+  const enabledByKey = new Map(enabledCriteria.map((criterion) => [criterion.key, criterion]));
+  const seen = new Set();
+  const rows = [];
 
-  const recomputed = aggregateDimension(dimensionConfig, criterionResults);
+  for (const entry of dimResult.criterionResults) {
+    if (entry === null || typeof entry !== 'object') {
+      throw new Error(`criterion results for dimension "${dimension}" must be objects`);
+    }
+    const configured = enabledByKey.get(entry.key);
+    if (!configured) {
+      throw new Error(
+        `criterion result key "${entry.key}" is not an enabled criterion of dimension "${dimension}"`
+      );
+    }
+    if (seen.has(entry.key)) {
+      throw new Error(`duplicate criterion result for "${entry.key}" in dimension "${dimension}"`);
+    }
+    seen.add(entry.key);
 
-  if (!sameNullableNumber(recomputed.score, dimResult.score) ||
-      recomputed.grade !== dimResult.grade ||
-      recomputed.compliance !== dimResult.compliance ||
-      !sameNullableNumber(recomputed.coverage, dimResult.coverage)) {
-    throw new Error(
-      `invalid completed results for dimension "${dimension}": score/grade/compliance/coverage ` +
-      'contradict the profile version configuration'
-    );
+    let normalizedScore;
+    let scoringValue;
+    if (Object.prototype.hasOwnProperty.call(entry, 'scoring_value')) {
+      scoringValue = entry.scoring_value ?? null;
+    } else if (Object.prototype.hasOwnProperty.call(entry, 'scoringValue')) {
+      scoringValue = entry.scoringValue ?? null;
+    } else {
+      scoringValue = null;
+    }
+
+    if (entry.status === CRITERION_STATUS.PASS || entry.status === CRITERION_STATUS.FAIL) {
+      if (entry.score === null || entry.score === undefined) {
+        throw new Error(`criterion "${entry.key}" requires a numeric score for status ${entry.status}`);
+      }
+      if (configured.weight > 0 && configured.scoring) {
+        const derived = deriveScoreForCriterion({
+          status: entry.status,
+          scoring: configured.scoring,
+          scoringValue
+        });
+        if (derived.error) {
+          throw new Error(`criterion "${entry.key}" in dimension "${dimension}": ${derived.error}`);
+        }
+        if (!sameNullableNumber(derived.score, entry.score)) {
+          throw new Error(
+            `criterion "${entry.key}" in dimension "${dimension}": score contradicts its profile scoring configuration`
+          );
+        }
+        normalizedScore = derived.score;
+      } else {
+        // Zero-weight / scoreless criterion carried as non-scoring evidence.
+        normalizedScore = entry.score;
+      }
+    } else {
+      if (entry.score !== null && entry.score !== undefined) {
+        throw new Error(`criterion "${entry.key}" with status ${entry.status} must not carry a quality score`);
+      }
+      normalizedScore = null;
+    }
+
+    rows.push({
+      key: entry.key,
+      status: entry.status,
+      score: normalizedScore,
+      scoring_value: scoringValue,
+      raw_value: entry.raw_value ?? entry.rawValue ?? null,
+      evidence: entry.evidence ?? null,
+      message: entry.message ?? null
+    });
   }
-  return recomputed;
+  return rows;
 }
 
 function assertTerminalStatus(status) {
@@ -141,14 +208,18 @@ async function createEvaluation(userId, tradeId, profileVersionId, data = {}) {
   return result.rows[0];
 }
 
-// Persists a terminal result for an evaluation. For `completed`, the supplied
-// per-dimension results must cover every dimension configured in the
-// evaluation's immutable profile version and every dimension summary must
-// match a fresh aggregation over that version's configuration. Flat summary
-// columns are derived from the recomputed aggregates. For `insufficient_data`,
-// no completed dimension results may be attached. Completed rows are
-// immutable: this refuses to overwrite one, and the DB trigger rejects the
-// UPDATE regardless.
+// Persists a terminal result for an evaluation. Once the evaluation reaches a
+// terminal status (`completed` or `insufficient_data`) it is immutable: a
+// later attempt must create a new evaluation row.
+//
+// `completed`: every dimension supplied must cover exactly the configured
+// dimensions; per-criterion PASS/FAIL scores are derived from/validated
+// against the immutable profile-version scoring configuration and the
+// normalized aggregate is recomputed by the aggregation engine; flat summary
+// columns derive from the recomputed aggregate; the persisted results JSONB
+// is the normalized aggregate (raw evidence/scoring values preserved).
+//
+// `insufficient_data`: no completed dimension results may be attached.
 async function saveResult(evaluationId, userId, data) {
   assertTerminalStatus(data.status);
 
@@ -161,7 +232,7 @@ async function saveResult(evaluationId, userId, data) {
       WHERE e.id = $1
         AND e.user_id = $2
         AND p.user_id = $2
-        AND e.status <> 'completed'
+        AND ${TERMINAL_STATUS_SQL}
     `,
     [evaluationId, userId]
   );
@@ -193,19 +264,40 @@ async function saveResult(evaluationId, userId, data) {
       );
     }
 
-    const recomputedByDimension = {};
+    // Normalize + validate each dimension from the immutable configuration,
+    // then recompute the authoritative aggregate.
+    const normalizedResults = {};
     for (const dimension of configuredDimensions) {
-      recomputedByDimension[dimension] = assertConsistentDimensionResult(
-        dimension,
-        configuration.dimensions[dimension],
-        results[dimension]
-      );
+      const rows = normalizeCriterionRows(dimension, configuration.dimensions[dimension], results[dimension]);
+      const recomputed = aggregateDimension(configuration.dimensions[dimension], rows);
+
+      const supplied = results[dimension];
+      if (supplied.score !== undefined && !sameNullableNumber(supplied.score, recomputed.score)) {
+        throw new Error(
+          `invalid completed results for dimension "${dimension}": score contradicts the profile version configuration`
+        );
+      }
+      if (supplied.grade !== undefined && supplied.grade !== recomputed.grade) {
+        throw new Error(
+          `invalid completed results for dimension "${dimension}": grade contradicts the profile version configuration`
+        );
+      }
+      if (supplied.compliance !== undefined && supplied.compliance !== recomputed.compliance) {
+        throw new Error(
+          `invalid completed results for dimension "${dimension}": compliance contradicts the profile version configuration`
+        );
+      }
+      if (supplied.coverage !== undefined && !sameNullableNumber(supplied.coverage, recomputed.coverage)) {
+        throw new Error(
+          `invalid completed results for dimension "${dimension}": coverage contradicts the profile version configuration`
+        );
+      }
+
+      normalizedResults[dimension] = recomputed;
     }
-    // Flat summary columns derive from the validated aggregates. The results
-    // JSONB keeps the supplied evidence/enriched rows, which are guaranteed
-    // to agree with the recomputed summaries.
-    summaries = summariesFromResults(recomputedByDimension);
-    persistedResults = results;
+
+    summaries = summariesFromResults(normalizedResults);
+    persistedResults = normalizedResults;
   }
 
   const updated = await db.query(
@@ -232,7 +324,7 @@ async function saveResult(evaluationId, userId, data) {
         evaluated_at = CURRENT_TIMESTAMP
       WHERE id = $1
         AND user_id = $2
-        AND status <> 'completed'
+        AND status NOT IN ('completed', 'insufficient_data')
       RETURNING ${EVALUATION_COLUMNS}
     `,
     [
@@ -291,6 +383,7 @@ module.exports = {
   EVALUATION_COLUMNS,
   DIMENSION_SUMMARY_KEYS,
   summariesFromResults,
+  normalizeCriterionRows,
   createEvaluation,
   saveResult,
   getEvaluation,

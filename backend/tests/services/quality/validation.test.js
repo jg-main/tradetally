@@ -11,7 +11,14 @@ const {
 function dim(overrides = {}) {
   return {
     minimum_coverage: DEFAULT_MINIMUM_COVERAGE,
-    criteria: overrides.criteria || [{ key: 'a', enabled: true, required: true, weight: 100, parameters: {} }]
+    criteria: overrides.criteria || [{
+      key: 'a',
+      enabled: true,
+      required: true,
+      weight: 100,
+      parameters: {},
+      scoring: { type: 'binary', pass_score: 100, fail_score: 0 }
+    }]
   };
 }
 
@@ -100,8 +107,14 @@ describe('assertProfileVersionConfiguration', () => {
     expect(() => assertProfileVersionConfiguration(versionConfig({ setup: dim() }))).not.toThrow();
     expect(() => assertProfileVersionConfiguration(versionConfig({
       setup: dim(),
-      entry: dim({ criteria: [{ key: 'e1', weight: 100, parameters: {} }] }),
-      management: dim({ criteria: [{ key: 'm1', weight: 100 }] })
+      entry: dim({ criteria: [{
+        key: 'e1', weight: 100, parameters: {},
+        scoring: { type: 'binary', pass_score: 100, fail_score: 0 }
+      }] }),
+      management: dim({ criteria: [{
+        key: 'm1', weight: 100,
+        scoring: { type: 'binary', pass_score: 100, fail_score: 0 }
+      }] })
     }))).not.toThrow();
   });
 
@@ -132,7 +145,10 @@ describe('assertProfileVersionConfiguration', () => {
   });
 
   it('validates grade_thresholds completeness, range, and strict order', () => {
-    const baseCriteria = [{ key: 'a', weight: 100 }];
+    const baseCriteria = [{
+      key: 'a', weight: 100,
+      scoring: { type: 'binary', pass_score: 100, fail_score: 0 }
+    }];
     expect(() => assertProfileVersionConfiguration(versionConfig({
       setup: { criteria: baseCriteria, grade_thresholds: { A: 90, B: 80, C: 70, D: 60 } }
     }))).not.toThrow();
@@ -168,9 +184,18 @@ describe('assertProfileVersionConfiguration', () => {
     }))).toThrow(/fail_score/);
   });
 
-  it('accepts criteria without parameters or scoring (envelope defaults)', () => {
+  it('requires scoring configuration on enabled positive-weight criteria', () => {
     expect(() => assertProfileVersionConfiguration(versionConfig({
       setup: { criteria: [{ key: 'a', weight: 100 }] }
+    }))).toThrow(/positive weight but no scoring configuration/);
+  });
+
+  it('accepts enabled zero-weight criteria without scoring (non-scoring evidence)', () => {
+    expect(() => assertProfileVersionConfiguration(versionConfig({
+      setup: { criteria: [
+        { key: 'scored', weight: 100, scoring: { type: 'binary', pass_score: 100, fail_score: 0 } },
+        { key: 'evidence_only', weight: 0 }
+      ] }
     }))).not.toThrow();
   });
 });

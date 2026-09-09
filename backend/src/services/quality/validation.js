@@ -254,6 +254,24 @@ function assertProfileVersionConfiguration(configuration) {
       assertGradeThresholds(dimConfig.grade_thresholds, `dimension "${dimension}"`);
     }
     assertDimensionConfig(dimConfig);
+
+    // The profile scoring configuration is the authoritative source of
+    // numerical criterion scores. Every enabled criterion that carries
+    // positive quality weight must declare an explicit scoring envelope;
+    // zero-weight criteria may be scoreless (non-scoring evidence).
+    for (const criterion of dimConfig.criteria) {
+      const enabled = criterion.enabled !== undefined ? criterion.enabled : true;
+      if (
+        enabled &&
+        typeof criterion.weight === 'number' &&
+        criterion.weight > 0 &&
+        (criterion.scoring === undefined || criterion.scoring === null)
+      ) {
+        throw new Error(
+          `dimension "${dimension}" criterion "${criterion.key}" has positive weight but no scoring configuration`
+        );
+      }
+    }
   }
 }
 

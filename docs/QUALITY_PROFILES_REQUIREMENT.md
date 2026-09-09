@@ -1400,6 +1400,15 @@ minutes_after_first_trigger
 
 Do not automatically fail second-break entries in v1; retain them as evidence unless the profile explicitly requires first break.
 
+Canonical quality scoring for Trigger Compliance (binary; no partial credit):
+
+```text
+PASS → 100
+FAIL → 0
+```
+
+UNKNOWN / NOT_APPLICABLE carry no numeric score, and compliance remains independent of the numerical quality score.
+
 ---
 
 # 25. Entry Extension
@@ -1656,6 +1665,15 @@ UNKNOWN
 Do not infer that the user's real stop was the rule-based reference stop.
 
 A reference/hypothetical stop may be displayed separately.
+
+Canonical quality scoring for Initial Stop (binary; no partial credit):
+
+```text
+PASS → 100
+FAIL → 0
+```
+
+UNKNOWN / NOT_APPLICABLE carry no numeric score, and compliance remains independent of the numerical quality score.
 
 ---
 
@@ -2085,6 +2103,15 @@ I confirm the stop was never lowered
 ```
 
 but must be marked as `user_asserted`.
+
+Canonical quality scoring for Stop Ratchet (binary; no partial credit):
+
+```text
+PASS → 100
+FAIL → 0
+```
+
+UNKNOWN / NOT_APPLICABLE carry no numeric score, and compliance remains independent of the numerical quality score.
 
 ---
 
@@ -2609,12 +2636,28 @@ and return a standardized result such as:
   "key": "range_contraction",
   "status": "PASS",
   "score": 90,
+  "scoring_value": 0.542,
   "compliance": true,
   "raw_value": 0.542,
   "evidence": {},
   "message": "Recent 5-session range is 54.2% of the prior 10-session range."
 }
 ```
+
+`scoring_value` is the normalized input to the criterion's immutable profile `scoring` envelope, used to derive (and later validate) the PASS/FAIL numerical `score`:
+
+```text
+binary             scoring_value unused; score derives from PASS/FAIL
+step               finite numeric value on the configured curve
+piecewise_linear   finite numeric value on the configured curve
+discrete           configured outcome-key string
+composite          object keyed by component.key with component inputs
+                   (boolean for binary components, number for
+                   step/piecewise components, string for discrete
+                   components)
+```
+
+The persisted PASS/FAIL score must agree with the profile scoring configuration applied to `scoring_value`; caller-supplied scores are never trusted. UNKNOWN / NOT_APPLICABLE results carry no numeric `score` and no `scoring_value` is used.
 
 Allowed criterion status values:
 

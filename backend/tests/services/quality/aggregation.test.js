@@ -202,6 +202,22 @@ describe('aggregateDimension', () => {
     expect(out.score).toBeCloseTo(80, 5);
   });
 
+  it('passes scoring_value through to enriched criterion rows', () => {
+    const config = configWith([criterion('a', 100, { required: true })]);
+    const out = aggregateDimension(config, [{
+      key: 'a',
+      status: CRITERION_STATUS.PASS,
+      score: 90,
+      scoring_value: 0.542,
+      raw_value: 0.542,
+      message: 'ratio 0.542'
+    }]);
+
+    expect(out.criterionResults[0].scoringValue).toBe(0.542);
+    expect(out.criterionResults[0].rawValue).toBe(0.542);
+    expect(out.criterionResults[0].message).toBe('ratio 0.542');
+  });
+
   it('throws on invalid dimension config', () => {
     expect(() => aggregateDimension({ criteria: [{ key: 'a', weight: -1 }] }, [])).toThrow(/weight/);
     expect(() => aggregateDimension({ criteria: [{ key: 'a', weight: 10, enabled: 'yes' }] }, []))
@@ -258,12 +274,16 @@ describe('gradeForScore', () => {
 });
 
 describe('assertProfileVersionConfiguration', () => {
+  function scored(key, weight, overrides = {}) {
+    return { ...criterion(key, weight, overrides), scoring: { type: 'binary', pass_score: 100, fail_score: 0 } };
+  }
+
   it('accepts a configuration with all three dimensions', () => {
     const config = {
       dimensions: {
-        setup: configWith([criterion('a', 100)]),
-        entry: configWith([criterion('b', 100)]),
-        management: configWith([criterion('c', 100)])
+        setup: configWith([scored('a', 100)]),
+        entry: configWith([scored('b', 100)]),
+        management: configWith([scored('c', 100)])
       }
     };
     expect(() => assertProfileVersionConfiguration(config)).not.toThrow();

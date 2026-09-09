@@ -88,6 +88,21 @@ describe('validateCriterionResult', () => {
     expect(validateCriterionResult(base({ message: 42 })).valid).toBe(false);
   });
 
+  it('accepts an optional scoring_value as number, string, or object', () => {
+    expect(validateCriterionResult(base({ scoring_value: 0.542 })).valid).toBe(true);
+    expect(validateCriterionResult(base({ scoring_value: 'same_trigger_session' })).valid).toBe(true);
+    expect(validateCriterionResult(base({ scoring_value: { touches: 3, recent: true } })).valid).toBe(true);
+    expect(validateCriterionResult(base({ scoring_value: null })).valid).toBe(true);
+  });
+
+  it('rejects malformed scoring_value values', () => {
+    expect(validateCriterionResult(base({ scoring_value: [0.542] })).valid).toBe(false);
+    expect(validateCriterionResult(base({ scoring_value: Number.NaN })).valid).toBe(false);
+    expect(validateCriterionResult(base({ scoring_value: () => 100 })).valid).toBe(false);
+    expect(validateCriterionResult(base({ scoring_value: '' })).valid).toBe(false);
+    expect(validateCriterionResult(base({ scoring_value: new Date() })).valid).toBe(false);
+  });
+
   it('rejects non-object results', () => {
     expect(validateCriterionResult(null).valid).toBe(false);
     expect(validateCriterionResult('pass').valid).toBe(false);
