@@ -835,6 +835,17 @@ class User {
       // Delete trades after their queued work has been canceled.
       await client.query('DELETE FROM trades WHERE user_id = $1', [userId]);
 
+      // Quality Profiles keep immutable, history-safe references: profile
+      // versions and evaluations are RESTRICT-ed against profile/version
+      // deletion, so they must be removed explicitly (in dependency order)
+      // before the user row can be deleted.
+      await client.query('DELETE FROM trade_quality_evaluations WHERE user_id = $1', [userId]);
+      await client.query(`
+        DELETE FROM quality_profile_versions
+        WHERE profile_id IN (SELECT id FROM quality_profiles WHERE user_id = $1)
+      `, [userId]);
+      await client.query('DELETE FROM quality_profiles WHERE user_id = $1', [userId]);
+
       // Finally, delete the user
       // Other tables with ON DELETE CASCADE will be handled automatically
       const query = `DELETE FROM users WHERE id = $1`;

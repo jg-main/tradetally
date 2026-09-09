@@ -12,7 +12,7 @@
 
 const db = require('../../config/database');
 const { DEFAULT_SCHEMA_VERSION } = require('./constants');
-const { assertProfileVersionConfiguration } = require('./aggregation');
+const { assertProfileVersionConfiguration } = require('./validation');
 const {
   CANONICAL_BO_NAME,
   CANONICAL_BO_DESCRIPTION,
@@ -88,8 +88,17 @@ async function getCurrentVersion(profileId, userId) {
 }
 
 // Creates a quality profile with its first immutable version (version 1).
+//
+// Generic profile creation REQUIRES an explicit valid configuration. Only
+// the Canonical BO preset path (ensureCanonicalBO) injects the canonical
+// default; a generic profile must never silently become Canonical BO.
 async function createProfile(userId, profileData) {
-  const configuration = profileData.configuration || getCanonicalBOConfig();
+  const configuration = profileData.configuration;
+  if (configuration === undefined || configuration === null) {
+    throw new Error(
+      'Profile configuration is required; use ensureCanonicalBO() to create the Canonical BO preset'
+    );
+  }
   assertProfileVersionConfiguration(configuration);
 
   const name = typeof profileData.name === 'string' ? profileData.name.trim() : '';
@@ -97,9 +106,23 @@ async function createProfile(userId, profileData) {
     throw new Error('Profile name is required');
   }
 
+  const playbookId = profileData.playbookId || null;
+  const instrumentType = profileData.instrumentType || null;
+  const isActive = profileData.isActive !== false;
+
   const client = await db.connect();
   try {
     await client.query('BEGIN');
+
+    if (playbookId) {
+      const playbookResult = await client.query(
+        'SELECT 1 AS found FROM playbooks WHERE id = $1 AND user_id = $2',
+        [playbookId, userId]
+      );
+      if (playbookResult.rows.length === 0) {
+        throw new Error('playbook not found or not owned by this user');
+      }
+    }
 
     const profileResult = await client.query(
       `
@@ -107,17 +130,18 @@ async function createProfile(userId, profileData) {
           user_id, name, description, playbook_id, instrument_type, is_active
         )
         VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING ${PROFILE_COLUMNS}
+        RETURNING id
       `,
       [
         userId,
         name,
         profileData.description || null,
-        profileData.playbookId || null,
-        profileData.instrumentType || null,
-        profileData.isActive !== false
+        playbookId,
+        instrumentType,
+        isActive
       ]
     );
+    const profileId = profileResult.rows[0].id;
 
     const versionResult = await client.query(
       `
@@ -127,20 +151,26 @@ async function createProfile(userId, profileData) {
         VALUES ($1, $2, $3, $4)
         RETURNING ${VERSION_COLUMNS}
       `,
-      [profileResult.rows[0].id, 1, DEFAULT_SCHEMA_VERSION, configuration]
+      [profileId, 1, DEFAULT_SCHEMA_VERSION, configuration]
     );
 
-    await client.query(
+    // Return the actual persisted profile state (current_version_id set),
+    // not the stale pre-version INSERT row.
+    const updatedResult = await client.query(
       `
         UPDATE quality_profiles
         SET current_version_id = $1
-        WHERE id = $2
+        WHERE id = $2 AND user_id = $3
+        RETURNING ${PROFILE_COLUMNS}
       `,
-      [versionResult.rows[0].id, profileResult.rows[0].id]
+      [versionResult.rows[0].id, profileId, userId]
     );
+    if (updatedResult.rows.length === 0) {
+      throw new Error('profile could not be updated after version creation');
+    }
 
     await client.query('COMMIT');
-    return profileResult.rows[0];
+    return updatedResult.rows[0];
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;

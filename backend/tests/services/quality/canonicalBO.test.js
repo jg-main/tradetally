@@ -183,3 +183,242 @@ describe('Canonical BO seed configuration', () => {
     expect(Object.isFrozen(CANONICAL_BO_CONFIG.dimensions.setup.criteria[0])).toBe(true);
   });
 });
+
+describe('Canonical BO scoring configuration', () => {
+  function byKey(dimension) {
+    return Object.fromEntries(
+      CANONICAL_BO_CONFIG.dimensions[dimension].criteria.map((criterion) => [criterion.key, criterion])
+    );
+  }
+
+  it('attaches typed scoring to every criterion with a spec-defined curve', () => {
+    const setup = byKey(DIMENSIONS.SETUP);
+    for (const key of Object.keys(setup)) {
+      expect(setup[key].scoring).toBeDefined();
+    }
+
+    const entry = byKey(DIMENSIONS.ENTRY);
+    for (const key of ['breakout_session', 'volume_pace', 'range_pace', 'entry_extension', 'stop_width']) {
+      expect(entry[key].scoring).toBeDefined();
+    }
+    // Sections 24 and 29 define compliance/evidence rules but no scoring curve.
+    expect(entry.trigger_compliance.scoring).toBeUndefined();
+    expect(entry.initial_stop.scoring).toBeUndefined();
+
+    const management = byKey(DIMENSIONS.MANAGEMENT);
+    for (const key of ['partial_timing', 'partial_sizing', 'no_premature_reduction',
+      'post_partial_breakeven', 'trailing_ma']) {
+      expect(management[key].scoring).toBeDefined();
+    }
+    expect(management.stop_ratchet.scoring).toBeUndefined();
+  });
+
+  it('encodes the Setup scoring curves exactly', () => {
+    const setup = byKey(DIMENSIONS.SETUP);
+
+    expect(setup.leader.scoring).toEqual({ type: 'binary', pass_score: 100, fail_score: 0 });
+    expect(setup.base_duration.scoring).toEqual({ type: 'binary', pass_score: 100, fail_score: 0 });
+
+    // Section 14.5.
+    expect(setup.prior_move.scoring).toEqual({
+      type: 'step',
+      mode: 'gte',
+      default_score: 0,
+      thresholds: [
+        { value: 20, score: 40 },
+        { value: 30, score: 60 },
+        { value: 40, score: 80 },
+        { value: 60, score: 90 },
+        { value: 100, score: 100 }
+      ]
+    });
+
+    // Section 16.5: score = 100 * non_lower_transitions / total_transitions.
+    expect(setup.higher_lows.scoring).toEqual({
+      type: 'piecewise_linear',
+      points: [
+        { value: 0, score: 0 },
+        { value: 1, score: 100 }
+      ]
+    });
+
+    // Sections 17.4 / 18.3.
+    const contractionBands = {
+      type: 'step',
+      mode: 'lte',
+      default_score: 0,
+      thresholds: [
+        { value: 0.4, score: 100 },
+        { value: 0.55, score: 90 },
+        { value: 0.7, score: 75 },
+        { value: 0.85, score: 50 },
+        { value: 1.0, score: 25 }
+      ]
+    };
+    expect(setup.range_contraction.scoring).toEqual(contractionBands);
+    expect(setup.volume_contraction.scoring).toEqual(contractionBands);
+
+    // Section 19.3 (passing subcomponents count).
+    expect(setup.ma_trend.scoring).toEqual({
+      type: 'step',
+      mode: 'gte',
+      default_score: 0,
+      thresholds: [
+        { value: 1, score: 33 },
+        { value: 2, score: 67 },
+        { value: 3, score: 100 }
+      ]
+    });
+  });
+
+  it('encodes the Pivot Quality composite with canonical subweights (section 21.4)', () => {
+    const pivot = byKey(DIMENSIONS.SETUP).pivot_quality.scoring;
+    expect(pivot.type).toBe('composite');
+    expect(pivot.components.map((c) => c.weight)).toEqual([30, 20, 30, 20]);
+    expect(pivot.components.map((c) => c.key)).toEqual([
+      'resistance_touches', 'recent_touch', 'd1_proximity', 'no_prior_resolution'
+    ]);
+
+    const touches = pivot.components[0].scoring;
+    expect(touches).toEqual({
+      type: 'step',
+      mode: 'gte',
+      default_score: 0,
+      thresholds: [
+        { value: 1, score: 40 },
+        { value: 2, score: 80 },
+        { value: 3, score: 100 }
+      ]
+    });
+    expect(pivot.components[1].scoring).toEqual({ type: 'binary', pass_score: 100, fail_score: 0 });
+    expect(pivot.components[2].scoring).toEqual({
+      type: 'piecewise_linear',
+      points: [
+        { value: 2, score: 100 },
+        { value: 5, score: 70 },
+        { value: 10, score: 0 }
+      ]
+    });
+    expect(pivot.components[3].scoring).toEqual({ type: 'binary', pass_score: 100, fail_score: 0 });
+  });
+
+  it('encodes the Entry scoring curves exactly', () => {
+    const entry = byKey(DIMENSIONS.ENTRY);
+
+    expect(entry.breakout_session.scoring).toEqual({ type: 'binary', pass_score: 100, fail_score: 0 });
+
+    // Section 26.
+    expect(entry.volume_pace.scoring).toEqual({
+      type: 'step',
+      mode: 'gte',
+      default_score: 0,
+      thresholds: [
+        { value: 0.8, score: 25 },
+        { value: 1.0, score: 60 },
+        { value: 1.4, score: 85 },
+        { value: 2.0, score: 100 }
+      ]
+    });
+
+    // Section 27.
+    expect(entry.range_pace.scoring).toEqual({
+      type: 'step',
+      mode: 'gte',
+      default_score: 0,
+      thresholds: [
+        { value: 0.75, score: 40 },
+        { value: 1.0, score: 70 },
+        { value: 1.25, score: 90 },
+        { value: 1.5, score: 100 }
+      ]
+    });
+
+    // Section 25 (ADR units).
+    expect(entry.entry_extension.scoring).toEqual({
+      type: 'step',
+      mode: 'lte',
+      default_score: 0,
+      thresholds: [
+        { value: 0.05, score: 100 },
+        { value: 0.1, score: 90 },
+        { value: 0.2, score: 75 },
+        { value: 0.3, score: 50 },
+        { value: 0.5, score: 25 }
+      ]
+    });
+
+    // Section 31 (stop width / ADR$).
+    expect(entry.stop_width.scoring).toEqual({
+      type: 'step',
+      mode: 'lte',
+      default_score: 0,
+      thresholds: [
+        { value: 0.5, score: 100 },
+        { value: 0.75, score: 90 },
+        { value: 1.0, score: 75 },
+        { value: 1.25, score: 40 }
+      ]
+    });
+  });
+
+  it('encodes the Management scoring curves and missing-data behavior exactly', () => {
+    const management = byKey(DIMENSIONS.MANAGEMENT);
+
+    // Sections 36.3/38/42/45: these conditional rules may legitimately be
+    // NOT_APPLICABLE, so they declare not_applicable missing-data behavior.
+    for (const key of ['partial_timing', 'partial_sizing', 'post_partial_breakeven', 'trailing_ma']) {
+      expect(management[key].missing_data_behavior).toBe('not_applicable');
+    }
+
+    expect(management.partial_timing.scoring).toEqual({
+      type: 'discrete',
+      scores: { same_trigger_session: 100, next_session: 50, later_or_not_completed: 0 }
+    });
+
+    // Section 39 (deviation from the 50% target, in percentage points/100).
+    expect(management.partial_sizing.scoring).toEqual({
+      type: 'step',
+      mode: 'lte',
+      default_score: 0,
+      thresholds: [
+        { value: 0.02, score: 100 },
+        { value: 0.05, score: 90 },
+        { value: 0.1, score: 70 },
+        { value: 0.2, score: 40 }
+      ]
+    });
+
+    // Section 40 (fraction reduced before trigger).
+    expect(management.no_premature_reduction.scoring).toEqual({
+      type: 'step',
+      mode: 'lte',
+      default_score: 0,
+      thresholds: [
+        { value: 0, score: 100 },
+        { value: 0.1, score: 75 },
+        { value: 0.25, score: 50 }
+      ]
+    });
+
+    expect(management.post_partial_breakeven.scoring).toEqual({
+      type: 'discrete',
+      scores: {
+        same_session_at_or_above_be: 100,
+        before_next_session: 70,
+        raised_below_be: 40,
+        no_meaningful_reduction: 0
+      }
+    });
+
+    // Section 44.
+    expect(management.trailing_ma.scoring).toEqual({
+      type: 'discrete',
+      scores: {
+        within_window: 100,
+        later_same_next_session: 70,
+        one_session_late: 40,
+        later_or_ignored: 0
+      }
+    });
+  });
+});

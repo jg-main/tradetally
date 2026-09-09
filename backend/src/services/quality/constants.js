@@ -73,6 +73,39 @@ const DIMENSION_KEYS = Object.freeze([
   DIMENSIONS.MANAGEMENT
 ]);
 
+// Criterion-level policy describing how the criterion handles absent
+// evidence. `unknown` is the default: the rule applies but TradeTally cannot
+// obtain enough evidence, so the criterion becomes UNKNOWN and reduces
+// coverage. `not_applicable` marks conditional rules (e.g. partial-management
+// criteria) whose evaluator may legitimately return NOT_APPLICABLE when the
+// rule never becomes applicable, while still returning UNKNOWN when it
+// applies but evidence is missing.
+const MISSING_DATA_BEHAVIOR = Object.freeze({
+  UNKNOWN: 'unknown',
+  NOT_APPLICABLE: 'not_applicable'
+});
+
+const MISSING_DATA_BEHAVIOR_VALUES = Object.freeze([
+  MISSING_DATA_BEHAVIOR.UNKNOWN,
+  MISSING_DATA_BEHAVIOR.NOT_APPLICABLE
+]);
+
+// Closed set of typed scoring envelopes used by criterion configuration.
+// Scoring curves are profile configuration (trading policy), never evaluator
+// constants. Envelope types:
+//   binary          - { type, pass_score, fail_score }
+//   step            - { type, mode: 'gte'|'lte', default_score, thresholds: [{value, score}] }
+//   piecewise_linear- { type, points: [{value, score}] }
+//   discrete        - { type, scores: { outcomeKey: score } }
+//   composite       - { type, components: [{key, weight, scoring}] }
+const SCORING_TYPES = Object.freeze([
+  'binary',
+  'step',
+  'piecewise_linear',
+  'discrete',
+  'composite'
+]);
+
 // Evaluation lifecycle statuses (spec section 5.3).
 const EVALUATION_STATUS = Object.freeze({
   DRAFT: 'draft',
@@ -112,6 +145,9 @@ module.exports = {
   DEFAULT_MINIMUM_COVERAGE,
   DIMENSIONS,
   DIMENSION_KEYS,
+  MISSING_DATA_BEHAVIOR,
+  MISSING_DATA_BEHAVIOR_VALUES,
+  SCORING_TYPES,
   EVALUATION_STATUS,
   EVALUATION_STATUS_VALUES,
   DEFAULT_SCHEMA_VERSION,

@@ -4,16 +4,34 @@
 // (spec sections 11, 61, 62, 63).
 //
 // This module is the single source of truth for the seeded Canonical BO v1
-// profile. Every trading-policy value below is a profile-configurable
-// default; the application may only hard-code mathematical definitions and
-// evaluator types.
+// profile. Every trading-policy value below — including the typed `scoring`
+// curves from the spec scoring sections and `missing_data_behavior` — is a
+// profile-configurable default; the application may only hard-code
+// mathematical definitions and evaluator types.
+//
+// Scoring envelope semantics (see backend/src/services/quality/validation.js):
+//   binary            - two-outcome scoring (pass_score / fail_score)
+//   step              - monotone constant bands; mode 'gte' matches the largest
+//                       threshold the value reaches, mode 'lte' matches the
+//                       smallest threshold the value stays under; otherwise
+//                       default_score applies.
+//   piecewise_linear  - linear interpolation between points, clamped to the
+//                       endpoint scores outside the point range.
+//   discrete          - outcome-category -> score map (management timing rules).
+//   composite         - weighted combination of sub-component scoring configs.
+//
+// Criterion states (PASS/FAIL/NOT_APPLICABLE/UNKNOWN) are independent of the
+// numeric score; compliance comes from `required` + the criterion result
+// status, exactly as specified in sections 7-9.
 //
 // Conditional management criteria (Partial Timing, Partial Sizing,
-// Post-Partial BE, Trailing MA) are `required: true` in the generic
-// contract: their evaluators return NOT_APPLICABLE when the rule never
-// becomes applicable (e.g. +1R never reached through Day 5), and
+// Post-Partial BE, Trailing MA) are `required: true` and declare
+// `missing_data_behavior: 'not_applicable'`: their evaluators return
+// NOT_APPLICABLE when the rule never becomes applicable (e.g. +1R never
+// reached through Day 5, or a protective stop supersedes the MA exit), and
 // NOT_APPLICABLE is excluded from coverage and from required-criteria
-// compliance by the aggregation engine (sections 33, 46).
+// compliance by the aggregation engine (sections 33, 36.3, 42, 45, 46).
+// Missing evidence for a rule that DOES apply still yields UNKNOWN.
 
 const {
   DEFAULT_GRADE_THRESHOLDS,
@@ -27,6 +45,21 @@ const CANONICAL_BO_DESCRIPTION =
   'Leading stock after a substantial prior advance that forms an orderly multi-week ' +
   'consolidation (higher lows, contracting ranges, declining volume) while preserving ' +
   'its intermediate-term uptrend, resolving above a clear pivot.';
+
+// Shared scoring shapes used by more than one criterion.
+const BINARY_100_0 = { type: 'binary', pass_score: 100, fail_score: 0 };
+const CONTRACTION_BANDS = {
+  type: 'step',
+  mode: 'lte',
+  default_score: 0,
+  thresholds: [
+    { value: 0.4, score: 100 },
+    { value: 0.55, score: 90 },
+    { value: 0.7, score: 75 },
+    { value: 0.85, score: 50 },
+    { value: 1.0, score: 25 }
+  ]
+};
 
 // Weights are stored as integer percentages and sum to 100 per dimension.
 const CANONICAL_BO_CONFIG = {
@@ -42,7 +75,9 @@ const CANONICAL_BO_CONFIG = {
           weight: 20,
           parameters: {
             source: 'user_asserted'
-          }
+          },
+          // Section 13: YES = 100 / NO = 0.
+          scoring: BINARY_100_0
         },
         {
           key: 'prior_move',
@@ -55,6 +90,19 @@ const CANONICAL_BO_CONFIG = {
             swing_left: 3,
             swing_right: 3,
             selection: 'most_recent_qualifying'
+          },
+          // Section 14.5 (value = prior_move_pct).
+          scoring: {
+            type: 'step',
+            mode: 'gte',
+            default_score: 0,
+            thresholds: [
+              { value: 20, score: 40 },
+              { value: 30, score: 60 },
+              { value: 40, score: 80 },
+              { value: 60, score: 90 },
+              { value: 100, score: 100 }
+            ]
           }
         },
         {
@@ -70,7 +118,10 @@ const CANONICAL_BO_CONFIG = {
             swing_high_right: 3,
             max_post_high_advance_pct: 5,
             candidate_selection: 'earliest_qualifying'
-          }
+          },
+          // Section 15.5: binary v1 — in-range duration (10-40 sessions) = 100,
+          // otherwise 0. The in-range rule comes from the parameters above.
+          scoring: BINARY_100_0
         },
         {
           key: 'higher_lows',
@@ -83,6 +134,14 @@ const CANONICAL_BO_CONFIG = {
             minimum_lows: 2,
             tolerance_pct: 0.5,
             sequence_rule: 'no_material_lower_low'
+          },
+          // Section 16.5: score = 100 * non_lower_transitions / total_transitions.
+          scoring: {
+            type: 'piecewise_linear',
+            points: [
+              { value: 0, score: 0 },
+              { value: 1, score: 100 }
+            ]
           }
         },
         {
@@ -95,7 +154,9 @@ const CANONICAL_BO_CONFIG = {
             prior_window: 10,
             maximum_ratio: 0.7,
             require_full_windows: true
-          }
+          },
+          // Section 17.4 (value = contraction ratio).
+          scoring: CONTRACTION_BANDS
         },
         {
           key: 'volume_contraction',
@@ -107,7 +168,9 @@ const CANONICAL_BO_CONFIG = {
             prior_window: 10,
             maximum_ratio: 0.7,
             require_full_windows: true
-          }
+          },
+          // Section 18.3 (value = volume ratio).
+          scoring: CONTRACTION_BANDS
         },
         {
           key: 'ma_trend',
@@ -122,6 +185,17 @@ const CANONICAL_BO_CONFIG = {
             support_period: 20,
             max_close_below_support_pct: 2,
             require_fast_above_slow: false
+          },
+          // Section 19.3 (value = number of passing subcomponents, 0-3).
+          scoring: {
+            type: 'step',
+            mode: 'gte',
+            default_score: 0,
+            thresholds: [
+              { value: 1, score: 33 },
+              { value: 2, score: 67 },
+              { value: 3, score: 100 }
+            ]
           }
         },
         {
@@ -138,6 +212,53 @@ const CANONICAL_BO_CONFIG = {
             max_d1_distance_pct: 5,
             prior_close_tolerance_pct: 1,
             require_confirmation: true
+          },
+          // Section 21.4 composite with canonical subweights (30/20/30/20).
+          scoring: {
+            type: 'composite',
+            components: [
+              {
+                key: 'resistance_touches',
+                weight: 30,
+                // 0 -> 0, 1 -> 40, 2 -> 80, >=3 -> 100.
+                scoring: {
+                  type: 'step',
+                  mode: 'gte',
+                  default_score: 0,
+                  thresholds: [
+                    { value: 1, score: 40 },
+                    { value: 2, score: 80 },
+                    { value: 3, score: 100 }
+                  ]
+                }
+              },
+              {
+                key: 'recent_touch',
+                weight: 20,
+                // Recent touch within final window: YES 100 / NO 0.
+                scoring: BINARY_100_0
+              },
+              {
+                key: 'd1_proximity',
+                weight: 30,
+                // Section 21.4: <=2% -> 100, 2-5% linear 100->70,
+                // 5-10% linear 70->0, >10% -> 0 (value = pivot distance pct).
+                scoring: {
+                  type: 'piecewise_linear',
+                  points: [
+                    { value: 2, score: 100 },
+                    { value: 5, score: 70 },
+                    { value: 10, score: 0 }
+                  ]
+                }
+              },
+              {
+                key: 'no_prior_resolution',
+                weight: 20,
+                // No pre-breakout close materially above the pivot: YES 100 / NO 0.
+                scoring: BINARY_100_0
+              }
+            ]
           }
         }
       ]
@@ -151,7 +272,9 @@ const CANONICAL_BO_CONFIG = {
           enabled: true,
           required: true,
           weight: 10,
-          parameters: {}
+          parameters: {},
+          // Section 23: entry in the breakout session = 100, otherwise 0.
+          scoring: BINARY_100_0
         },
         {
           key: 'trigger_compliance',
@@ -163,6 +286,8 @@ const CANONICAL_BO_CONFIG = {
             require_pivot_resolution: true,
             minimum_penetration_pct: 0
           }
+          // Section 24 defines trigger evidence and compliance but no numeric
+          // scoring curve, so no `scoring` config is attached.
         },
         {
           key: 'volume_pace',
@@ -172,6 +297,18 @@ const CANONICAL_BO_CONFIG = {
           parameters: {
             reference_sessions: 20,
             target_multiple: 1.4
+          },
+          // Section 26 (value = volume pace multiple).
+          scoring: {
+            type: 'step',
+            mode: 'gte',
+            default_score: 0,
+            thresholds: [
+              { value: 0.8, score: 25 },
+              { value: 1.0, score: 60 },
+              { value: 1.4, score: 85 },
+              { value: 2.0, score: 100 }
+            ]
           }
         },
         {
@@ -181,6 +318,18 @@ const CANONICAL_BO_CONFIG = {
           weight: 5,
           parameters: {
             reference_sessions: 20
+          },
+          // Section 27 (value = range pace multiple).
+          scoring: {
+            type: 'step',
+            mode: 'gte',
+            default_score: 0,
+            thresholds: [
+              { value: 0.75, score: 40 },
+              { value: 1.0, score: 70 },
+              { value: 1.25, score: 90 },
+              { value: 1.5, score: 100 }
+            ]
           }
         },
         {
@@ -191,6 +340,19 @@ const CANONICAL_BO_CONFIG = {
           parameters: {
             primary_normalization: 'ADR',
             hard_maximum: 'disabled'
+          },
+          // Section 25 (value = extension in ADR units).
+          scoring: {
+            type: 'step',
+            mode: 'lte',
+            default_score: 0,
+            thresholds: [
+              { value: 0.05, score: 100 },
+              { value: 0.1, score: 90 },
+              { value: 0.2, score: 75 },
+              { value: 0.3, score: 50 },
+              { value: 0.5, score: 25 }
+            ]
           }
         },
         {
@@ -204,6 +366,8 @@ const CANONICAL_BO_CONFIG = {
             minimum_buffer_method: 'minimum_tick',
             minimum_buffer_value: 1
           }
+          // Section 29 defines stop compliance/UNKNOWN but no numeric scoring
+          // curve, so no `scoring` config is attached.
         },
         {
           key: 'stop_width',
@@ -214,6 +378,18 @@ const CANONICAL_BO_CONFIG = {
             volatility_method: 'ADR',
             period: 20,
             maximum_multiple: 1.0
+          },
+          // Section 31 (value = stop width / ADR$).
+          scoring: {
+            type: 'step',
+            mode: 'lte',
+            default_score: 0,
+            thresholds: [
+              { value: 0.5, score: 100 },
+              { value: 0.75, score: 90 },
+              { value: 1.0, score: 75 },
+              { value: 1.25, score: 40 }
+            ]
           }
         }
       ]
@@ -232,6 +408,16 @@ const CANONICAL_BO_CONFIG = {
             latest_day: 5,
             minimum_mfe_r: 1.0,
             completion_window: 'same_session'
+          },
+          missing_data_behavior: 'not_applicable',
+          // Section 38 (outcome categories).
+          scoring: {
+            type: 'discrete',
+            scores: {
+              same_trigger_session: 100,
+              next_session: 50,
+              later_or_not_completed: 0
+            }
           }
         },
         {
@@ -241,6 +427,22 @@ const CANONICAL_BO_CONFIG = {
           weight: 15,
           parameters: {
             target_pct: 50
+          },
+          missing_data_behavior: 'not_applicable',
+          // Section 39. Achieved partial pct is evaluated as absolute
+          // deviation from target_pct (50%): <=2pp -> 100, <=5pp -> 90,
+          // <=10pp -> 70, <=20pp -> 40, beyond -> 0, mirroring the
+          // 48-52 / 45-48+52-55 / 40-45+55-60 / 30-40+60-70 bands.
+          scoring: {
+            type: 'step',
+            mode: 'lte',
+            default_score: 0,
+            thresholds: [
+              { value: 0.02, score: 100 },
+              { value: 0.05, score: 90 },
+              { value: 0.1, score: 70 },
+              { value: 0.2, score: 40 }
+            ]
           }
         },
         {
@@ -248,7 +450,18 @@ const CANONICAL_BO_CONFIG = {
           enabled: true,
           required: true,
           weight: 10,
-          parameters: {}
+          parameters: {},
+          // Section 40 (value = fraction of position reduced before trigger).
+          scoring: {
+            type: 'step',
+            mode: 'lte',
+            default_score: 0,
+            thresholds: [
+              { value: 0, score: 100 },
+              { value: 0.1, score: 75 },
+              { value: 0.25, score: 50 }
+            ]
+          }
         },
         {
           key: 'stop_ratchet',
@@ -258,6 +471,8 @@ const CANONICAL_BO_CONFIG = {
           parameters: {
             downward_tolerance_ticks: 0
           }
+          // Section 41 defines the no-lowering rule and UNKNOWN on missing
+          // stop history but no numeric scoring curve.
         },
         {
           key: 'post_partial_breakeven',
@@ -267,6 +482,17 @@ const CANONICAL_BO_CONFIG = {
           parameters: {
             minimum_stop: 'original_entry_basis',
             deadline: 'same_session'
+          },
+          missing_data_behavior: 'not_applicable',
+          // Section 42 (outcome categories).
+          scoring: {
+            type: 'discrete',
+            scores: {
+              same_session_at_or_above_be: 100,
+              before_next_session: 70,
+              raised_below_be: 40,
+              no_meaningful_reduction: 0
+            }
           }
         },
         {
@@ -280,6 +506,17 @@ const CANONICAL_BO_CONFIG = {
             exit_signal: 'first_daily_close_below_selected_ma',
             equality_triggers: false,
             execution_window_minutes: 30
+          },
+          missing_data_behavior: 'not_applicable',
+          // Section 44 (outcome categories).
+          scoring: {
+            type: 'discrete',
+            scores: {
+              within_window: 100,
+              later_same_next_session: 70,
+              one_session_late: 40,
+              later_or_ignored: 0
+            }
           }
         }
       ]

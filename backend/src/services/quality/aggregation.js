@@ -34,45 +34,10 @@ const {
   isUnknownStatus,
   validateCriterionResult
 } = require('./criterionResult');
+const { assertDimensionConfig, assertProfileVersionConfiguration } = require('./validation');
 
 function hasOwn(obj, prop) {
   return Object.prototype.hasOwnProperty.call(obj, prop);
-}
-
-function assertDimensionConfig(dimensionConfig) {
-  if (dimensionConfig === null || typeof dimensionConfig !== 'object' || Array.isArray(dimensionConfig)) {
-    throw new Error('dimension configuration must be an object');
-  }
-  if (!Array.isArray(dimensionConfig.criteria)) {
-    throw new Error('dimension configuration requires a criteria array');
-  }
-  const seenKeys = new Set();
-  dimensionConfig.criteria.forEach((criterion, index) => {
-    if (criterion === null || typeof criterion !== 'object') {
-      throw new Error(`criteria[${index}] must be an object`);
-    }
-    if (typeof criterion.key !== 'string' || criterion.key.trim() === '') {
-      throw new Error(`criteria[${index}] requires a non-empty key`);
-    }
-    if (seenKeys.has(criterion.key)) {
-      throw new Error(`dimension configuration contains duplicate criterion key "${criterion.key}"`);
-    }
-    seenKeys.add(criterion.key);
-    const enabled = criterion.enabled !== undefined ? criterion.enabled : true;
-    if (typeof enabled !== 'boolean') {
-      throw new Error(`criterion "${criterion.key}" enabled must be a boolean`);
-    }
-    if (!enabled) {
-      return;
-    }
-    const weight = criterion.weight;
-    if (typeof weight !== 'number' || !Number.isFinite(weight) || weight < 0) {
-      throw new Error(`criterion "${criterion.key}" weight must be a non-negative finite number`);
-    }
-    if (criterion.required !== undefined && typeof criterion.required !== 'boolean') {
-      throw new Error(`criterion "${criterion.key}" required must be a boolean`);
-    }
-  });
 }
 
 // Grade for a score using configured thresholds. `thresholds` maps grade to
@@ -273,35 +238,10 @@ function aggregateAllDimensions(versionConfiguration, resultsByDimension) {
   return output;
 }
 
-// Structural validation of a profile version configuration
-// (spec section 5.2). Every configured dimension must be an object whose
-// criteria array is valid. `minimum_coverage` and `grade_thresholds` are
-// optional and default to canonical values in aggregation when omitted, so
-// callers can defer them until they need non-default behavior. Parameter
-// values are intentionally free-form because each criterion type validates
-// its own parameters.
-function assertProfileVersionConfiguration(configuration) {
-  if (configuration === null || typeof configuration !== 'object') {
-    throw new Error('profile version configuration must be an object');
-  }
-  const dimensions = configuration.dimensions;
-  if (dimensions === null || typeof dimensions !== 'object' || Array.isArray(dimensions)) {
-    throw new Error('profile version configuration requires a dimensions object');
-  }
-  const configuredKeys = Object.keys(dimensions);
-  if (configuredKeys.length === 0) {
-    throw new Error('profile version configuration must define at least one dimension');
-  }
-  for (const dimension of configuredKeys) {
-    const dimConfig = dimensions[dimension];
-    if (dimConfig === null || typeof dimConfig !== 'object' || Array.isArray(dimConfig)) {
-      throw new Error(`dimension "${dimension}" must be an object`);
-    }
-    assertDimensionConfig(dimConfig);
-  }
-}
-
 module.exports = {
+  // Structural validators live in ./validation and are re-exported here for
+  // convenience so callers that already import them from aggregation keep
+  // working.
   assertDimensionConfig,
   assertProfileVersionConfiguration,
   gradeForScore,
