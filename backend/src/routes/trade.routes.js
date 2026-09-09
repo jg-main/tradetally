@@ -911,6 +911,13 @@ router.post('/:id/quality', authenticate, tradeController.calculateTradeQuality)
 router.post('/quality/batch', authenticate, tradeController.calculateBatchQuality);
 router.post('/quality/all', authenticate, tradeController.calculateAllTradesQuality);
 
+// Quality Profiles — Setup Quality workflow (Phase 2). Versioned, per-trade
+// Setup evaluation; non-terminal draft progress until Entry/Management exist.
+const qualitySetupController = require('../controllers/qualitySetup.controller');
+router.post('/:id/quality/prepare', authenticate, qualitySetupController.prepareQualitySetup);
+router.post('/:id/quality/evaluate', authenticate, qualitySetupController.evaluateQualitySetup);
+router.get('/:id/quality/evaluations', authenticate, qualitySetupController.listQualityEvaluations);
+
 // Health data integration routes
 router.put('/:id/health', authenticate, tradeController.updateTradeHealthData);
 router.put('/health/bulk', authenticate, tradeController.bulkUpdateHealthData);

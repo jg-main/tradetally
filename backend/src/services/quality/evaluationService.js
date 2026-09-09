@@ -381,6 +381,116 @@ async function getEvaluation(evaluationId, userId) {
   return result.rows[0] || null;
 }
 
+// Persists NON-TERMINAL Setup evaluation progress for a draft evaluation
+// (Phase 2 Setup Quality workflow).
+//
+// Phase 2 evaluates and persists the Setup dimension only. Canonical BO also
+// contains Entry and Management dimensions that are not implemented yet, so an
+// evaluation must NOT be marked `completed` in Phase 2: no Entry/Management
+// results are fabricated and terminal saveResult() is never called with dummy
+// dimensions. This method stores the Setup dimension aggregate plus the exact
+// evidence/user-input snapshot on a still-mutable draft row.
+//
+// Contract:
+//   - the evaluation must exist, belong to `userId`, link to a profile version
+//     owned by the same user, and be NON-TERMINAL (draft/needs_input). Terminal
+//     (`completed` / `insufficient_data`) immutability from Phase 1 is never
+//     weakened: a terminal row returns null and the caller must create a new
+//     evaluation.
+//   - setupResults.criterionResults are normalized against the immutable
+//     profile-version setup configuration: PASS/FAIL scores are derived from
+//     (or validated against) the configured `scoring` envelopes, and the
+//     authoritative Setup aggregate is recomputed by the aggregation engine.
+//   - results JSONB is stored as { setup: <recomputed aggregate>, entry: null,
+//     management: null } — Entry/Management are explicit null because they are
+//     not evaluated in Phase 2; nothing is fabricated to satisfy a
+//     completed-dimension contract.
+//   - the row stays mutable so later Base/Pivot confirmation adjustments can
+//     re-run evaluate() and update the same draft.
+async function saveSetupProgress(evaluationId, userId, data = {}) {
+  const lookup = await db.query(
+    `
+      SELECT e.id, e.status, v.configuration
+      FROM trade_quality_evaluations e
+      JOIN quality_profile_versions v ON v.id = e.profile_version_id
+      JOIN quality_profiles p ON p.id = v.profile_id
+      WHERE e.id = $1
+        AND e.user_id = $2
+        AND p.user_id = $2
+        AND ${TERMINAL_STATUS_SQL}
+    `,
+    [evaluationId, userId]
+  );
+
+  if (lookup.rows.length === 0) {
+    return null;
+  }
+  const configuration = lookup.rows[0].configuration;
+  if (
+    configuration === null ||
+    typeof configuration !== 'object' ||
+    !configuration.dimensions ||
+    !configuration.dimensions.setup
+  ) {
+    throw new Error('profile version configuration has no setup dimension');
+  }
+  const setupConfig = configuration.dimensions.setup;
+
+  const setupResults = data.setupResults;
+  if (setupResults === null || typeof setupResults !== 'object' || Array.isArray(setupResults)) {
+    throw new Error('setup progress requires a setupResults object with criterionResults');
+  }
+  const dimResult = { criterionResults: setupResults.criterionResults || [] };
+  const rows = normalizeCriterionRows('setup', setupConfig, dimResult);
+  const recomputed = aggregateDimension(setupConfig, rows);
+  const setupSummary = {
+    setup_score: recomputed.score,
+    setup_grade: recomputed.grade,
+    setup_compliance: recomputed.compliance,
+    setup_coverage: recomputed.coverage
+  };
+
+  // The stored results envelope keeps one key per configured dimension so
+  // later phases (and any full-dimension consumer) can rely on a stable shape.
+  // Entry/Management are explicitly `null` because Phase 2 never evaluates
+  // them — nothing is fabricated to satisfy a completed-dimension contract,
+  // and Phase 3/4 replace these nulls with their own recomputed aggregates.
+  const persistedResults = { setup: recomputed, entry: null, management: null };
+
+  const updated = await db.query(
+    `
+      UPDATE trade_quality_evaluations
+      SET
+        results = $3,
+        evidence_snapshot = $4,
+        user_inputs = $5,
+        detected_context = $6,
+        setup_score = $7,
+        setup_grade = $8,
+        setup_compliance = $9,
+        setup_coverage = $10,
+        evaluated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+        AND user_id = $2
+        AND ${TERMINAL_STATUS_SQL}
+      RETURNING ${EVALUATION_COLUMNS}
+    `,
+    [
+      evaluationId,
+      userId,
+      JSON.stringify(persistedResults),
+      data.evidenceSnapshot ?? null,
+      data.userInputs ?? null,
+      data.detectedContext ?? null,
+      setupSummary.setup_score,
+      setupSummary.setup_grade,
+      setupSummary.setup_compliance,
+      setupSummary.setup_coverage
+    ]
+  );
+  return updated.rows[0] || null;
+}
+
 // Evaluation history for a trade, newest first. Keeps every version's result
 // so the UI can show "evaluated with v1 / re-evaluate with v3".
 async function listEvaluationsForTrade(userId, tradeId) {
@@ -403,6 +513,7 @@ module.exports = {
   normalizeCriterionRows,
   createEvaluation,
   saveResult,
+  saveSetupProgress,
   getEvaluation,
   listEvaluationsForTrade
 };

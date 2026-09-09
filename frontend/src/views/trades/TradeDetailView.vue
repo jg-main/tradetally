@@ -1578,6 +1578,9 @@
             </div>
           </div>
 
+          <!-- Quality Profiles — Setup Quality (Phase 2) -->
+          <SetupQualitySection v-if="isOwner" :trade="trade" />
+
           <!-- News Section -->
           <div v-if="trade.has_news && trade.news_events && trade.news_events.length > 0" class="card">
             <div class="card-body">
@@ -1675,6 +1678,7 @@ import { useSymbolMetadata } from '@/composables/useSymbolMetadata'
 import TradeChartVisualization from '@/components/trades/TradeChartVisualization.vue'
 import TradeImages from '@/components/trades/TradeImages.vue'
 import TradeCharts from '@/components/trades/TradeCharts.vue'
+import SetupQualitySection from '@/components/trades/SetupQualitySection.vue'
 import ProUpgradePrompt from '@/components/ProUpgradePrompt.vue'
 import BaseSelect from '@/components/common/BaseSelect.vue'
 import { useAIStore } from '@/stores/ai'
