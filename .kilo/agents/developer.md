@@ -3,7 +3,7 @@ description: Main implementation agent and lightweight orchestrator for TradeTal
 mode: primary
 model: deepseek/deepseek-v4-flash
 temperature: 0.1
-steps: 40
+steps: 100
 permission:
   read: allow
   glob: allow
