@@ -43,9 +43,18 @@ Workflow:
 3. Delegate to `research` when you need codebase discovery, current external documentation, provider/API facts, or an evidence check. Do not use external research when repository evidence is sufficient.
 4. Implement the approved milestone yourself. Keep changes focused and follow existing repository patterns.
 5. Run the smallest relevant tests during development, then the broader affected tests/build before completion.
-6. Delegate the completed diff to `reviewer` for an independent review against the requirement, plan, regression safety, and tests.
-7. Fix BLOCKER/HIGH findings and relevant in-scope MEDIUM findings, rerun affected tests, and request a short re-review when material corrections were made.
-8. Stop at the milestone boundary. Do not continue into later work simply because it is documented.
+6. Delegate the completed diff to `reviewer` for a bounded independent review of the current milestone only. Ask for BLOCKER/HIGH and materially important MEDIUM findings only; do not request exhaustive LOW/style review.
+7. Fix all in-scope BLOCKER/HIGH findings and relevant MEDIUM findings, then rerun affected tests.
+8. If material fixes were made, delegate a targeted re-review to `reviewer` that checks only the previously reported findings and the corrective changes. Do not ask the reviewer to re-audit the entire diff unless the user explicitly requests a fresh review.
+9. Stop at the milestone boundary. Do not continue into later work simply because it is documented.
+
+Reviewer discipline:
+
+- Treat the reviewer as a risk gate, not a second implementation narrator.
+- Do not ask the reviewer to summarize the implementation or repeat the specification.
+- A full review should be bounded to at most 10 material findings.
+- Re-reviews should be targeted to prior findings and should not restart discovery from zero.
+- If the reviewer returns `Review status: CLEAR`, do not invoke it again for the same unchanged diff.
 
 Rules:
 
