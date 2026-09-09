@@ -49,7 +49,9 @@ const { getDateInTimezone } = require('../../utils/timezone');
 // buffer beyond the pure session requirement, plus holiday gaps absorbed by
 // the session->calendar conversion. Session durations are always counted from
 // actual bars; this constant only sizes the fetch request.
-const HISTORY_SESSION_SLACK = 40;
+// Small calendar/request margin only. Correctness comes from the profile-derived
+// session requirements below, never from this margin.
+const HISTORY_SESSION_SLACK = 8;
 const POST_ENTRY_CALENDAR_DAYS = 10;
 const MARKET_TZ = 'America/New_York';
 
@@ -159,6 +161,30 @@ function enabledSetupCriteria(setupConfig) {
   );
 }
 
+// The required semantic user inputs are derived from the ACTIVE execution
+// requirements of the immutable profile version, never from a hard-coded list:
+//   - leader_confirmed is required only when the Leader criterion is enabled;
+//   - base_start and pivot are structural Canonical BO context (they establish
+//     D/D-1 and are consumed by every Setup criterion except Leader), so they
+//     are required whenever any enabled criterion actually depends on that
+//     structural context (i.e. any enabled criterion other than Leader).
+function semanticInputRequirements(setupConfig) {
+  const enabledKeys = enabledSetupCriteria(setupConfig).map((criterion) => criterion.key);
+  const leaderEnabled = enabledKeys.includes('leader');
+  const structuralRequired = enabledKeys.some((key) => key !== 'leader');
+  return { leaderEnabled, structuralRequired };
+}
+
+function requiredUserInputsFromConfig(setupConfig) {
+  const { leaderEnabled, structuralRequired } = semanticInputRequirements(setupConfig);
+  const required = [];
+  if (leaderEnabled) required.push('leader_confirmed');
+  if (structuralRequired) {
+    required.push('base_start', 'pivot');
+  }
+  return required;
+}
+
 // Reads detector parameters from the profile setup criteria that own them
 // (base_duration owns Base Start detection tuning; pivot_quality owns Pivot
 // detection tuning), so every detection window/threshold is profile
@@ -200,30 +226,65 @@ function criterionParameters(setupConfig, key) {
   return criterion && criterion.parameters ? criterion.parameters : null;
 }
 
+function intParameter(parameters, key, fallback) {
+  return parameters && Number.isInteger(parameters[key]) ? parameters[key] : fallback;
+}
+
 // Derives the required daily-session history from the immutable Setup
-// configuration: Base Start detection lookback before the breakout, plus the
-// Prior Move search lookback before the Base Start, plus SMA/MA indicator
-// history, plus detector window slack. The resulting session count is then
-// converted into a conservative calendar-day fetch request so a user who
-// enlarges a configured lookback never hits an undocumented fixed 400-day
-// implementation ceiling.
+// configuration. Every Setup calculation that may require evidence before the
+// entry/Base Start contributes an explicit requirement:
+//
+//   Prior-Move worst case: the earliest Base Start candidate sits
+//   (detection_lookback - 1) sessions before D-1 and its Prior Move search can
+//   extend another search_lookback sessions further back; the structural
+//   swing-left windows of Base Start and Prior Move add their confirmation
+//   depth. Requirement (sessions before D-1):
+//     (detection_lookback - 1) + search_lookback + swing_high_left +
+//     prior_move.swing_left + prior_move.swing_right
+//
+//   MA Trend at D-1 (inclusive-session arithmetic): SMA_p at the comparison
+//   date D-1 - slope_lookback needs its p closes ending there, i.e.
+//   slope_lookback + p - 1 sessions before D-1; SMA_support at D-1 needs
+//   support_period - 1. Requirement:
+//     max(slope_lookback + fast_period - 1,
+//         slope_lookback + slow_period - 1,
+//         support_period - 1)
+//
+// A small calendar/session margin (HISTORY_SESSION_SLACK) is retained for
+// request robustness only.
 function requiredHistorySessions(setupConfig) {
   const baseDuration = criterionParameters(setupConfig, 'base_duration');
   const priorMove = criterionParameters(setupConfig, 'prior_move');
   const maTrend = criterionParameters(setupConfig, 'ma_trend');
 
-  const detectionLookback =
-    baseDuration && Number.isInteger(baseDuration.detection_lookback)
-      ? baseDuration.detection_lookback
-      : 60;
-  const priorLookback =
-    priorMove && Number.isInteger(priorMove.search_lookback) ? priorMove.search_lookback : 60;
-  const slowPeriod =
-    maTrend && Number.isInteger(maTrend.slow_period) ? maTrend.slow_period : 20;
-  const slopeLookback =
-    maTrend && Number.isInteger(maTrend.slope_lookback) ? maTrend.slope_lookback : 5;
+  // Base Start + Prior Move structural requirement.
+  const detectionLookback = intParameter(baseDuration, 'detection_lookback', 60);
+  const baseSwingLeft = intParameter(baseDuration, 'swing_high_left', 3);
+  const priorLookback = intParameter(priorMove, 'search_lookback', 60);
+  const priorSwingLeft = intParameter(priorMove, 'swing_left', 3);
+  const priorSwingRight = intParameter(priorMove, 'swing_right', 3);
+  const structuralSessions = Math.max(
+    0,
+    (detectionLookback - 1) + priorLookback + baseSwingLeft + priorSwingLeft + priorSwingRight
+  );
 
-  return detectionLookback + priorLookback + slowPeriod + slopeLookback + HISTORY_SESSION_SLACK;
+  // MA Trend indicator history requirement (inclusive arithmetic).
+  const slopeLookback = intParameter(maTrend, 'slope_lookback', 5);
+  const fastPeriod = intParameter(maTrend, 'fast_period', 10);
+  const slowPeriod = intParameter(maTrend, 'slow_period', 20);
+  const supportPeriod = intParameter(maTrend, 'support_period', slowPeriod);
+  const maSessions = Math.max(
+    0,
+    slopeLookback + fastPeriod - 1,
+    slopeLookback + slowPeriod - 1,
+    supportPeriod - 1
+  );
+
+  const fallback = 185;
+  if (!baseDuration && !priorMove && !maTrend) {
+    return fallback;
+  }
+  return Math.max(structuralSessions, maSessions) + HISTORY_SESSION_SLACK;
 }
 
 function evidenceWindowDates(entryDate, setupConfig) {
@@ -315,8 +376,9 @@ function stagedPivotMatchesStored(detections, storedDetected) {
 }
 
 // True when a prepare operation changes any semantic dependency that can affect
-// Setup results: evidence context, the confirmed/adjusted Base Start, or the
-// Pivot detection context.
+// Setup results: evidence context, the confirmed/adjusted Base Start (a
+// structural DATE change OR a provenance-only SOURCE change — both make stale
+// Setup evidence/results non-current), or the Pivot detection context.
 function prepareChangesSetupContext({ storedSnapshot, reuseStored, bars, storedInputs, storedDetected, stagedBaseStart, detections }) {
   const evidenceChanged = reuseStored
     ? !sameBars(bars, storedSnapshot ? storedSnapshot.bars : null)
@@ -324,9 +386,19 @@ function prepareChangesSetupContext({ storedSnapshot, reuseStored, bars, storedI
   const storedBase = (storedInputs && storedInputs.base_start) || null;
   const stagedDate = stagedBaseStart ? stagedBaseStart.date : null;
   const storedDate = storedBase ? storedBase.date : null;
-  const baseStartChanged = stagedDate !== storedDate;
+  const baseStartDateChanged = stagedDate !== storedDate;
+  const stagedSource = stagedBaseStart ? stagedBaseStart.source : null;
+  const storedSource = storedBase ? storedBase.source : null;
+  const baseStartSourceChanged = stagedSource !== storedSource;
   const pivotChanged = !stagedPivotMatchesStored(detections, storedDetected);
-  return { evidenceChanged, baseStartChanged, pivotChanged, changed: evidenceChanged || baseStartChanged || pivotChanged };
+  return {
+    evidenceChanged,
+    baseStartDateChanged,
+    baseStartSourceChanged,
+    baseStartChanged: baseStartDateChanged || baseStartSourceChanged,
+    pivotChanged,
+    changed: evidenceChanged || baseStartDateChanged || baseStartSourceChanged || pivotChanged
+  };
 }
 
 function completenessFromSnapshot(snapshot) {
@@ -337,7 +409,10 @@ function completenessFromSnapshot(snapshot) {
 
 // Validates a confirmed/adjusted Base Start submitted for pivot re-detection
 // or for evaluation. Returns { date, index, price, source }.
-function parseConfirmedBaseStartInput(input, { bars, dateIndexByDate, entryIndex }) {
+// Prepare ingress hardening: source=detected_confirmed is only accepted when it
+// matches the machine Base Start stored for this evaluation/evidence snapshot;
+// an arbitrary date cannot be persisted as detected_confirmed.
+function parseConfirmedBaseStartInput(input, { bars, dateIndexByDate, entryIndex, detections }) {
   if (!input || typeof input !== 'object') {
     throw new SetupQualityInputError('confirmedBaseStart requires { date, source }.', 'BASE_START_REQUIRED');
   }
@@ -363,6 +438,16 @@ function parseConfirmedBaseStartInput(input, { bars, dateIndexByDate, entryIndex
       `base_start.source must be one of ${CONFIRM_SOURCES.join(', ')}.`,
       'INVALID_SOURCE'
     );
+  }
+  if (source === 'detected_confirmed') {
+    const storedBase = detections && detections.baseStartDetection;
+    if (!storedBase || storedBase.date !== date) {
+      throw new SetupQualityInputError(
+        'Confirmed Base Start must match the machine-detected Base Start stored for this evidence snapshot. Re-run Prepare or label it as user_adjusted.',
+        'BASE_START_DETECTION_MISMATCH',
+        { submittedDate: date, detectedDate: storedBase ? storedBase.date : null }
+      );
+    }
   }
   return { date, index, price: bars[index].high, source };
 }
@@ -595,19 +680,51 @@ function toFrontendEvaluation(row) {
 // Persists one coherent evidence/detection/input context on a non-terminal
 // draft evaluation. Terminal rows are never touched (SQL guard + returned row
 // check).
+//
+// ATOMICITY (integrity invariant): persisting a changed prepare context AND
+// invalidating any stale Setup result happens in ONE UPDATE statement. There is
+// never a committed intermediate state where the new evidence/detection/
+// user-input context is paired with an old Setup aggregate.
+//
+// Phase 3 seam: when Setup/Pivot context changes, Entry (which depends on the
+// confirmed Pivot / breakout boundary) and later Management (Initial R / Entry
+// dependencies) also become stale. Phase 3 must cascade-invalidate those
+// dimensions through the same helper (see invalidateResultDimensions) rather
+// than silently preserving incompatible Entry/Management results. This
+// milestone only clears the Setup dimension; Entry/Management are not yet
+// evaluated (their persisted slots are null).
 async function persistPrepareContext(evaluationId, userId, payload) {
   const db = require('../../config/database');
+  const clearSetup = payload.clearSetup === true;
+  const params = [
+    evaluationId,
+    userId,
+    payload.evidenceSnapshot,
+    payload.detectedContext,
+    payload.userInputs
+  ];
+  let setClause = `
+      evidence_snapshot = $3,
+      detected_context = $4,
+      user_inputs = $5`;
+  if (clearSetup) {
+    setClause += `,
+      results = $6,
+      setup_score = NULL,
+      setup_grade = NULL,
+      setup_compliance = NULL,
+      setup_coverage = NULL`;
+    params.push(payload.preservedResults ?? null);
+  }
   const updated = await db.query(
     `
       UPDATE trade_quality_evaluations
-      SET evidence_snapshot = $3,
-          detected_context = $4,
-          user_inputs = $5
+      SET ${setClause}
       WHERE id = $1 AND user_id = $2
         AND status NOT IN ('completed', 'insufficient_data')
       RETURNING ${EVALUATION_COLUMNS}
     `,
-    [evaluationId, userId, payload.evidenceSnapshot, payload.detectedContext, payload.userInputs]
+    params
   );
   if (updated.rows.length === 0) {
     throw new SetupQualityInputError(
@@ -618,43 +735,22 @@ async function persistPrepareContext(evaluationId, userId, payload) {
   return updated.rows[0];
 }
 
-// Invalidates a stale Setup result when a prepare changed the semantic context
-// (evidence / confirmed Base Start / Pivot detection). The Setup aggregate and
-// flat summary fields are cleared so the old grade is never shown against the
-// new confirmations; the draft id is retained and non-setup result keys (e.g.
-// a future entry/management) are preserved. Run Setup Quality again is then
-// required before Setup is considered evaluated.
-async function clearSetupResults(evaluationId, userId, preservedResults) {
-  const db = require('../../config/database');
-  const updated = await db.query(
-    `
-      UPDATE trade_quality_evaluations
-      SET results = $3,
-          setup_score = NULL,
-          setup_grade = NULL,
-          setup_compliance = NULL,
-          setup_coverage = NULL
-      WHERE id = $1 AND user_id = $2
-        AND status NOT IN ('completed', 'insufficient_data')
-      RETURNING ${EVALUATION_COLUMNS}
-    `,
-    [evaluationId, userId, preservedResults]
-  );
-  if (updated.rows.length === 0) {
-    throw new SetupQualityInputError(
-      'Evaluation could not be updated (it may have reached a terminal state).',
-      'EVALUATION_TERMINAL'
-    );
-  }
-  return updated.rows[0];
-}
-
-function preservedNonSetupResults(results) {
+// Returns the persisted results object with the given dimensions removed and
+// every other dimension preserved. Phase 2 clears only `setup`; Phase 3 reuses
+// this helper to also invalidate `entry` (and, through dependencies,
+// `management`) without erasing unrelated progress.
+function invalidateResultDimensions(results, dimensionsToClear) {
   const parsed = parseJsonField(results, 'results');
   if (!parsed || typeof parsed !== 'object') return null;
   const copy = { ...parsed };
-  delete copy.setup;
+  for (const dimension of dimensionsToClear || []) {
+    delete copy[dimension];
+  }
   return Object.keys(copy).length > 0 ? copy : null;
+}
+
+function preservedNonSetupResults(results) {
+  return invalidateResultDimensions(results, ['setup']);
 }
 
 /**
@@ -736,12 +832,14 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
   // Effective Base Start: confirmedBaseStart from this request first, then a
   // previously persisted Base Start confirmation (same evidence), then the
   // machine detection.
+  const storedDetectionsForIngress = parseJsonField(evaluation.detected_context, 'detected_context');
   let baseStartForPivot = null;
   if (confirmedBaseStart) {
     baseStartForPivot = parseConfirmedBaseStartInput(confirmedBaseStart, {
       bars,
       dateIndexByDate,
-      entryIndex
+      entryIndex,
+      detections: storedDetectionsForIngress
     });
   } else if (entryIndex !== -1) {
     baseStartForPivot = persistedConfirmedBaseStart(evaluation, {
@@ -784,38 +882,44 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
   };
 
   // Invalidation rule: if a Setup result is already persisted and this prepare
-  // changes any semantic dependency that can affect Setup results (evidence,
-  // confirmed/adjusted Base Start, or the Pivot detection context), the old
-  // Setup result must not stay represented as valid. The result is cleared
-  // below; the draft id is retained and Run Setup Quality is required again.
+  // changes ANY semantic dependency that can affect Setup results — evidence,
+  // confirmed/adjusted Base Start (date OR provenance source), or the Pivot
+  // detection context — the old Setup result must not stay represented as
+  // valid. The context change and the Setup-result invalidation are persisted
+  // ATOMICALLY in one UPDATE below; the draft id is retained and Run Setup
+  // Quality is required again.
   const storedSnapshot = parseJsonField(evaluation.evidence_snapshot, 'evidence_snapshot');
   const storedDetected = parseJsonField(evaluation.detected_context, 'detected_context');
   const hasSetupResult = evaluationHasResults(evaluation);
-  const { baseStartChanged, changed: contextChanged } = prepareChangesSetupContext({
-    storedSnapshot,
-    reuseStored,
-    bars,
-    storedInputs: existingUserInputs,
-    storedDetected,
-    stagedBaseStart,
-    detections
-  });
+  const { baseStartDateChanged, baseStartChanged, changed: contextChanged } =
+    prepareChangesSetupContext({
+      storedSnapshot,
+      reuseStored,
+      bars,
+      storedInputs: existingUserInputs,
+      storedDetected,
+      stagedBaseStart,
+      detections
+    });
   const clearSetup = hasSetupResult && contextChanged;
 
-  // A changed Base Start invalidates any previously confirmed Pivot: never
-  // leave an old pivot confirmation in the persisted user_inputs.
-  if (baseStartChanged) {
+  // A STRUCTURAL Base Start date change invalidates any previously confirmed
+  // Pivot: never leave an old pivot confirmation in the persisted user_inputs.
+  // A provenance-only change (same date, different source) keeps the pivot
+  // confirmation structurally valid (it was derived under the same date).
+  if (baseStartDateChanged) {
     delete userInputs.pivot;
   }
 
-  const refreshed = await persistPrepareContext(evaluation.id, userId, {
+  const finalRow = await persistPrepareContext(evaluation.id, userId, {
     evidenceSnapshot,
     detectedContext,
-    userInputs
+    userInputs,
+    clearSetup,
+    preservedResults: clearSetup
+      ? preservedNonSetupResults(evaluation.results)
+      : undefined
   });
-  const finalRow = clearSetup
-    ? await clearSetupResults(evaluation.id, userId, preservedNonSetupResults(evaluation.results))
-    : refreshed;
 
   return {
     evaluation: toFrontendEvaluation(finalRow),
@@ -856,7 +960,7 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
       lastDate: bars.length > 0 ? bars[bars.length - 1].date : null,
       entrySessionDate: entryDate
     },
-    requiredUserInputs: ['leader_confirmed', 'base_start', 'pivot'],
+    requiredUserInputs: requiredUserInputsFromConfig(setupConfig),
     unavailableEvidence
   };
 }
@@ -1036,7 +1140,8 @@ function parsePivotInput(input, { bars, dateIndexByDate, entryIndex, detections,
   return { price, date, index, source, detectionConfidence };
 }
 
-function parseLeaderInput(input) {
+function parseLeaderInput(input, leaderEnabled) {
+  if (!leaderEnabled) return null;
   if (typeof input !== 'boolean') {
     throw new SetupQualityInputError('leader_confirmed must be a boolean (true = Yes, false = No).');
   }
@@ -1044,10 +1149,17 @@ function parseLeaderInput(input) {
 }
 
 function normalizeUserInputs(raw, context) {
-  const leader_confirmed = parseLeaderInput(raw.leader_confirmed);
-  const base_start = parseBaseStartInput(raw.base_start, context);
-  const pivot = parsePivotInput(raw.pivot, { ...context, baseStartDate: base_start.date });
-  return { leader_confirmed, base_start, pivot };
+  const { leaderEnabled, structuralRequired } = context.semantic || { leaderEnabled: true, structuralRequired: true };
+  const normalized = {};
+  const leader_confirmed = parseLeaderInput(raw.leader_confirmed, leaderEnabled);
+  if (leaderEnabled) normalized.leader_confirmed = leader_confirmed;
+  if (structuralRequired) {
+    const base_start = parseBaseStartInput(raw.base_start, context);
+    const pivot = parsePivotInput(raw.pivot, { ...context, baseStartDate: base_start.date });
+    normalized.base_start = base_start;
+    normalized.pivot = pivot;
+  }
+  return normalized;
 }
 
 // ---------------------------------------------------------------------------
@@ -1151,12 +1263,18 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     throw new SetupQualityInputError('Semantic user inputs are required.', 'INPUT_REQUIRED');
   }
 
+  const { leaderEnabled, structuralRequired } = semanticInputRequirements(setupConfig);
+
   // Fetch and snapshot the daily evidence actually used. The evaluation
   // reuses the evidence snapshot captured at prepare() when one exists (a
   // draft evaluation is reproducible from the exact evidence its detections
   // were based on; provider history cannot silently change between prepare and
   // evaluate). Only when no stored snapshot exists (e.g. an evaluate called
   // without a prior prepare) is fresh evidence fetched.
+  //
+  // Evidence is only required when an enabled Setup criterion depends on the
+  // structural Base Start/Pivot context (every criterion except Leader). A
+  // Leader-only profile evaluates without any market-data dependency.
   const { fromDate, toDate } = evidenceWindowDates(entryDate, setupConfig);
   const rawStoredSnapshot = evaluation.evidence_snapshot;
   const storedSnapshot =
@@ -1169,58 +1287,63 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
           }
         })()
       : rawStoredSnapshot;
-  let evidence;
-  const snapshotBars =
-    storedSnapshot && Array.isArray(storedSnapshot.bars) && storedSnapshot.bars.length > 0
-      ? storedSnapshot.bars
-      : null;
-  // Only a VERIFIED stored snapshot is reused for scoring. An unverified
-  // (cache-only) snapshot is provisional: evaluate() retries the provider chain
-  // so a later provider recovery makes evaluation possible without cleanup.
-  if (
-    snapshotBars &&
-    storedSnapshot.entrySessionDate === entryDate &&
-    completenessFromSnapshot(storedSnapshot) === 'verified'
-  ) {
-    evidence = {
-      bars: snapshotBars,
-      source: storedSnapshot.source || 'stored_snapshot',
-      completeness: 'verified',
-      error: null
-    };
-  } else {
-    evidence = await loadDailyEvidence({
-      symbol: trade.symbol,
-      userId,
-      fromDate,
-      toDate
-    });
-  }
-  const bars = normalizeDailyBars(evidence.bars);
-  if (bars.length === 0) {
-    throw new SetupQualityInputError(
-      `Daily market data is unavailable for ${trade.symbol}; Setup Quality cannot be evaluated.`,
-      'EVIDENCE_UNAVAILABLE'
-    );
-  }
-  // Evidence completeness must be VERIFIED (a provider session set backs the
-  // bars). Unverified cache-only sessions cannot be treated as consecutive
-  // trading sessions; Setup Quality must surface UNKNOWN instead of scoring
-  // against fabricated adjacency.
-  if (evidence.completeness !== 'verified') {
-    throw new SetupQualityInputError(
-      `Daily market data for ${trade.symbol} could not be verified against a market-data provider; ` +
-        'Setup Quality cannot count trading sessions from unverified cache data.',
-      'EVIDENCE_UNAVAILABLE'
-    );
-  }
-  const dateIndexByDate = indexByDate(bars);
-  const entryIndex = findEntrySessionIndex(bars, dateIndexByDate, entryDate);
-  if (entryIndex === -1) {
-    throw new SetupQualityInputError(
-      `No daily bar is available for the trade entry session ${entryDate}; Setup Quality cannot be evaluated.`,
-      'ENTRY_SESSION_UNAVAILABLE'
-    );
+  let evidence = null;
+  let bars = [];
+  let dateIndexByDate = new Map();
+  let entryIndex = -1;
+  if (structuralRequired) {
+    const snapshotBars =
+      storedSnapshot && Array.isArray(storedSnapshot.bars) && storedSnapshot.bars.length > 0
+        ? storedSnapshot.bars
+        : null;
+    // Only a VERIFIED stored snapshot is reused for scoring. An unverified
+    // (cache-only) snapshot is provisional: evaluate() retries the provider chain
+    // so a later provider recovery makes evaluation possible without cleanup.
+    if (
+      snapshotBars &&
+      storedSnapshot.entrySessionDate === entryDate &&
+      completenessFromSnapshot(storedSnapshot) === 'verified'
+    ) {
+      evidence = {
+        bars: snapshotBars,
+        source: storedSnapshot.source || 'stored_snapshot',
+        completeness: 'verified',
+        error: null
+      };
+    } else {
+      evidence = await loadDailyEvidence({
+        symbol: trade.symbol,
+        userId,
+        fromDate,
+        toDate
+      });
+    }
+    bars = normalizeDailyBars(evidence.bars);
+    if (bars.length === 0) {
+      throw new SetupQualityInputError(
+        `Daily market data is unavailable for ${trade.symbol}; Setup Quality cannot be evaluated.`,
+        'EVIDENCE_UNAVAILABLE'
+      );
+    }
+    // Evidence completeness must be VERIFIED (a provider session set backs the
+    // bars). Unverified cache-only sessions cannot be treated as consecutive
+    // trading sessions; Setup Quality must surface UNKNOWN instead of scoring
+    // against fabricated adjacency.
+    if (evidence.completeness !== 'verified') {
+      throw new SetupQualityInputError(
+        `Daily market data for ${trade.symbol} could not be verified against a market-data provider; ` +
+          'Setup Quality cannot count trading sessions from unverified cache data.',
+        'EVIDENCE_UNAVAILABLE'
+      );
+    }
+    dateIndexByDate = indexByDate(bars);
+    entryIndex = findEntrySessionIndex(bars, dateIndexByDate, entryDate);
+    if (entryIndex === -1) {
+      throw new SetupQualityInputError(
+        `No daily bar is available for the trade entry session ${entryDate}; Setup Quality cannot be evaluated.`,
+        'ENTRY_SESSION_UNAVAILABLE'
+      );
+    }
   }
 
   // Server-verified detection context: the machine detections stored on this
@@ -1233,91 +1356,103 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     bars,
     dateIndexByDate,
     entryIndex,
-    detections: storedDetections
+    detections: storedDetections,
+    semantic: { leaderEnabled, structuralRequired }
   });
 
   // Authoritative Setup boundary: first session after the confirmed Base Start
   // trading above the confirmed Pivot (bounded by the initial entry session).
-  const boundary = resolveSetupBoundary({
-    bars,
-    baseStartIndex: userInputs.base_start.index,
-    pivotPrice: userInputs.pivot.price,
-    upperBoundIndex: entryIndex
-  });
-  if (!boundary) {
-    throw new SetupQualityInputError(
-      'No session traded above the confirmed Pivot between the confirmed Base Start and the trade entry session. Adjust the Base Start and/or Pivot so the setup resolves before the entry.',
-      'NO_RESOLUTION_SESSION',
-      {
-        baseStartDate: userInputs.base_start.date,
-        pivotPrice: userInputs.pivot.price,
-        entrySessionDate: entryDate
-      }
-    );
-  }
-
-  const baseEndIndex = boundary.baseEndIndex;
-  const setup = {
-    baseStart: {
-      index: userInputs.base_start.index,
-      date: userInputs.base_start.date,
-      price: userInputs.base_start.price,
-      source: userInputs.base_start.source
-    },
-    pivot: {
-      index: userInputs.pivot.index,
-      date: userInputs.pivot.date,
-      price: userInputs.pivot.price,
-      source: userInputs.pivot.source,
-      detectionConfidence: userInputs.pivot.detectionConfidence
-    },
-    resolution: {
-      index: boundary.resolutionIndex,
-      date: bars[boundary.resolutionIndex].date
-    },
-    baseEnd: {
-      index: baseEndIndex,
-      date: bars[baseEndIndex].date
-    },
-    entrySession: {
-      index: entryIndex,
-      date: entryDate
+  let boundary = null;
+  let setup = null;
+  if (structuralRequired) {
+    boundary = resolveSetupBoundary({
+      bars,
+      baseStartIndex: userInputs.base_start.index,
+      pivotPrice: userInputs.pivot.price,
+      upperBoundIndex: entryIndex
+    });
+    if (!boundary) {
+      throw new SetupQualityInputError(
+        'No session traded above the confirmed Pivot between the confirmed Base Start and the trade entry session. Adjust the Base Start and/or Pivot so the setup resolves before the entry.',
+        'NO_RESOLUTION_SESSION',
+        {
+          baseStartDate: userInputs.base_start.date,
+          pivotPrice: userInputs.pivot.price,
+          entrySessionDate: entryDate
+        }
+      );
     }
-  };
+
+    const baseEndIndex = boundary.baseEndIndex;
+    setup = {
+      baseStart: {
+        index: userInputs.base_start.index,
+        date: userInputs.base_start.date,
+        price: userInputs.base_start.price,
+        source: userInputs.base_start.source
+      },
+      pivot: {
+        index: userInputs.pivot.index,
+        date: userInputs.pivot.date,
+        price: userInputs.pivot.price,
+        source: userInputs.pivot.source,
+        detectionConfidence: userInputs.pivot.detectionConfidence
+      },
+      resolution: {
+        index: boundary.resolutionIndex,
+        date: bars[boundary.resolutionIndex].date
+      },
+      baseEnd: {
+        index: baseEndIndex,
+        date: bars[baseEndIndex].date
+      },
+      entrySession: {
+        index: entryIndex,
+        date: entryDate
+      }
+    };
+  }
 
   const criterionRows = buildCriterionRows(setupConfig, setup, bars, userInputs);
 
-  const setupBoundary = {
-    baseStartDate: setup.baseStart.date,
-    resolutionDate: setup.resolution.date,
-    baseEndDate: setup.baseEnd.date
-  };
+  const setupBoundary =
+    setup !== null
+      ? {
+          baseStartDate: setup.baseStart.date,
+          resolutionDate: setup.resolution.date,
+          baseEndDate: setup.baseEnd.date
+        }
+      : null;
 
   const detectedContext = {
     ...(storedDetections || {}),
     version: 2,
     evaluatedAt: new Date().toISOString(),
-    confirmations: {
-      base_start: { date: setup.baseStart.date, source: setup.baseStart.source },
-      pivot: {
-        price: setup.pivot.price,
-        date: setup.pivot.date,
-        source: setup.pivot.source,
-        detectionConfidence: userInputs.pivot.detectionConfidence
-      }
-    },
-    boundary: {
-      method: 'first_daily_high_above_confirmed_pivot',
-      baseStartDate: setup.baseStart.date,
-      baseStartSource: setup.baseStart.source,
-      pivotPrice: setup.pivot.price,
-      pivotSource: setup.pivot.source,
-      detectionConfidence: userInputs.pivot.detectionConfidence,
-      resolutionDate: setup.resolution.date,
-      baseEndDate: setup.baseEnd.date,
-      entrySessionDate: entryDate,
-      upperBoundDate: bars[entryIndex].date
-    }
+    ...(structuralRequired && setup !== null
+      ? {
+          confirmations: {
+            base_start: { date: setup.baseStart.date, source: setup.baseStart.source },
+            pivot: {
+              price: setup.pivot.price,
+              date: setup.pivot.date,
+              source: setup.pivot.source,
+              detectionConfidence: userInputs.pivot.detectionConfidence
+            }
+          },
+          boundary: {
+            method: 'first_daily_high_above_confirmed_pivot',
+            baseStartDate: setup.baseStart.date,
+            baseStartSource: setup.baseStart.source,
+            pivotPrice: setup.pivot.price,
+            pivotSource: setup.pivot.source,
+            detectionConfidence: userInputs.pivot.detectionConfidence,
+            resolutionDate: setup.resolution.date,
+            baseEndDate: setup.baseEnd.date,
+            entrySessionDate: entryDate,
+            upperBoundDate: bars[entryIndex].date
+          }
+        }
+      : {})
   };
 
   const evidenceSnapshot = buildEvidenceSnapshot({
@@ -1330,16 +1465,23 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     boundary: setupBoundary
   });
 
-  const storedUserInputs = {
-    leader_confirmed: userInputs.leader_confirmed,
-    base_start: { date: userInputs.base_start.date, source: userInputs.base_start.source },
-    pivot: {
+  // Persist only the semantic inputs the ACTIVE criteria actually require.
+  const storedUserInputs = {};
+  if (leaderEnabled && typeof userInputs.leader_confirmed === 'boolean') {
+    storedUserInputs.leader_confirmed = userInputs.leader_confirmed;
+  }
+  if (structuralRequired && setup !== null) {
+    storedUserInputs.base_start = {
+      date: setup.baseStart.date,
+      source: setup.baseStart.source
+    };
+    storedUserInputs.pivot = {
       price: userInputs.pivot.price,
       date: userInputs.pivot.date,
       source: userInputs.pivot.source,
       detectionConfidence: userInputs.pivot.detectionConfidence
-    }
-  };
+    };
+  }
 
   const updated = await saveSetupProgress(evaluationId, userId, {
     setupResults: { criterionResults: criterionRows },
@@ -1363,12 +1505,14 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       versionNumber: version.version_number,
       schemaVersion: version.schema_version
     },
-    setup: {
-      baseStart: setup.baseStart,
-      pivot: setup.pivot,
-      resolution: setup.resolution,
-      baseEnd: setup.baseEnd
-    }
+    setup: setup !== null
+      ? {
+          baseStart: setup.baseStart,
+          pivot: setup.pivot,
+          resolution: setup.resolution,
+          baseEnd: setup.baseEnd
+        }
+      : null
   };
 }
 
@@ -1418,6 +1562,10 @@ module.exports = {
   findEvaluationForPrepare,
   parseJsonField,
   snapshotIsUsable,
+  semanticInputRequirements,
+  requiredUserInputsFromConfig,
+  requiredHistorySessions,
+  invalidateResultDimensions,
   completenessFromSnapshot,
   getTradeForUser
 };

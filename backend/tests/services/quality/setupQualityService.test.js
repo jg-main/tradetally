@@ -70,19 +70,26 @@ function installDbRouter(overrides = {}) {
   db.query.mockReset();
   db.query.mockImplementation((sql, params = []) => {
     if (sql.includes('UPDATE trade_quality_evaluations')) {
+      if (overrides.failAtomicUpdate) {
+        throw new Error('simulated db failure');
+      }
       if (sql.includes('setup_score = NULL')) {
-        // clearSetupResults invalidation UPDATE: returns the full row with the
-        // Setup result cleared but evidence/detections/user_inputs preserved.
-        const preserved = params[2];
-        const cleared = {
+        // ATOMIC prepare context + Setup-result invalidation UPDATE: one
+        // statement carries the new evidence/detected/user-input context AND
+        // the cleared Setup result.
+        const preserved = params[5];
+        const base = existingDraft || makeEvaluationRow();
+        const merged = {
+          ...base,
           results: preserved === null ? null : typeof preserved === 'string' ? JSON.parse(preserved) : preserved,
           setup_score: null,
           setup_grade: null,
           setup_compliance: null,
-          setup_coverage: null
+          setup_coverage: null,
+          evidence_snapshot: params[2],
+          detected_context: params[3],
+          user_inputs: params[4]
         };
-        const base = existingDraft || makeEvaluationRow();
-        const merged = { ...base, ...cleared };
         if (overrides.trackEvalRow) existingDraft = merged;
         return { rows: [merged] };
       }
@@ -104,18 +111,22 @@ function installDbRouter(overrides = {}) {
         if (overrides.trackEvalRow) existingDraft = row;
         return { rows: [row] };
       }
-      // prepare() context refresh: evidence_snapshot / detected_context / user_inputs.
-      const row = makeEvaluationRow({
+      // prepare() context refresh: evidence_snapshot / detected_context /
+      // user_inputs. Unchanged columns (results, setup_* etc.) are preserved
+      // from the existing draft (real DB behavior).
+      const base = existingDraft || makeEvaluationRow();
+      const row = {
+        ...base,
         evidence_snapshot: params[2],
         detected_context: params[3],
         user_inputs: params[4]
-      });
+      };
       if (overrides.trackEvalRow) existingDraft = row;
       return { rows: [row] };
     }
     if (sql.includes('SELECT e.id, e.status, v.configuration')) {
       return {
-        rows: [{ id: EVAL_ID, status: overrides.evalStatus || 'draft', configuration: CANONICAL_CONFIG }]
+        rows: [{ id: EVAL_ID, status: overrides.evalStatus || 'draft', configuration: overrides.versionConfiguration || CANONICAL_CONFIG }]
       };
     }
     if (sql.includes('FROM quality_profile_versions v') && sql.includes('p.name AS profile_name')) {
@@ -125,7 +136,7 @@ function installDbRouter(overrides = {}) {
             id: VERSION_ID,
             version_number: 1,
             schema_version: 1,
-            configuration: CANONICAL_CONFIG,
+            configuration: overrides.versionConfiguration || CANONICAL_CONFIG,
             profile_id: 'profile-1',
             profile_name: 'Canonical BO'
           }
@@ -717,5 +728,234 @@ describe('SetupQualityService.evaluate', () => {
     });
     expect(evB.evaluation.results.setup).toBeDefined();
     expect(evB.evaluation.setup_compliance).toBe('PASS');
+  });
+});
+
+describe('integrity closure (Phase 2 final)', () => {
+  function withConfig(configuration) {
+    profileService.getCurrentVersion.mockReset().mockResolvedValue({
+      id: VERSION_ID,
+      version_number: 1,
+      schema_version: 1,
+      configuration
+    });
+  }
+
+  test('context change + Setup-result invalidation is a single atomic UPDATE', async () => {
+    const preparedA = await prepareDraft();
+    await SetupQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: preparedA.evaluation.id,
+      userInputs: confirmedFromPrepared(preparedA)
+    });
+    db.query.mockClear();
+
+    await prepareDraft({
+      confirmedBaseStart: { date: scenario.dateAt(71), source: 'user_adjusted' }
+    });
+
+    const updates = db.query.mock.calls
+      .map(([sql]) => sql)
+      .filter((sql) => sql.includes('UPDATE trade_quality_evaluations'));
+    // Exactly ONE UPDATE: it carries the new context AND the invalidation in the
+    // same statement (no separate clear-setup UPDATE can interleave).
+    expect(updates).toHaveLength(1);
+    expect(updates[0]).toContain('evidence_snapshot = $3');
+    expect(updates[0]).toContain('user_inputs = $5');
+    expect(updates[0]).toContain('results = $6');
+    expect(updates[0]).toContain('setup_score = NULL');
+  });
+
+  test('a simulated failure mid-persist cannot leave new context paired with stale Setup results', async () => {
+    const preparedA = await prepareDraft();
+    await SetupQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: preparedA.evaluation.id,
+      userInputs: confirmedFromPrepared(preparedA)
+    });
+    db.query.mockClear();
+
+    // Force the single atomic UPDATE to fail (router override).
+    installDbRouter({ trackEvalRow: true, failAtomicUpdate: true });
+    db.query.mockClear();
+
+    await expect(
+      prepareDraft({ confirmedBaseStart: { date: scenario.dateAt(71), source: 'user_adjusted' } })
+    ).rejects.toThrow('simulated db failure');
+
+    // Only the single atomic UPDATE was attempted (no partial second write).
+    const updateAttempts = db.query.mock.calls.filter(([sql]) =>
+      sql.includes('UPDATE trade_quality_evaluations')
+    );
+    expect(updateAttempts).toHaveLength(1);
+  });
+
+  test('an unchanged context does not clear an existing Setup result', async () => {
+    const preparedA = await prepareDraft();
+    await SetupQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: preparedA.evaluation.id,
+      userInputs: confirmedFromPrepared(preparedA)
+    });
+    db.query.mockClear();
+
+    // Plain re-prepare with no changes (same evidence, same base, same pivot).
+    const again = await prepareDraft();
+    expect(again.evaluation.results.setup).toBeDefined();
+    expect(again.evaluation.setup_grade).toBe('A');
+    const updates = db.query.mock.calls
+      .map(([sql]) => sql)
+      .filter((sql) => sql.includes('UPDATE trade_quality_evaluations'));
+    // The context UPDATE runs, but it does NOT clear the Setup result.
+    expect(updates).toHaveLength(1);
+    expect(updates[0]).not.toContain('setup_score = NULL');
+  });
+
+  test('Leader disabled removes leader_confirmed from required inputs and evaluation', async () => {
+    const config = JSON.parse(JSON.stringify(CANONICAL_CONFIG));
+    config.dimensions.setup.criteria.find((c) => c.key === 'leader').enabled = false;
+    withConfig(config);
+
+    const prepared = await prepareDraft();
+    expect(prepared.requiredUserInputs).toEqual(['base_start', 'pivot']);
+
+    // Evaluation succeeds WITHOUT leader_confirmed.
+    const inputs = confirmedFromPrepared(prepared);
+    expect(inputs.leader_confirmed).toBeDefined();
+    delete inputs.leader_confirmed;
+
+    installDbRouter({ trackEvalRow: true, versionConfiguration: config });
+    const result = await SetupQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: prepared.evaluation.id,
+      userInputs: inputs
+    });
+    const rows = resultByKey(result.evaluation);
+    expect(rows.has('leader')).toBe(false);
+    expect(rows.size).toBe(7);
+    // No leader contribution: enabled weights sum to 80 and all pass.
+    expect(result.evaluation.setup_coverage).toBe(100);
+    expect(result.evaluation.setup_compliance).toBe('PASS');
+    expect(result.evaluation.results.setup.knownWeight).toBe(80);
+    expect(result.evaluation.user_inputs.leader_confirmed).toBeUndefined();
+  });
+
+  test('Canonical profile still requires Leader/Base Start/Pivot', async () => {
+    const prepared = await prepareDraft();
+    expect(prepared.requiredUserInputs).toEqual(['leader_confirmed', 'base_start', 'pivot']);
+  });
+
+  test('larger MA periods / support period / swing windows enlarge the fetched history', () => {
+    const clone = () => JSON.parse(JSON.stringify(CANONICAL_CONFIG));
+    const setupDim = (cfg) => cfg.dimensions.setup;
+    const later = (config) => SetupQualityService.evidenceWindowDates(scenario.dateAt(RESOLUTION_INDEX), setupDim(config)).fromDate;
+    const canonicalDate = later(clone());
+
+    // Keep the structural term small so the MA requirement is the dominant one.
+    const baseSmall = () => {
+      const cfg = clone();
+      cfg.dimensions.setup.criteria.find((c) => c.key === 'base_duration').parameters.detection_lookback = 20;
+      cfg.dimensions.setup.criteria.find((c) => c.key === 'prior_move').parameters.search_lookback = 20;
+      return cfg;
+    };
+
+    // canonical MA (fast 10/slow 20/support 20) vs fast_period > slow_period.
+    const maCanon = baseSmall();
+    const maFast = baseSmall();
+    const fastParams = maFast.dimensions.setup.criteria.find((c) => c.key === 'ma_trend').parameters;
+    fastParams.fast_period = 60;
+    fastParams.slow_period = 40;
+    fastParams.support_period = 20;
+    fastParams.slope_lookback = 5;
+
+    // support_period > slow_period drives the requirement instead.
+    const supportDominant = baseSmall();
+    const supportParams = supportDominant.dimensions.setup.criteria.find((c) => c.key === 'ma_trend').parameters;
+    supportParams.slow_period = 20;
+    supportParams.support_period = 90;
+    supportParams.slope_lookback = 5;
+
+    // Unusually large structural swing windows also expand the request.
+    const bigSwings = clone();
+    bigSwings.dimensions.setup.criteria.find((c) => c.key === 'base_duration').parameters.detection_lookback = 200;
+    bigSwings.dimensions.setup.criteria.find((c) => c.key === 'prior_move').parameters.search_lookback = 200;
+    bigSwings.dimensions.setup.criteria.find((c) => c.key === 'prior_move').parameters.swing_left = 20;
+    bigSwings.dimensions.setup.criteria.find((c) => c.key === 'prior_move').parameters.swing_right = 20;
+
+    expect(later(maFast) < later(maCanon)).toBe(true);
+    expect(later(supportDominant) < later(maFast)).toBe(true);
+    expect(later(bigSwings) < canonicalDate).toBe(true);
+
+    // Canonical request remains sufficient for the canonical regression scenario.
+    const canonicalSessions = SetupQualityService.requiredHistorySessions(setupDim(clone()));
+    expect(canonicalSessions).toBeGreaterThan(130);
+  });
+
+  test('provenance-only Base Start change invalidates stale Setup results but keeps the identical machine Pivot', async () => {
+    const preparedA = await prepareDraft();
+    await SetupQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: preparedA.evaluation.id,
+      userInputs: confirmedFromPrepared(preparedA)
+    });
+    const machineBaseDate = preparedA.detectedBaseStart.date;
+
+    // Same date, source changes detected_confirmed -> user_adjusted.
+    const reprepared = await prepareDraft({
+      confirmedBaseStart: { date: machineBaseDate, source: 'user_adjusted' }
+    });
+    // Stale Setup invalidated (atomic UPDATE carried the clear).
+    expect(reprepared.evaluation.results.setup).toBeUndefined();
+    expect(reprepared.evaluation.setup_grade).toBeNull();
+    // Structural date is identical, so the machine Pivot is NOT needlessly
+    // invalidated: it remains derived from the same date and still confirms.
+    expect(reprepared.evaluation.user_inputs.base_start).toEqual({
+      date: machineBaseDate,
+      source: 'user_adjusted'
+    });
+    expect(reprepared.evaluation.user_inputs.pivot).toBeDefined();
+    expect(reprepared.detectedPivot.derivedFromBaseStart).toBe(machineBaseDate);
+
+    // Re-evaluate under the user_adjusted provenance: persisted evidence must
+    // reflect user_adjusted.
+    const inputs = confirmedFromPrepared(reprepared); // pivot detected_confirmed
+    inputs.base_start = { date: machineBaseDate, source: 'user_adjusted' };
+    const result = await SetupQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: reprepared.evaluation.id,
+      userInputs: inputs
+    });
+    expect(result.evaluation.results.setup).toBeDefined();
+    expect(result.evaluation.user_inputs.base_start.source).toBe('user_adjusted');
+    const duration = resultByKey(result.evaluation).get('base_duration');
+    expect(duration.evidence.base_start_source).toBe('user_adjusted');
+  });
+
+  test('an arbitrary detected_confirmed Base Start submitted through Prepare is rejected', async () => {
+    const preparedA = await prepareDraft(); // stored machine Base Start at session 70
+    expect(preparedA.detectedBaseStart.date).toBe(scenario.dateAt(70));
+    await expect(
+      prepareDraft({
+        confirmedBaseStart: { date: scenario.dateAt(80), source: 'detected_confirmed' }
+      })
+    ).rejects.toMatchObject({ code: 'BASE_START_DETECTION_MISMATCH' });
+  });
+
+  test('user_adjusted Prepare input remains accepted with exact provenance', async () => {
+    const result = await prepareDraft({
+      confirmedBaseStart: { date: scenario.dateAt(71), source: 'user_adjusted' }
+    });
+    expect(result.evaluation.user_inputs.base_start).toEqual({
+      date: scenario.dateAt(71),
+      source: 'user_adjusted'
+    });
+    expect(result.detectedPivot.derivedFromBaseStart).toBe(scenario.dateAt(71));
+  });
+
+  test('invalidateResultDimensions preserves unrelated dimensions (Phase 3 seam)', () => {
+    const results = { setup: { score: 90 }, entry: { score: 80 }, management: { score: 70 } };
+    expect(SetupQualityService.invalidateResultDimensions(results, ['setup'])).toEqual({
+      entry: { score: 80 },
+      management: { score: 70 }
+    });
+    // Phase 3 dependency expectation: a Setup/Pivot semantic change cascades to
+    // Entry (depends on the confirmed Pivot / breakout boundary) and then to
+    // Management (Initial R / Entry dependencies). The seam supports clearing
+    // all three without erasing unrelated state.
+    expect(SetupQualityService.invalidateResultDimensions(results, ['setup', 'entry', 'management'])).toBeNull();
   });
 });
