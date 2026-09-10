@@ -294,6 +294,61 @@ function evidenceWindowDates(entryDate, setupConfig) {
   return { fromDate, toDate };
 }
 
+// Deterministic bound on fetch-window expansion attempts. Each retry widens the
+// calendar window by roughly one more `requiredHistorySessions` block, so a
+// large configured lookback is always reachable; the bound guarantees there is
+// never an infinite retry loop.
+const MAX_FETCH_EXPANSIONS = 3;
+
+// Fetches daily evidence and, for verified provider data, verifies that the
+// available PRE-ENTRY session history satisfies the profile-derived session
+// requirement (requiredHistorySessions). If the initial calendar window was too
+// narrow to supply those sessions (the earliest returned session sits at the
+// requested left boundary), the window is widened deterministically and the
+// provider is re-requested (bounded by MAX_FETCH_EXPANSIONS).
+//
+// Distinguishes:
+//   - our window was too narrow          -> expand and retry;
+//   - provider genuinely lacks history   -> return the provider evidence as-is
+//     (affected criteria become UNKNOWN downstream);
+//   - provider unavailable / unverified  -> return as-is (unverified handling
+//     stays with the caller).
+async function fetchSufficientDailyEvidence({ symbol, userId, entryDate, setupConfig, loader }) {
+  const requiredSessions = setupConfig ? requiredHistorySessions(setupConfig) : 185;
+  const initial = evidenceWindowDates(entryDate, setupConfig);
+  let fromDate = initial.fromDate;
+  const toDate = initial.toDate;
+  const fetchLoader = loader || ((opts) => loadDailyEvidence(opts));
+
+  let lastResult = null;
+  for (let attempt = 0; attempt <= MAX_FETCH_EXPANSIONS; attempt += 1) {
+    const result = await fetchLoader({ symbol, userId, fromDate, toDate });
+    lastResult = { result, fromDate, toDate };
+    const bars = normalizeDailyBars(result.bars);
+    if (result.completeness !== 'verified' || bars.length === 0) {
+      return { ...lastResult, expansions: attempt };
+    }
+    const preEntrySessions = bars.filter((bar) => bar.date < entryDate).length;
+    if (preEntrySessions >= requiredSessions) {
+      return { ...lastResult, expansions: attempt };
+    }
+    const earliest = bars[0].date;
+    // If the earliest returned session is not at/very near the requested left
+    // boundary, the provider genuinely has no older history for this symbol:
+    // expanding our request cannot help.
+    const boundaryLimit = addCalendarDays(fromDate, 5);
+    if (earliest > boundaryLimit) {
+      return { ...lastResult, expansions: attempt };
+    }
+    if (attempt === MAX_FETCH_EXPANSIONS) {
+      return { ...lastResult, expansions: attempt };
+    }
+    // Widen the window by roughly another required-history block.
+    fromDate = addCalendarDays(fromDate, -calendarDaysForSessions(requiredSessions));
+  }
+  return { ...lastResult, expansions: MAX_FETCH_EXPANSIONS };
+}
+
 // ---------------------------------------------------------------------------
 // Detection proposals (prepare)
 // ---------------------------------------------------------------------------
@@ -603,19 +658,26 @@ function buildDetectedContext({ entryDate, detections }) {
   };
 }
 
+// Builds the persisted evidence snapshot. `evidence` may be null when an
+// evaluation has NO market-data requirement (e.g. a Leader-only profile): the
+// snapshot then uses the documented safe shape with completeness 'not_required'
+// and no bars — never fake market evidence.
 function buildEvidenceSnapshot({ trade, evidence, entryDate, bars, fromDate, toDate, boundary }) {
+  const safeBars = Array.isArray(bars) ? bars : [];
+  const completeness =
+    evidence && evidence.completeness ? evidence.completeness : 'not_required';
   return {
     symbol: String(trade.symbol || '').toUpperCase(),
     resolution: 'daily',
     requestedWindow: { fromDate, toDate },
-    source: evidence.source,
-    completeness: evidence.completeness || 'unverified',
-    sessionCount: bars.length,
-    firstDate: bars.length > 0 ? bars[0].date : null,
-    lastDate: bars.length > 0 ? bars[bars.length - 1].date : null,
+    source: evidence ? evidence.source : null,
+    completeness,
+    sessionCount: safeBars.length,
+    firstDate: safeBars.length > 0 ? safeBars[0].date : null,
+    lastDate: safeBars.length > 0 ? safeBars[safeBars.length - 1].date : null,
     entrySessionDate: entryDate,
     setupBoundary: boundary || null,
-    bars
+    bars: safeBars
   };
 }
 
@@ -789,7 +851,9 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
   const setupConfig = getSetupDimensionConfig(version.configuration);
   assertValidSetupConfiguration(setupConfig);
 
-  const { fromDate, toDate } = evidenceWindowDates(entryDate, setupConfig);
+  const semantic = semanticInputRequirements(setupConfig);
+  const structuralRequired = semantic.structuralRequired;
+  let { fromDate, toDate } = evidenceWindowDates(entryDate, setupConfig);
 
   // Choose the evaluation + evidence pair (model A reuse vs model B refresh).
   const evaluation = await findEvaluationForPrepare(
@@ -803,7 +867,12 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
   const reuseStored = snapshotIsUsable(stored, symbolUpper, entryDate);
 
   let evidence;
-  if (reuseStored) {
+  if (!structuralRequired) {
+    // Leader-only execution contract: no enabled criterion depends on Base
+    // Start/Pivot or daily market data. Do not fetch evidence, do not run
+    // detection, and never fabricate market data.
+    evidence = { bars: [], source: null, completeness: 'not_required', error: null };
+  } else if (reuseStored) {
     evidence = {
       bars: stored.bars,
       source: stored.source,
@@ -811,7 +880,15 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
       error: null
     };
   } else {
-    evidence = await loadDailyEvidence({ symbol: symbolUpper, userId, fromDate, toDate });
+    const fetched = await fetchSufficientDailyEvidence({
+      symbol: symbolUpper,
+      userId,
+      entryDate,
+      setupConfig
+    });
+    evidence = fetched.result;
+    fromDate = fetched.fromDate;
+    toDate = fetched.toDate;
   }
 
   const bars = normalizeDailyBars(evidence.bars);
@@ -819,42 +896,73 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
   const entryIndex = findEntrySessionIndex(bars, dateIndexByDate, entryDate);
 
   const unavailableEvidence = [];
-  if (bars.length === 0) {
-    unavailableEvidence.push('daily_ohlcv');
-  }
-  if (entryIndex === -1) {
-    unavailableEvidence.push('entry_session_bar');
-  }
-  if (evidence.completeness !== 'verified') {
-    unavailableEvidence.push('evidence_completeness');
+  if (structuralRequired) {
+    if (bars.length === 0) {
+      unavailableEvidence.push('daily_ohlcv');
+    }
+    if (entryIndex === -1) {
+      unavailableEvidence.push('entry_session_bar');
+    }
+    if (evidence.completeness !== 'verified') {
+      unavailableEvidence.push('evidence_completeness');
+    }
   }
 
   // Effective Base Start: confirmedBaseStart from this request first, then a
   // previously persisted Base Start confirmation (same evidence), then the
-  // machine detection.
+  // machine detection. Only evaluated when structural criteria are enabled.
   const storedDetectionsForIngress = parseJsonField(evaluation.detected_context, 'detected_context');
   let baseStartForPivot = null;
-  if (confirmedBaseStart) {
-    baseStartForPivot = parseConfirmedBaseStartInput(confirmedBaseStart, {
-      bars,
-      dateIndexByDate,
-      entryIndex,
-      detections: storedDetectionsForIngress
-    });
-  } else if (entryIndex !== -1) {
-    baseStartForPivot = persistedConfirmedBaseStart(evaluation, {
-      bars,
-      dateIndexByDate,
-      entryIndex
-    });
+  if (structuralRequired) {
+    // Provenance authority (integrity): a detected_confirmed ingress is only
+    // valid against the detection that belongs to the EXACT evidence being
+    // stored.
+    //   - reused verified snapshot -> its stored machine detection;
+    //   - fresh/recovered evidence  -> the machine Base Start detected from
+    //     THAT fresh evidence (never the previous snapshot's detection).
+    let ingressDetections = storedDetectionsForIngress;
+    if (confirmedBaseStart && !reuseStored) {
+      const freshMachineBase =
+        bars.length > 0 && entryIndex > 0
+          ? detectBaseStart({
+              bars,
+              endIndex: entryIndex - 1,
+              parameters: baseStartParameters(setupConfig)
+            })
+          : null;
+      ingressDetections = freshMachineBase
+        ? {
+            baseStartDetection: {
+              index: freshMachineBase.index,
+              date: freshMachineBase.date,
+              price: freshMachineBase.price,
+              source: 'detected'
+            }
+          }
+        : null;
+    }
+    if (confirmedBaseStart) {
+      baseStartForPivot = parseConfirmedBaseStartInput(confirmedBaseStart, {
+        bars,
+        dateIndexByDate,
+        entryIndex,
+        detections: ingressDetections
+      });
+    } else if (entryIndex !== -1) {
+      baseStartForPivot = persistedConfirmedBaseStart(evaluation, {
+        bars,
+        dateIndexByDate,
+        entryIndex
+      });
+    }
   }
 
   const detections =
-    bars.length > 0 && entryIndex > 0
+    structuralRequired && bars.length > 0 && entryIndex > 0
       ? proposeDetections({ bars, dateIndexByDate, entryIndex, setupConfig, baseStartForPivot })
       : {
-          provisionalBaseEndIndex: entryIndex - 1,
-          provisionalBaseEndIndexDate: entryIndex > 0 ? bars[entryIndex - 1].date : null,
+          provisionalBaseEndIndex: -1,
+          provisionalBaseEndIndexDate: null,
           baseStart: null,
           pivot: null,
           effectiveBaseStart: null,
@@ -873,7 +981,7 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
   });
 
   const existingUserInputs = parseJsonField(evaluation.user_inputs, 'user_inputs') || {};
-  const stagedBaseStart = baseStartForPivot
+  const stagedBaseStart = structuralRequired && baseStartForPivot
     ? { date: baseStartForPivot.date, source: baseStartForPivot.source }
     : null;
   const userInputs = {
@@ -891,16 +999,15 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
   const storedSnapshot = parseJsonField(evaluation.evidence_snapshot, 'evidence_snapshot');
   const storedDetected = parseJsonField(evaluation.detected_context, 'detected_context');
   const hasSetupResult = evaluationHasResults(evaluation);
-  const { baseStartDateChanged, baseStartChanged, changed: contextChanged } =
-    prepareChangesSetupContext({
-      storedSnapshot,
-      reuseStored,
-      bars,
-      storedInputs: existingUserInputs,
-      storedDetected,
-      stagedBaseStart,
-      detections
-    });
+  const { baseStartDateChanged, changed: contextChanged } = prepareChangesSetupContext({
+    storedSnapshot,
+    reuseStored,
+    bars,
+    storedInputs: existingUserInputs,
+    storedDetected,
+    stagedBaseStart,
+    detections
+  });
   const clearSetup = hasSetupResult && contextChanged;
 
   // A STRUCTURAL Base Start date change invalidates any previously confirmed
@@ -1275,7 +1382,7 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   // Evidence is only required when an enabled Setup criterion depends on the
   // structural Base Start/Pivot context (every criterion except Leader). A
   // Leader-only profile evaluates without any market-data dependency.
-  const { fromDate, toDate } = evidenceWindowDates(entryDate, setupConfig);
+  let { fromDate, toDate } = evidenceWindowDates(entryDate, setupConfig);
   const rawStoredSnapshot = evaluation.evidence_snapshot;
   const storedSnapshot =
     typeof rawStoredSnapshot === 'string'
@@ -1291,7 +1398,11 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   let bars = [];
   let dateIndexByDate = new Map();
   let entryIndex = -1;
-  if (structuralRequired) {
+  if (!structuralRequired) {
+    // Leader-only execution contract: no market-data requirement. The snapshot
+    // uses the documented safe 'not_required' shape (never fake evidence).
+    evidence = { bars: [], source: null, completeness: 'not_required', error: null };
+  } else {
     const snapshotBars =
       storedSnapshot && Array.isArray(storedSnapshot.bars) && storedSnapshot.bars.length > 0
         ? storedSnapshot.bars
@@ -1311,12 +1422,15 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
         error: null
       };
     } else {
-      evidence = await loadDailyEvidence({
-        symbol: trade.symbol,
+      const fetched = await fetchSufficientDailyEvidence({
+        symbol: String(trade.symbol || '').trim().toUpperCase(),
         userId,
-        fromDate,
-        toDate
+        entryDate,
+        setupConfig
       });
+      evidence = fetched.result;
+      fromDate = fetched.fromDate;
+      toDate = fetched.toDate;
     }
     bars = normalizeDailyBars(evidence.bars);
     if (bars.length === 0) {
@@ -1566,6 +1680,8 @@ module.exports = {
   requiredUserInputsFromConfig,
   requiredHistorySessions,
   invalidateResultDimensions,
+  fetchSufficientDailyEvidence,
+  MAX_FETCH_EXPANSIONS,
   completenessFromSnapshot,
   getTradeForUser
 };

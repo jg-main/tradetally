@@ -186,11 +186,18 @@ const DETECTION_PARAMETER_CRITERIA = ['base_duration', 'pivot_quality'];
 /**
  * Validates the Setup dimension criteria of a profile version.
  *
- * Required parameters are enforced for every ENABLED criterion plus the
- * detection-owning criteria (base_duration/pivot_quality) even when disabled,
- * because shared structural detection reads their parameters. Disabled unused
- * criteria without evaluator-specific parameters do not block execution.
- * Unknown parameter names inside a known criterion are ignored.
+ * Execution-aware rule:
+ *   - structural detection (Base Start/Pivot) only runs when an ENABLED
+ *     criterion actually depends on the structural context (any enabled
+ *     criterion other than Leader). In that case the detection-owning
+ *     criteria (base_duration/pivot_quality) must be parameterized even when
+ *     disabled, because shared structural detection reads their parameters.
+ *   - A Leader-only profile (no enabled structural criterion) never runs Base
+ *     Start/Pivot detection, so detector parameters must NOT be demanded for
+ *     unused disabled criteria there.
+ *   - Enabled criteria always have their typed parameters enforced. Disabled
+ *     unused criteria without evaluator-specific parameters never block
+ *     execution. Unknown parameter names inside a known criterion are ignored.
  * Returns an array of violation strings (empty when valid).
  */
 function validateSetupCriteria(setupConfig) {
@@ -198,12 +205,22 @@ function validateSetupCriteria(setupConfig) {
   if (!setupConfig || !Array.isArray(setupConfig.criteria)) {
     return errors;
   }
+  const enabledKeys = setupConfig.criteria
+    .filter((criterion) => criterion.enabled === undefined || criterion.enabled === true)
+    .map((criterion) => criterion.key);
+  const structuralDetectionNeeded = enabledKeys.some((key) => key !== 'leader');
+
   for (const criterion of setupConfig.criteria) {
     const enabled = criterion.enabled === undefined ? true : criterion.enabled;
-    if (!enabled && !DETECTION_PARAMETER_CRITERIA.includes(criterion.key)) {
+    if (enabled) {
+      errors.push(...validateParameters(criterion.key, criterion.parameters));
       continue;
     }
-    errors.push(...validateParameters(criterion.key, criterion.parameters));
+    // Disabled criteria only contribute validation when structural detection
+    // actually needs their tuning parameters.
+    if (structuralDetectionNeeded && DETECTION_PARAMETER_CRITERIA.includes(criterion.key)) {
+      errors.push(...validateParameters(criterion.key, criterion.parameters));
+    }
   }
   return errors;
 }

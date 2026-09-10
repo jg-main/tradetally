@@ -319,3 +319,84 @@ describe('SetupQualitySection', () => {
     expect(wrapper.get('[data-testid="confirm-pivot"]').exists()).toBe(true)
   })
 })
+
+describe('SetupQualitySection dynamic execution contract (requiredUserInputs)', () => {
+  beforeEach(() => {
+    mockStoreInstance = createStoreState()
+  })
+
+  function prepareThen(payload) {
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([])
+    mockStoreInstance.prepare.mockResolvedValue(payload)
+    return mountSection()
+  }
+
+  async function runSetup(wrapper) {
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-setup"]').trigger('click')
+    await flushPromises()
+  }
+
+  it('Leader disabled: Leader control is absent and evaluation proceeds with Base/Pivot only', async () => {
+    const payload = {
+      ...detectedPayload(),
+      requiredUserInputs: ['base_start', 'pivot']
+    }
+    const wrapper = prepareThen(payload)
+    await runSetup(wrapper)
+
+    expect(wrapper.find('[data-testid="leader-yes"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="leader-no"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="confirm-base-start"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="confirm-pivot"]').exists()).toBe(true)
+
+    mockStoreInstance.evaluate.mockResolvedValue({
+      evaluation: evaluationResult({ results: { setup: { score: 90, grade: 'A', compliance: 'PASS', coverage: 100, criterionResults: [] } } })
+    })
+    await wrapper.get('[data-testid="confirm-base-start"]').trigger('click')
+    await wrapper.get('[data-testid="confirm-pivot"]').trigger('click')
+    await wrapper.get('[data-testid="run-setup"]').trigger('click')
+    await flushPromises()
+
+    const userInputs = mockStoreInstance.evaluate.mock.calls[0][1].userInputs
+    expect(userInputs.leader_confirmed).toBeUndefined()
+    expect(userInputs.base_start).toEqual({ date: '2026-03-12', source: 'detected_confirmed' })
+    expect(userInputs.pivot).toEqual(expect.objectContaining({ price: 102, source: 'detected_confirmed' }))
+  })
+
+  it('Leader-only profile: only Leader is required and no structural inputs are sent', async () => {
+    const payload = {
+      ...detectedPayload(),
+      requiredUserInputs: ['leader_confirmed'],
+      detectedBaseStart: null,
+      detectedPivot: null,
+      pivotBaseStartDate: null,
+      pivotBaseStartSource: null
+    }
+    const wrapper = prepareThen(payload)
+    await runSetup(wrapper)
+
+    expect(wrapper.find('[data-testid="leader-yes"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="confirm-base-start"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="confirm-pivot"]').exists()).toBe(false)
+
+    mockStoreInstance.evaluate.mockResolvedValue({
+      evaluation: evaluationResult({ results: { setup: { score: 100, grade: 'A', compliance: 'PASS', coverage: 100, criterionResults: [] } } })
+    })
+    await wrapper.get('[data-testid="leader-yes"]').setValue(true)
+    await wrapper.get('[data-testid="run-setup"]').trigger('click')
+    await flushPromises()
+
+    const userInputs = mockStoreInstance.evaluate.mock.calls[0][1].userInputs
+    expect(userInputs).toEqual({ leader_confirmed: true })
+  })
+
+  it('Canonical profile still shows and requires all three inputs', async () => {
+    const wrapper = prepareThen(detectedPayload())
+    await runSetup(wrapper)
+
+    expect(wrapper.find('[data-testid="leader-yes"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="confirm-base-start"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="confirm-pivot"]').exists()).toBe(true)
+  })
+})

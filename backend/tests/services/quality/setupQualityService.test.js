@@ -959,3 +959,159 @@ describe('integrity closure (Phase 2 final)', () => {
     expect(SetupQualityService.invalidateResultDimensions(results, ['setup', 'entry', 'management'])).toBeNull();
   });
 });
+
+describe('executable-contract closure (Phase 2 final)', () => {
+  function withConfig(configuration) {
+    profileService.getCurrentVersion.mockReset().mockResolvedValue({
+      id: VERSION_ID,
+      version_number: 1,
+      schema_version: 1,
+      configuration
+    });
+  }
+
+
+  function leaderOnlyConfig() {
+    const config = JSON.parse(JSON.stringify(CANONICAL_CONFIG));
+    for (const criterion of config.dimensions.setup.criteria) {
+      if (criterion.key !== 'leader') criterion.enabled = false;
+    }
+    return config;
+  }
+
+  function structuralConfig() {
+    const config = JSON.parse(JSON.stringify(CANONICAL_CONFIG));
+    config.dimensions.setup.criteria.find((c) => c.key === 'leader').enabled = false;
+    return config;
+  }
+
+  test('Leader-only prepare succeeds without market data or detection', async () => {
+    const config = leaderOnlyConfig();
+    withConfig(config);
+    loadDailyEvidence.mockClear();
+
+    const prepared = await prepareDraft();
+    expect(loadDailyEvidence).not.toHaveBeenCalled();
+    expect(prepared.requiredUserInputs).toEqual(['leader_confirmed']);
+    expect(prepared.detectedBaseStart).toBeNull();
+    expect(prepared.detectedPivot).toBeNull();
+    expect(prepared.evaluation.evidence_snapshot.completeness).toBe('not_required');
+    expect(prepared.unavailableEvidence).toEqual([]);
+  });
+
+  test('Leader-only evaluate succeeds and contains exactly the Leader criterion', async () => {
+    const config = leaderOnlyConfig();
+    withConfig(config);
+    const prepared = await prepareDraft();
+
+    installDbRouter({ trackEvalRow: true, versionConfiguration: config });
+    const result = await SetupQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: prepared.evaluation.id,
+      userInputs: { leader_confirmed: true }
+    });
+
+    expect(result.evaluation.results.setup).toBeDefined();
+    const rows = resultByKey(result.evaluation);
+    expect(rows.size).toBe(1);
+    expect(rows.has('leader')).toBe(true);
+    expect(rows.get('leader').status).toBe('PASS');
+    expect(result.evaluation.setup_compliance).toBe('PASS');
+    expect(result.evaluation.evidence_snapshot.completeness).toBe('not_required');
+  });
+
+  test('Leader disabled + structural criteria unchanged (no leader_confirmed required, no Leader result)', async () => {
+    const config = structuralConfig();
+    withConfig(config);
+    const prepared = await prepareDraft();
+    expect(prepared.requiredUserInputs).toEqual(['base_start', 'pivot']);
+    installDbRouter({ trackEvalRow: true, versionConfiguration: config });
+    const inputs = confirmedFromPrepared(prepared);
+    delete inputs.leader_confirmed;
+    const result = await SetupQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: prepared.evaluation.id,
+      userInputs: inputs
+    });
+    const rows = resultByKey(result.evaluation);
+    expect(rows.has('leader')).toBe(false);
+    expect(rows.size).toBe(7);
+    expect(result.evaluation.setup_compliance).toBe('PASS');
+  });
+
+  test('fresh-evidence detected_confirmed must match the machine Base Start detected from THAT evidence', async () => {
+    const addDays = (base, n) => {
+      const d = new Date(`${base}T00:00:00.000Z`);
+      d.setUTCDate(d.getUTCDate() + n);
+      return d.toISOString().split('T')[0];
+    };
+    // Evidence B: an alternative verified series whose machine Base Start
+    // (2026-03-20) differs from evidence A's (2026-03-12) while 2026-03-12 is
+    // still a valid session inside B. Entry session = 2026-04-06.
+    const altBars = () => {
+      const rows = [];
+      for (let i = 0; i < 20; i += 1) {
+        const close = 10 + (i * 40) / 19; // climb to ~50 at index 19
+        rows.push([close - 0.1, close + 0.4, close - 0.6, close, 1_000_000]);
+      }
+      for (let i = 20; i <= 35; i += 1) {
+        const close = 46.5 + (i % 3);
+        rows.push([close - 0.1, close + 0.5, close - 0.5, close, 1_000_000]);
+      }
+      rows.push([59, 62, 58, 60, 1_000_000]); // breakout day 2026-04-06
+      for (let i = 0; i < 4; i += 1) {
+        rows.push([61 + i, 63 + i, 60 + i, 62 + i, 1_000_000]);
+      }
+      const { buildBars } = require('./barFactory');
+      return buildBars('2026-03-01', rows);
+    };
+
+    // Evidence A: cache-only/unverified with machine Base Start at scenario 70.
+    loadDailyEvidence
+      .mockResolvedValueOnce({ bars: scenario.bars, source: 'historical_cache', completeness: 'unverified', error: 'x' });
+    const first = await prepareDraft();
+    const oldBaseA = scenario.dateAt(70);
+    expect(first.detectedBaseStart.date).toBe(oldBaseA);
+
+    // Provider recovers with evidence B (fresh). Submitting OLD Base A as
+    // detected_confirmed must be rejected: B's machine detection differs.
+    loadDailyEvidence.mockResolvedValueOnce({ bars: altBars(), source: 'finnhub', completeness: 'verified', error: null });
+    await expect(
+      prepareDraft({ confirmedBaseStart: { date: oldBaseA, source: 'detected_confirmed' } })
+    ).rejects.toMatchObject({ code: 'BASE_START_DETECTION_MISMATCH' });
+
+    // Fresh machine detection (B) is stored and then accepted as
+    // detected_confirmed.
+    loadDailyEvidence.mockResolvedValueOnce({ bars: altBars(), source: 'finnhub', completeness: 'verified', error: null });
+    const second = await prepareDraft();
+    const baseB = second.detectedBaseStart.date;
+    expect(baseB).not.toBe(oldBaseA);
+    expect(second.evaluation.evidence_snapshot.completeness).toBe('verified');
+
+    const bConfirmed = await prepareDraft({
+      confirmedBaseStart: { date: baseB, source: 'detected_confirmed' }
+    });
+    expect(bConfirmed.pivotBaseStartDate).toBe(baseB);
+
+    // OLD Base A remains acceptable as user_adjusted because it is a valid
+    // session inside evidence B.
+    const adjusted = await prepareDraft({
+      confirmedBaseStart: { date: oldBaseA, source: 'user_adjusted' }
+    });
+    expect(adjusted.evaluation.user_inputs.base_start).toEqual({
+      date: oldBaseA,
+      source: 'user_adjusted'
+    });
+  });
+
+  test('reused verified evidence continues to validate detected_confirmed against its stored detection', async () => {
+    const prepared = await prepareDraft();
+    expect(prepared.evaluation.evidence_snapshot.completeness).toBe('verified');
+    const confirmed = await prepareDraft({
+      confirmedBaseStart: {
+        date: prepared.detectedBaseStart.date,
+        source: 'detected_confirmed'
+      }
+    });
+    expect(confirmed.evaluation.user_inputs.base_start.source).toBe('detected_confirmed');
+    expect(loadDailyEvidence).toHaveBeenCalledTimes(1); // reuse; no fresh fetch
+  });
+});

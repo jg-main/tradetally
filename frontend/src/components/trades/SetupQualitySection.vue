@@ -61,8 +61,8 @@
     </div>
 
     <template v-else-if="prepared">
-      <!-- Leader -->
-      <div class="mb-3 rounded-md bg-gray-50 px-3 py-2 dark:bg-gray-800">
+      <!-- Leader (only when the active profile requires the leader assertion) -->
+      <div v-if="requiresInput('leader_confirmed')" class="mb-3 rounded-md bg-gray-50 px-3 py-2 dark:bg-gray-800">
         <div class="flex items-center justify-between">
           <span class="text-xs font-medium text-gray-700 dark:text-gray-300">Leader</span>
           <span
@@ -88,8 +88,8 @@
         </div>
       </div>
 
-      <!-- Base Start -->
-      <div class="mb-3 rounded-md bg-gray-50 px-3 py-2 dark:bg-gray-800">
+      <!-- Base Start (only when the active profile depends on structural context) -->
+      <div v-if="requiresInput('base_start')" class="mb-3 rounded-md bg-gray-50 px-3 py-2 dark:bg-gray-800">
         <div class="flex items-center justify-between">
           <span class="text-xs font-medium text-gray-700 dark:text-gray-300">Base Start</span>
           <span v-if="baseStartInput" class="provenance-badge" :class="provenanceClass(baseStartInput.source)">
@@ -141,8 +141,8 @@
         </div>
       </div>
 
-      <!-- Pivot -->
-      <div class="mb-3 rounded-md bg-gray-50 px-3 py-2 dark:bg-gray-800">
+      <!-- Pivot (only when the active profile depends on structural context) -->
+      <div v-if="requiresInput('pivot')" class="mb-3 rounded-md bg-gray-50 px-3 py-2 dark:bg-gray-800">
         <div class="flex items-center justify-between">
           <span class="text-xs font-medium text-gray-700 dark:text-gray-300">Pivot</span>
           <div class="flex items-center gap-2">
@@ -231,7 +231,7 @@
           {{ store.evaluating ? 'Evaluating…' : 'Run / Recalculate Setup Quality' }}
         </button>
         <span v-if="!canEvaluate" class="text-xs text-amber-600 dark:text-amber-400">
-          Confirm or adjust the Base Start, Pivot, and Leader first.
+          {{ missingInputsText }}
         </span>
         <span v-if="evaluation && evaluation.status !== 'completed'" class="text-xs text-gray-400">
           Draft progress — Entry/Management are added in later phases.
@@ -370,8 +370,43 @@ const profileLabel = computed(() => {
 const evidenceUnavailable = computed(() => (prepared.value ? prepared.value.unavailableEvidence || [] : []))
 const hasPersistedResults = computed(() => !!(evaluation.value && evaluation.value.results && evaluation.value.results.setup))
 
+// The UI consumes the server-provided execution contract: requiredUserInputs
+// is derived from the immutable active Setup criteria. Fall back to the
+// canonical triple for older server responses that omit the field.
+const requiredInputs = computed(() => {
+  const list = prepared.value && prepared.value.requiredUserInputs
+  if (Array.isArray(list) && list.length > 0) return list
+  return ['leader_confirmed', 'base_start', 'pivot']
+})
+
+function requiresInput(key) {
+  return requiredInputs.value.includes(key)
+}
+
+const INPUT_LABELS = {
+  leader_confirmed: 'Leader',
+  base_start: 'the Base Start',
+  pivot: 'the Pivot'
+}
+
+const missingInputsText = computed(() => {
+  const missing = requiredInputs.value.filter((key) => {
+    if (key === 'leader_confirmed') return leader.value === null
+    if (key === 'base_start') return !baseStartInput.value
+    if (key === 'pivot') return !pivotInput.value
+    return true
+  })
+  if (missing.length === 0) return ''
+  const labels = missing.map((key) => INPUT_LABELS[key] || key).join(', ')
+  return `Confirm or adjust ${labels} first.`
+})
+
 const canEvaluate = computed(() => {
-  return leader.value !== null && !!baseStartInput.value && !!pivotInput.value
+  if (!prepared.value) return false
+  if (requiresInput('leader_confirmed') && leader.value === null) return false
+  if (requiresInput('base_start') && !baseStartInput.value) return false
+  if (requiresInput('pivot') && !pivotInput.value) return false
+  return true
 })
 
 // A machine-detected Pivot can only be confirmed as detected_confirmed when it
@@ -556,20 +591,25 @@ async function runEvaluate() {
     return
   }
   try {
+    // Send ONLY the semantic inputs the active execution contract requires.
+    const userInputs = {}
+    if (requiresInput('leader_confirmed')) userInputs.leader_confirmed = leader.value
+    if (requiresInput('base_start')) {
+      userInputs.base_start = {
+        date: baseStartInput.value.date,
+        source: baseStartInput.value.source
+      }
+    }
+    if (requiresInput('pivot')) {
+      userInputs.pivot = {
+        price: Number(pivotInput.value.price),
+        date: pivotInput.value.date || undefined,
+        source: pivotInput.value.source
+      }
+    }
     const payload = await store.evaluate(props.trade.id, {
       evaluationId,
-      userInputs: {
-        leader_confirmed: leader.value,
-        base_start: {
-          date: baseStartInput.value.date,
-          source: baseStartInput.value.source
-        },
-        pivot: {
-          price: Number(pivotInput.value.price),
-          date: pivotInput.value.date || undefined,
-          source: pivotInput.value.source
-        }
-      }
+      userInputs
     })
     evaluation.value = payload.evaluation
     prepared.value = { ...(prepared.value || {}), evaluation: payload.evaluation }
