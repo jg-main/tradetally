@@ -1,26 +1,32 @@
 'use strict';
 
 // Entry Quality orchestration service (Phase 3 of
-// docs/QUALITY_PROFILES_REQUIREMENT.md, sections 22-32, 47-49, 55-58).
+// docs/QUALITY_PROFILES_REQUIREMENT.md, sections 22-32, 47-49, 55-58, plus the
+// Phase 3 hardening milestone).
 //
 // Prepare -> Assert intended trigger -> Evaluate workflow:
 //   - prepare(): operates on an EXISTING non-terminal evaluation created by
-//     Setup Quality. It requires the persisted Setup dependency context
-//     (confirmed Pivot, breakout/resolution session, exact daily evidence
-//     snapshot), normalizes the trade's actual opening execution evidence, and
-//     reports the semantic Entry inputs still required (the intended trigger
-//     type) plus intraday-evidence availability.
+//     Setup Quality. It requires only the Setup fields the ENABLED Entry
+//     criteria actually consume, normalizes the trade's actual opening
+//     execution evidence, and reports the semantic Entry inputs still required
+//     (the intended trigger type) plus evidence availability.
 //   - evaluate(): runs exactly the enabled Entry criteria of the immutable
 //     profile version against point-in-time evidence and persists non-terminal
 //     Entry progress while preserving the valid Setup result.
 //
-// Dependencies:
-//   - The breakout session is the Phase 2 authoritative resolution session; it
-//     is never redefined from the actual entry date.
-//   - Entry never re-detects a Pivot and never fabricates Setup context.
-//   - Machine-observable metrics (volume/range pace, ADR/ATR, LOD, extension,
-//     Initial R) are computed from evidence and are never requested from the
-//     user. The only semantic Entry assertion is the intended trigger type.
+// Hardening invariants:
+//   - Entry dependencies are CRITERION-DRIVEN: Pivot/breakout session are only
+//     required when an enabled criterion needs them (finding 8).
+//   - The FIRST opening execution print is distinct from Entry Basis; Trigger
+//     Compliance uses the first print and is UNKNOWN when it cannot be proven
+//     (finding 2).
+//   - Trigger/ORH evidence uses the persisted breakout session's bars, while
+//     entry-time pace/LOD use the actual entry session's bars (finding 9).
+//   - Entry-specific daily evidence is fetched/snapshotted separately when the
+//     Setup snapshot does not contain enough history; the Setup snapshot is
+//     never replaced (finding 8).
+//   - Every save is guarded by a server-derived Setup dependency fingerprint so
+//     stale Entry work cannot attach to a newer Setup (finding 1).
 //
 // Phase 3 does NOT evaluate Management and never marks the evaluation terminal.
 
@@ -32,9 +38,11 @@ const {
   EVALUATION_COLUMNS
 } = require('./evaluationService');
 const { normalizeDailyBars, indexByDate } = require('./dailyEvidence');
+const { loadDailyEvidence } = require('./marketEvidenceService');
+const { setupDependencyFingerprint } = require('./dependencyFingerprint');
 const { normalizeExecutionEvidence } = require('./executionEvidenceService');
 const { resolveTrigger } = require('./entry/triggerResolver');
-const { computeVolatility, CANONICAL_ADR_PERIOD } = require('./entry/volatility');
+const { computeVolatility } = require('./entry/volatility');
 const { resolveStopEvidence } = require('./entry/stopEvidence');
 const { resolveBuffer } = require('./entry/buffer');
 const { computeInitialR, resolveInitialR } = require('./entry/initialR');
@@ -53,9 +61,7 @@ const { getDateInTimezone } = require('../../utils/timezone');
 
 const MARKET_TZ = 'America/New_York';
 const TERMINAL_STATUSES = Object.freeze(['completed', 'insufficient_data']);
-// Hard cap on historical same-time reference sessions a profile can require,
-// used only to bound provider requests; it never changes a configured value.
-const MAX_REFERENCE_SESSIONS = 60;
+const OPENING_RANGE_TRIGGER_TYPES = Object.freeze(['BO-ORH-1', 'BO-ORH-5', 'BO-ORH-60']);
 
 class EntryQualityInputError extends Error {
   constructor(message, code = 'INVALID_INPUT', details = null) {
@@ -99,6 +105,13 @@ function toFrontendEvaluation(row) {
     }
   }
   return parsed;
+}
+
+function subtractDays(dateString, days) {
+  const date = new Date(`${dateString}T00:00:00.000Z`);
+  if (Number.isNaN(date.getTime())) return dateString;
+  date.setUTCDate(date.getUTCDate() - days);
+  return date.toISOString().split('T')[0];
 }
 
 async function getTradeForUser(userId, tradeId) {
@@ -147,11 +160,6 @@ function enabledCriterion(entryConfig, key) {
   return enabledEntryCriteria(entryConfig).find((criterion) => criterion.key === key) || null;
 }
 
-// Enforces the Entry execution contract before any evidence work:
-//   - typed Entry criterion parameters;
-//   - every parameter an evaluator/helper interprets is present and typed;
-//   - an ENABLED Entry criterion with no registered evaluator is a clear
-//     PROFILE_CONFIG_INVALID, never a runtime 500.
 function assertValidEntryConfiguration(entryConfig) {
   const violations = validateEntryCriteria(entryConfig);
   if (violations.length > 0) {
@@ -172,8 +180,39 @@ function assertValidEntryConfiguration(entryConfig) {
   }
 }
 
-// The intended trigger is required only when an enabled criterion actually
-// depends on the resolved trigger (Trigger Compliance or Entry Extension).
+// Derives the Setup/daily/intraday dependencies of the ENABLED Entry criteria.
+// Pivot and breakout session are only required when something actually consumes
+// them (finding 8).
+function entryDependencyNeeds(entryConfig) {
+  const enabledKeys = enabledEntryCriteria(entryConfig).map((criterion) => criterion.key);
+  const has = (key) => enabledKeys.includes(key);
+
+  const needsPivot = has('trigger_compliance') || has('entry_extension');
+  const needsBreakoutSession =
+    has('breakout_session') || has('trigger_compliance') || has('entry_extension');
+  const needsTriggerIntraday = has('trigger_compliance');
+  const needsEntryIntraday = has('volume_pace') || has('range_pace') || has('initial_stop');
+
+  const initialStop = enabledCriterion(entryConfig, 'initial_stop');
+  const bufferMethod = initialStop ? initialStop.parameters.minimum_buffer_method : null;
+  const needsDailyEvidence =
+    has('stop_width') ||
+    has('entry_extension') ||
+    bufferMethod === 'ATR_fraction' ||
+    bufferMethod === 'ADR_fraction';
+
+  return {
+    enabledKeys,
+    needsPivot,
+    needsBreakoutSession,
+    needsTriggerIntraday,
+    needsEntryIntraday,
+    needsDailyEvidence,
+    needsReferenceSessions: has('volume_pace') || has('range_pace'),
+    has
+  };
+}
+
 function requiredEntryUserInputsFromConfig(entryConfig) {
   const enabledKeys = enabledEntryCriteria(entryConfig).map((criterion) => criterion.key);
   const triggerDependent = enabledKeys.some(
@@ -188,14 +227,21 @@ function allowedTriggerTypesFromConfig(entryConfig) {
     criterion && criterion.parameters && Array.isArray(criterion.parameters.allowed_types)
       ? criterion.parameters.allowed_types
       : null;
-  return allowed && allowed.length > 0 ? [...allowed] : [...SUPPORTED_TRIGGER_TYPES];
+  if (!allowed || allowed.length === 0) {
+    // The trigger policy owner is validated whenever a consumer is enabled, so
+    // reaching here means the profile is malformed.
+    throw new EntryQualityInputError(
+      'The trigger_compliance policy (allowed_types) is required but missing; profile configuration is invalid.',
+      'PROFILE_CONFIG_INVALID'
+    );
+  }
+  return [...allowed];
 }
 
-// Reads and verifies the persisted Setup dependency context Entry relies on:
-// confirmed Pivot, breakout/resolution session, base boundary, and the exact
-// daily evidence snapshot. Missing/stale Setup context is a hard error: Entry
-// never fabricates Setup context.
-function getSetupContext(evaluation) {
+// Criterion-driven Setup dependency context. An existing valid Setup result is
+// always required (Entry belongs to that evaluation); individual Setup fields
+// are only required when the enabled Entry criteria consume them.
+function getSetupContext(evaluation, needs) {
   const results = parseJsonField(evaluation.results);
   if (!results || !hasOwn(results, 'setup') || results.setup === null) {
     throw new EntryQualityInputError(
@@ -209,28 +255,32 @@ function getSetupContext(evaluation) {
   const confirmedPivot = boundary && isFiniteNumber(Number(boundary.pivotPrice))
     ? Number(boundary.pivotPrice)
     : (inputs.pivot && isFiniteNumber(Number(inputs.pivot.price)) ? Number(inputs.pivot.price) : null);
-  const breakoutSession = boundary && boundary.resolutionDate
-    ? boundary.resolutionDate
-    : (detected.setupBoundary && detected.setupBoundary.resolutionDate
-      ? detected.setupBoundary.resolutionDate
-      : null);
+  const breakoutSession = boundary && boundary.resolutionDate ? boundary.resolutionDate : null;
 
-  if (!isFiniteNumber(confirmedPivot) || confirmedPivot <= 0 || !breakoutSession) {
+  if (needs.needsPivot && (!isFiniteNumber(confirmedPivot) || confirmedPivot <= 0)) {
     throw new EntryQualityInputError(
-      'The confirmed Pivot and breakout/resolution session are unavailable on this draft. Re-run Setup Quality before Entry Quality.',
+      'The confirmed Pivot is required by the enabled Entry criteria but is unavailable on this draft. Run Setup Quality first.',
       'ENTRY_SETUP_REQUIRED',
-      { confirmedPivot, breakoutSession }
+      { confirmedPivot }
+    );
+  }
+  if (needs.needsBreakoutSession && !breakoutSession) {
+    throw new EntryQualityInputError(
+      'The breakout/resolution session is required by the enabled Entry criteria but is unavailable on this draft. Run Setup Quality first.',
+      'ENTRY_SETUP_REQUIRED',
+      { breakoutSession }
     );
   }
 
   return {
-    confirmedPivot,
-    breakoutSession,
-    baseStartDate: boundary ? boundary.baseStartDate : (inputs.base_start ? inputs.base_start.date : null),
-    resolutionDate: breakoutSession,
+    confirmedPivot: isFiniteNumber(confirmedPivot) ? confirmedPivot : null,
+    breakoutSession: breakoutSession || null,
+    baseStartDate: boundary ? boundary.baseStartDate : null,
+    resolutionDate: breakoutSession || null,
     baseEndDate: boundary ? boundary.baseEndDate : null,
-    pivotSource: boundary ? boundary.pivotSource : (inputs.pivot ? inputs.pivot.source : null),
-    boundarySource: boundary ? boundary.method : null
+    pivotSource: boundary ? boundary.pivotSource : null,
+    boundarySource: boundary ? boundary.method : null,
+    boundary: boundary || null
   };
 }
 
@@ -252,9 +302,6 @@ async function loadVersionForEvaluation(evaluation, userId) {
   return versionResult.rows[0];
 }
 
-// Resolves the evaluation Entry operates on: an explicit evaluationId, or the
-// most recent non-terminal draft for the trade that already holds Setup
-// results. Ownership is always enforced server-side.
 async function resolveEvaluationForEntry(userId, tradeId, evaluationId) {
   if (evaluationId) {
     const evaluation = await getEvaluation(evaluationId, userId);
@@ -301,37 +348,23 @@ function fallbackEntrySession(trade) {
   return getDateInTimezone(trade.entry_time, MARKET_TZ, false);
 }
 
-function dailyContext(evaluation) {
-  const snapshot = parseJsonField(evaluation.evidence_snapshot) || {};
-  const bars = normalizeDailyBars(Array.isArray(snapshot.bars) ? snapshot.bars : []);
-  return { snapshot, bars, dateIndex: indexByDate(bars) };
+function setupSnapshot(evaluation) {
+  return parseJsonField(evaluation.evidence_snapshot) || {};
 }
 
-function entrySessionIndex(bars, dateIndex, entryEvidence, trade) {
-  const actualSession = (entryEvidence && entryEvidence.actualEntrySession) || fallbackEntrySession(trade);
-  return {
-    actualSession,
-    index: actualSession && dateIndex.has(actualSession) ? dateIndex.get(actualSession) : -1
-  };
-}
-
-// Historical same-time reference sessions: the configured number of completed
-// sessions immediately preceding the actual entry session, drawn from the same
-// frozen daily snapshot.
-function referenceSessionDates(dailyBars, entryIndex, count) {
-  const dates = [];
-  for (let i = entryIndex - 1; i >= 0 && dates.length < count; i -= 1) {
-    dates.push(dailyBars[i].date);
-  }
-  return dates.reverse();
-}
-
+// Volatility period owner: stop_width. Its period is validated whenever any
+// consumer is enabled, so a missing period here is a hard profile error (no
+// silent canonical fallback).
 function volatilityPeriod(entryConfig) {
   const stopWidth = entryConfig.criteria.find((criterion) => criterion.key === 'stop_width');
-  if (stopWidth && stopWidth.parameters && Number.isInteger(stopWidth.parameters.period)) {
-    return stopWidth.parameters.period;
+  const period = stopWidth && stopWidth.parameters ? stopWidth.parameters.period : undefined;
+  if (!Number.isInteger(period) || period < 1) {
+    throw new EntryQualityInputError(
+      'The stop_width volatility period is required by an enabled Entry criterion but is missing/invalid.',
+      'PROFILE_CONFIG_INVALID'
+    );
   }
-  return CANONICAL_ADR_PERIOD;
+  return period;
 }
 
 function neededVolatilityMethods(entryConfig) {
@@ -362,9 +395,58 @@ function buildVolatilityByMethod({ methods, dailyBars, entryIndex, entryBasis, p
   return output;
 }
 
+// Resolves the daily bars Entry uses for volatility. Prefers the frozen Setup
+// snapshot when it contains enough completed sessions before the entry session;
+// otherwise fetches Entry-specific daily evidence and appends it separately
+// (never replacing the Setup snapshot).
+async function resolveEntryDailyEvidence({ evaluation, trade, userId, entrySession, period }) {
+  const snapshot = setupSnapshot(evaluation);
+  const setupBars = normalizeDailyBars(Array.isArray(snapshot.bars) ? snapshot.bars : []);
+  const requiredHistory = period + 2;
+  const setupIndexMap = indexByDate(setupBars);
+  const setupIndex = entrySession && setupIndexMap.has(entrySession) ? setupIndexMap.get(entrySession) : -1;
+
+  if (setupIndex >= requiredHistory) {
+    return {
+      bars: setupBars,
+      index: setupIndex,
+      source: snapshot.source || 'setup_snapshot',
+      completeness: snapshot.completeness || 'unverified',
+      appended: false,
+      error: null
+    };
+  }
+
+  const symbol = String((trade && trade.symbol) || '').trim().toUpperCase();
+  const fromDate = entrySession ? subtractDays(entrySession, period * 3 + 14) : null;
+  if (!symbol || !fromDate) {
+    return { bars: setupBars, index: setupIndex, source: 'setup_snapshot', completeness: 'unverified', appended: false, error: 'no entry daily window' };
+  }
+  const loaded = await loadDailyEvidence({ symbol, userId, fromDate, toDate: entrySession });
+  const bars = normalizeDailyBars(loaded.bars);
+  const indexMap = indexByDate(bars);
+  const index = entrySession && indexMap.has(entrySession) ? indexMap.get(entrySession) : -1;
+  return {
+    bars,
+    index,
+    source: loaded.source,
+    completeness: loaded.completeness,
+    appended: true,
+    error: loaded.error || null
+  };
+}
+
+function referenceSessionDates(dailyBars, entryIndex, count) {
+  const dates = [];
+  for (let i = entryIndex - 1; i >= 0 && dates.length < count; i -= 1) {
+    dates.push(dailyBars[i].date);
+  }
+  return dates.reverse();
+}
+
 async function loadReferenceSessions({ symbol, userId, dailyBars, entryIndex, count }) {
   if (!(count > 0) || entryIndex < 0) return [];
-  const dates = referenceSessionDates(dailyBars, entryIndex, Math.min(count, MAX_REFERENCE_SESSIONS));
+  const dates = referenceSessionDates(dailyBars, entryIndex, count);
   const references = [];
   for (const date of dates) {
     const sessionBounds = regularSessionBounds(date);
@@ -427,7 +509,7 @@ function buildEntryCriterionRows(entryConfig, context) {
         }
         row.score = derived.score;
       } else {
-        row.score = fragment.score !== undefined ? fragment.score : null;
+        row.score = null;
       }
     }
     rows.push(row);
@@ -435,12 +517,20 @@ function buildEntryCriterionRows(entryConfig, context) {
   return rows;
 }
 
-// Builds the compact Entry evidence snapshot block appended under
-// evidence_snapshot.entry. Raw intraday bars are NOT duplicated here (criterion
-// evidence already carries the measured values and provenance); only the
-// deterministic provenance/cutoff summary is persisted so already-evaluated
-// results cannot be silently changed by later provider revisions.
-function buildEntryEvidenceBlock({ executionEvidence, setupContext, intraday, stopEvidence, buffer, initialR, volatilityByMethod, metrics, triggerResolution, referenceSessions }) {
+function buildEntryEvidenceBlock({
+  executionEvidence,
+  setupContext,
+  entryDaily,
+  entryIntraday,
+  breakoutIntraday,
+  stopEvidence,
+  buffer,
+  initialR,
+  volatilityByMethod,
+  metrics,
+  triggerResolution,
+  referenceSessions
+}) {
   return {
     preparedAt: new Date().toISOString(),
     execution: {
@@ -450,6 +540,10 @@ function buildEntryEvidenceBlock({ executionEvidence, setupContext, intraday, st
       original_position_qty: executionEvidence.originalPositionQty,
       entry_basis: executionEvidence.entryBasis,
       initial_entry_time: executionEvidence.initialEntryTime,
+      initial_entry_fill_price: executionEvidence.initialEntryFillPrice,
+      initial_entry_fill_time: executionEvidence.initialEntryFillTime,
+      initial_entry_fill_trustworthy: executionEvidence.initialEntryFillTrustworthy,
+      ambiguous_first_fill: executionEvidence.ambiguousFirstFill,
       actual_entry_session: executionEvidence.actualEntrySession,
       first_reduction_time: executionEvidence.firstReductionTime,
       fills: executionEvidence.fills
@@ -461,18 +555,42 @@ function buildEntryEvidenceBlock({ executionEvidence, setupContext, intraday, st
       base_end_date: setupContext.baseEndDate,
       boundary_source: setupContext.boundarySource
     },
-    intraday: intraday
+    entry_daily: entryDaily
       ? {
-          available: intraday.available,
-          source: intraday.source,
-          resolution: intraday.resolution,
-          session: intraday.session
-            ? { date: intraday.session.date, openEpoch: intraday.session.openEpoch, closeEpoch: intraday.session.closeEpoch }
-            : null,
-          bars: intraday.bars ? intraday.bars.length : 0,
-          reason: intraday.reason || null
+          source: entryDaily.source,
+          completeness: entryDaily.completeness,
+          appended: entryDaily.appended,
+          bars: entryDaily.bars ? entryDaily.bars.length : 0,
+          entry_index: entryDaily.index,
+          error: entryDaily.error || null
         }
       : null,
+    intraday: {
+      entry_session: entryIntraday
+        ? {
+            available: entryIntraday.available,
+            source: entryIntraday.source,
+            resolution: entryIntraday.resolution,
+            session: entryIntraday.session
+              ? { date: entryIntraday.session.date, openEpoch: entryIntraday.session.openEpoch, closeEpoch: entryIntraday.session.closeEpoch }
+              : null,
+            bars: entryIntraday.bars ? entryIntraday.bars.length : 0,
+            coverage: entryIntraday.coverage || null,
+            reason: entryIntraday.reason || null
+          }
+        : null,
+      breakout_session: breakoutIntraday
+        ? {
+            available: breakoutIntraday.available,
+            source: breakoutIntraday.source,
+            resolution: breakoutIntraday.resolution,
+            session: breakoutIntraday.session ? breakoutIntraday.session.date : null,
+            bars: breakoutIntraday.bars ? breakoutIntraday.bars.length : 0,
+            coverage: breakoutIntraday.coverage || null,
+            reason: breakoutIntraday.reason || null
+          }
+        : null
+    },
     reference_sessions: (referenceSessions || []).map((reference) => ({
       date: reference.date,
       available: reference.available,
@@ -486,6 +604,7 @@ function buildEntryEvidenceBlock({ executionEvidence, setupContext, intraday, st
           source: stopEvidence.source,
           reference_time: stopEvidence.referenceTime,
           reference_time_source: stopEvidence.referenceTimeSource,
+          reference_stop: stopEvidence.referenceStop || null,
           provenance: stopEvidence.provenance
         }
       : null,
@@ -509,12 +628,13 @@ function buildEntryEvidenceBlock({ executionEvidence, setupContext, intraday, st
     metrics: metrics
       ? {
           lod_observable: metrics.lod ? metrics.lod.low : null,
-          lod_last_observable_epoch: metrics.lod ? metrics.lod.lastObservableEpoch : null,
+          lod_precision: metrics.lod ? metrics.lod.precision : null,
+          lod_reason: metrics.lod ? metrics.lod.reason : null,
           volume_pace: metrics.volumePace
-            ? { available: metrics.volumePace.available, pace: metrics.volumePace.pace }
+            ? { available: metrics.volumePace.available, pace: metrics.volumePace.pace, precision: metrics.volumePace.precision || null, reason: metrics.volumePace.reason || null }
             : null,
           range_pace: metrics.rangePace
-            ? { available: metrics.rangePace.available, pace: metrics.rangePace.pace }
+            ? { available: metrics.rangePace.available, pace: metrics.rangePace.pace, precision: metrics.rangePace.precision || null, reason: metrics.rangePace.reason || null }
             : null,
           range_at_entry_over_adr: metrics.rangeAtEntryOverAdr ?? null
         }
@@ -525,18 +645,34 @@ function buildEntryEvidenceBlock({ executionEvidence, setupContext, intraday, st
           trigger_type: triggerResolution.triggerType,
           effective_trigger: triggerResolution.effectiveTrigger,
           opening_range_high: triggerResolution.openingRangeHigh,
+          trigger_time_precision: triggerResolution.triggerTimePrecision || null,
           evidence: triggerResolution.evidence
         }
       : null
   };
 }
 
+function computeEntryDependencyFingerprint(evaluation) {
+  const detected = parseJsonField(evaluation.detected_context) || {};
+  return setupDependencyFingerprint({
+    profileVersionId: evaluation.profile_version_id,
+    boundary: detected.boundary || null,
+    evidenceSnapshot: parseJsonField(evaluation.evidence_snapshot) || null
+  });
+}
+
+async function loadBreakoutIntraday({ symbol, userId, setupContext, needs }) {
+  if (!needs.needsTriggerIntraday || !symbol || !setupContext.breakoutSession) return null;
+  return loadSessionIntradayBars(symbol, setupContext.breakoutSession, userId);
+}
+
+async function loadEntryIntraday({ symbol, userId, entrySession, needs }) {
+  if (!needs.needsEntryIntraday || !symbol || !entrySession) return null;
+  return loadSessionIntradayBars(symbol, entrySession, userId);
+}
+
 /**
- * Prepares Entry Quality for an existing draft evaluation. Returns the persisted
- * Setup dependency context, normalized execution evidence, intraday-evidence
- * availability, the allowed intended-trigger values, and the required semantic
- * Entry user inputs. It does NOT require the user to enter machine-observable
- * metrics.
+ * Prepares Entry Quality for an existing draft evaluation.
  */
 async function prepare(userId, tradeId, { evaluationId } = {}) {
   const trade = await getTradeForUser(userId, tradeId);
@@ -547,24 +683,30 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
   const version = await loadVersionForEvaluation(evaluation, userId);
   const entryConfig = getEntryDimensionConfig(version.configuration);
   assertValidEntryConfiguration(entryConfig);
+  const needs = entryDependencyNeeds(entryConfig);
 
-  const setupContext = getSetupContext(evaluation);
-  const { bars, dateIndex } = dailyContext(evaluation);
+  const setupContext = getSetupContext(evaluation, needs);
   const executionEvidence = normalizeExecutionEvidence(trade);
-  const { actualSession, index: entryIndex } = entrySessionIndex(bars, dateIndex, executionEvidence, trade);
 
   const unavailableEvidence = [];
-  if (bars.length === 0) unavailableEvidence.push('daily_setup_snapshot');
-  if (entryIndex === -1) unavailableEvidence.push('entry_session_daily_bar');
   if (!executionEvidence.available) unavailableEvidence.push('execution_evidence');
-  if (!trade.stop_loss) unavailableEvidence.push('actual_initial_stop');
+  if (!executionEvidence.initialEntryFillTrustworthy) unavailableEvidence.push('first_execution_print');
+  // TradeTally has no trustworthy actual-initial-stop source: this is a known
+  // evidence limitation of the canonical Initial Stop / Stop Width / Initial R.
+  if (needs.has('initial_stop') || needs.has('stop_width')) {
+    unavailableEvidence.push('actual_initial_stop');
+  }
+  if (needs.needsDailyEvidence) unavailableEvidence.push('entry_daily_evidence_pending');
 
   const symbol = String(trade.symbol || '').trim().toUpperCase();
-  const entrySessionDate = actualSession || fallbackEntrySession(trade);
-  const entryIntraday = entrySessionDate
+  const entrySessionDate = executionEvidence.actualEntrySession || fallbackEntrySession(trade);
+  const entryIntraday = needs.needsEntryIntraday && entrySessionDate
     ? await loadSessionIntradayBars(symbol, entrySessionDate, userId)
-    : { available: false, bars: [], source: null, resolution: '1min', session: null, reason: 'No actual entry session is available.' };
-  if (!entryIntraday.available) unavailableEvidence.push('entry_session_intraday');
+    : null;
+  if (needs.needsEntryIntraday && (!entryIntraday || !entryIntraday.available)) {
+    unavailableEvidence.push('entry_session_intraday');
+  }
+  const breakoutIntraday = await loadBreakoutIntraday({ symbol, userId, setupContext, needs });
 
   return {
     evaluation: toFrontendEvaluation(evaluation),
@@ -581,7 +723,9 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
       breakoutSession: setupContext.breakoutSession,
       baseStartDate: setupContext.baseStartDate,
       baseEndDate: setupContext.baseEndDate,
-      boundarySource: setupContext.boundarySource
+      boundarySource: setupContext.boundarySource,
+      needsPivot: needs.needsPivot,
+      needsBreakoutSession: needs.needsBreakoutSession
     },
     executionEvidence: {
       available: executionEvidence.available,
@@ -589,6 +733,10 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
       originalPositionQty: executionEvidence.originalPositionQty,
       entryBasis: executionEvidence.entryBasis,
       initialEntryTime: executionEvidence.initialEntryTime,
+      initialEntryFillPrice: executionEvidence.initialEntryFillPrice,
+      initialEntryFillTime: executionEvidence.initialEntryFillTime,
+      initialEntryFillTrustworthy: executionEvidence.initialEntryFillTrustworthy,
+      ambiguousFirstFill: executionEvidence.ambiguousFirstFill,
       actualEntrySession: executionEvidence.actualEntrySession,
       firstReductionTime: executionEvidence.firstReductionTime,
       provenance: executionEvidence.provenance,
@@ -596,14 +744,21 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
       unavailableReason: executionEvidence.unavailableReason
     },
     intradayEvidence: {
-      entrySession: {
-        available: entryIntraday.available,
-        date: entrySessionDate,
-        source: entryIntraday.source,
-        resolution: entryIntraday.resolution,
-        bars: entryIntraday.bars ? entryIntraday.bars.length : 0,
-        reason: entryIntraday.reason || null
-      }
+      entrySession: entryIntraday
+        ? { available: entryIntraday.available, date: entrySessionDate, source: entryIntraday.source, resolution: entryIntraday.resolution, bars: entryIntraday.bars ? entryIntraday.bars.length : 0, reason: entryIntraday.reason || null }
+        : null,
+      breakoutSession: breakoutIntraday
+        ? { available: breakoutIntraday.available, date: setupContext.breakoutSession, source: breakoutIntraday.source, resolution: breakoutIntraday.resolution, bars: breakoutIntraday.bars ? breakoutIntraday.bars.length : 0, reason: breakoutIntraday.reason || null }
+        : null
+    },
+    entryDependencyNeeds: {
+      enabledKeys: needs.enabledKeys,
+      needsPivot: needs.needsPivot,
+      needsBreakoutSession: needs.needsBreakoutSession,
+      needsTriggerIntraday: needs.needsTriggerIntraday,
+      needsEntryIntraday: needs.needsEntryIntraday,
+      needsDailyEvidence: needs.needsDailyEvidence,
+      needsReferenceSessions: needs.needsReferenceSessions
     },
     allowedTriggerTypes: allowedTriggerTypesFromConfig(entryConfig),
     requiredEntryUserInputs: requiredEntryUserInputsFromConfig(entryConfig),
@@ -614,7 +769,7 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
 
 /**
  * Evaluates and persists NON-TERMINAL Entry progress, preserving the valid
- * Setup result. Input carries only semantic assertions (intended_trigger_type).
+ * Setup result.
  */
 async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInputs } = {}) {
   if (!evaluationId) {
@@ -628,11 +783,11 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   const version = await loadVersionForEvaluation(evaluation, userId);
   const entryConfig = getEntryDimensionConfig(version.configuration);
   assertValidEntryConfiguration(entryConfig);
+  const needs = entryDependencyNeeds(entryConfig);
 
-  const setupContext = getSetupContext(evaluation);
-  const { snapshot, bars, dateIndex } = dailyContext(evaluation);
+  const setupContext = getSetupContext(evaluation, needs);
   const executionEvidence = normalizeExecutionEvidence(trade);
-  const { actualSession, index: entryIndex } = entrySessionIndex(bars, dateIndex, executionEvidence, trade);
+  const symbol = String(trade.symbol || '').trim().toUpperCase();
 
   const requiredInputs = requiredEntryUserInputsFromConfig(entryConfig);
   const allowedTypes = allowedTriggerTypesFromConfig(entryConfig);
@@ -642,32 +797,33 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     allowedTypes
   });
 
-  const symbol = String(trade.symbol || '').trim().toUpperCase();
-  const entrySessionDate = actualSession || null;
+  const entrySessionDate = executionEvidence.actualEntrySession || null;
 
-  // Entry-session intraday evidence (cache-first).
-  const entryIntraday = entrySessionDate
-    ? await loadSessionIntradayBars(symbol, entrySessionDate, userId)
-    : {
-        available: false, bars: [], source: null, resolution: '1min',
-        resolutionSeconds: 60, session: null,
-        reason: 'No actual initial-entry session is available.'
-      };
+  // Daily evidence (only when a volatility consumer is enabled).
+  const period = needs.needsDailyEvidence ? volatilityPeriod(entryConfig) : null;
+  const entryDaily = needs.needsDailyEvidence
+    ? await resolveEntryDailyEvidence({ evaluation, trade, userId, entrySession: entrySessionDate, period })
+    : null;
+  const dailyBars = entryDaily ? entryDaily.bars : [];
+  const entryIndex = entryDaily ? entryDaily.index : -1;
 
-  const session = entryIntraday.session || (entrySessionDate ? regularSessionBounds(entrySessionDate) : null);
-  const extraPrices = executionEvidence.available
-    ? executionEvidence.fills.map((fill) => fill.price)
+  // Intraday evidence: breakout session (trigger) and actual entry session
+  // (pace/LOD) are loaded SEPARATELY and never mixed (finding 9).
+  const breakoutIntraday = await loadBreakoutIntraday({ symbol, userId, setupContext, needs });
+  const entryIntraday = await loadEntryIntraday({ symbol, userId, entrySession: entrySessionDate, needs });
+  const entrySession = entryIntraday && entryIntraday.session
+    ? entryIntraday.session
+    : (entrySessionDate ? regularSessionBounds(entrySessionDate) : null);
+
+  const extraObservations = executionEvidence.available
+    ? executionEvidence.fills.map((fill) => ({ epoch: fill.timestampEpoch, price: fill.price }))
     : [];
 
-  // Stop evidence and buffer.
   const stopEvidence = resolveStopEvidence({ trade, executionEvidence });
-
-  // Volatility references needed by enabled criteria.
   const methods = neededVolatilityMethods(entryConfig);
-  const period = volatilityPeriod(entryConfig);
   const volatilityByMethod = buildVolatilityByMethod({
     methods,
-    dailyBars: bars,
+    dailyBars,
     entryIndex,
     entryBasis: executionEvidence.entryBasis,
     period
@@ -683,9 +839,11 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       })
     : { available: false, buffer: null, method: null, value: null, source: null, reason: 'Initial Stop is not enabled.' };
 
-  // Immutable Initial R: established once from the actual initial protective
-  // stop, then preserved across re-evaluations while the frozen inputs match.
-  const storedInitialR = snapshot && snapshot.entry ? snapshot.entry.initial_r || null : null;
+  const storedInitialR =
+    (parseJsonField(evaluation.evidence_snapshot) || {}).entry &&
+    (parseJsonField(evaluation.evidence_snapshot) || {}).entry.initial_r
+      ? (parseJsonField(evaluation.evidence_snapshot) || {}).entry.initial_r
+      : null;
   const initialR = resolveInitialR({
     computed: computeInitialR({
       direction: executionEvidence.direction,
@@ -698,36 +856,37 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
 
   // Point-in-time LOD through the stop-establishment reference time.
   const referenceEpoch = stopEvidence.referenceEpoch || executionEvidence.initialEntryEpoch || null;
-  let lod = { low: null, high: null, lastObservableEpoch: null, observableBars: 0 };
-  if (entryIntraday.available && session && isFiniteNumber(referenceEpoch)) {
+  let lod = { low: null, high: null, lastObservableEpoch: null, observableBars: 0, precision: null, reason: null };
+  if (entryIntraday && entryIntraday.available && entrySession && isFiniteNumber(referenceEpoch)) {
     lod = observableLod({
       bars: entryIntraday.bars,
-      openEpoch: session.openEpoch,
+      openEpoch: entrySession.openEpoch,
       referenceEpoch,
       resolutionSeconds: entryIntraday.resolutionSeconds,
-      extraPrices
+      extraObservations
     });
+  } else if (!entryIntraday || !entryIntraday.available) {
+    lod.reason = 'Entry-session intraday evidence is unavailable.';
   }
 
-  // Historical same-time reference sessions for pace criteria.
   const volumeCriterion = enabledCriterion(entryConfig, 'volume_pace');
   const rangeCriterion = enabledCriterion(entryConfig, 'range_pace');
   const referenceCount = Math.max(
     volumeCriterion ? volumeCriterion.parameters.reference_sessions : 0,
     rangeCriterion ? rangeCriterion.parameters.reference_sessions : 0
   );
-  const referenceSessions = entryIntraday.available
-    ? await loadReferenceSessions({ symbol, userId, dailyBars: bars, entryIndex, count: referenceCount })
+  const referenceSessions = entryIntraday && entryIntraday.available
+    ? await loadReferenceSessions({ symbol, userId, dailyBars, entryIndex, count: referenceCount })
     : [];
 
   let volumePace = null;
   let rangePace = null;
   let rangeAtEntryOverAdr = null;
-  if (entryIntraday.available && session && isFiniteNumber(executionEvidence.initialEntryEpoch)) {
+  if (entryIntraday && entryIntraday.available && entrySession && isFiniteNumber(executionEvidence.initialEntryEpoch)) {
     const entryCutoffEpoch = executionEvidence.initialEntryEpoch;
     if (volumeCriterion) {
       volumePace = computePaceMetric({
-        entrySession: session,
+        entrySession,
         entrySessionBars: entryIntraday.bars,
         entryCutoffEpoch,
         referenceSessions,
@@ -737,13 +896,13 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     }
     if (rangeCriterion) {
       rangePace = computePaceMetric({
-        entrySession: session,
+        entrySession,
         entrySessionBars: entryIntraday.bars,
         entryCutoffEpoch,
         referenceSessions,
         requiredSessions: rangeCriterion.parameters.reference_sessions,
         kind: 'range',
-        extraPrices
+        extraObservations
       });
       const adr = volatilityByMethod.ADR;
       if (rangePace && rangePace.available && adr && adr.available && adr.dollars > 0) {
@@ -752,11 +911,13 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     }
   }
 
-  // Trigger resolution (long-only canonical semantics).
   const triggerCriterion = entryConfig.criteria.find((criterion) => criterion.key === 'trigger_compliance');
   const triggerParameters = triggerCriterion && triggerCriterion.parameters ? triggerCriterion.parameters : {};
   let triggerResolution = null;
   if (intendedTriggerType && executionEvidence.available && executionEvidence.direction === 'long') {
+    const wantsBreakoutBars =
+      OPENING_RANGE_TRIGGER_TYPES.includes(intendedTriggerType) ||
+      triggerCriterion !== undefined;
     triggerResolution = resolveTrigger({
       triggerType: intendedTriggerType,
       parameters: {
@@ -768,11 +929,13 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       },
       setupContext,
       executionEvidence,
-      intraday: entryIntraday.available
+      intraday: wantsBreakoutBars && breakoutIntraday && breakoutIntraday.available
         ? {
-            entrySessionBars: entryIntraday.bars,
-            resolution: entryIntraday.resolution,
-            resolutionSeconds: entryIntraday.resolutionSeconds
+            breakoutSession: setupContext.breakoutSession,
+            breakoutSessionBars: breakoutIntraday.bars,
+            entrySessionBars: entryIntraday ? entryIntraday.bars : [],
+            resolution: breakoutIntraday.resolution,
+            resolutionSeconds: breakoutIntraday.resolutionSeconds
           }
         : null
     });
@@ -780,10 +943,11 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
 
   const intradayMetrics = {
     entryIntraday,
-    session,
-    resolution: entryIntraday.resolution,
-    resolutionSeconds: entryIntraday.resolutionSeconds,
-    regularSessionOpenEpoch: session ? session.openEpoch : null,
+    breakoutIntraday,
+    session: entrySession,
+    resolution: entryIntraday ? entryIntraday.resolution : null,
+    resolutionSeconds: entryIntraday ? entryIntraday.resolutionSeconds : null,
+    regularSessionOpenEpoch: entrySession ? entrySession.openEpoch : null,
     lod,
     volumePace,
     rangePace,
@@ -798,15 +962,11 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     intradayMetrics,
     stopEvidence,
     buffer,
-    userInputs: {
-      intended_trigger_type: intendedTriggerType
-    }
+    userInputs: { intended_trigger_type: intendedTriggerType }
   };
 
   const criterionRows = buildEntryCriterionRows(entryConfig, context);
 
-  // Merge Entry evidence and semantic inputs into the existing evaluation
-  // context WITHOUT replacing the frozen Phase 2 Setup snapshot or its inputs.
   const storedSnapshot = parseJsonField(evaluation.evidence_snapshot) || {};
   const storedInputs = parseJsonField(evaluation.user_inputs) || {};
   const storedDetected = parseJsonField(evaluation.detected_context) || {};
@@ -814,7 +974,9 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   const entryEvidenceBlock = buildEntryEvidenceBlock({
     executionEvidence,
     setupContext,
-    intraday: entryIntraday,
+    entryDaily,
+    entryIntraday,
+    breakoutIntraday,
     stopEvidence,
     buffer,
     initialR,
@@ -850,12 +1012,23 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     }
   };
 
-  const updated = await saveEntryProgress(evaluationId, userId, {
-    entryResults: { criterionResults: criterionRows },
-    evidenceSnapshot,
-    userInputs: storedUserInputs,
-    detectedContext
-  });
+  const dependencyFingerprint = computeEntryDependencyFingerprint(evaluation);
+
+  let updated;
+  try {
+    updated = await saveEntryProgress(evaluationId, userId, {
+      entryResults: { criterionResults: criterionRows },
+      evidenceSnapshot,
+      userInputs: storedUserInputs,
+      detectedContext,
+      dependencyFingerprint
+    });
+  } catch (error) {
+    if (error && error.code === 'STALE_DEPENDENCY') {
+      throw new EntryQualityInputError(error.message, 'STALE_DEPENDENCY');
+    }
+    throw error;
+  }
   if (!updated) {
     throw new EntryQualityInputError(
       'Evaluation could not be updated (it may have reached a terminal state).',
@@ -877,6 +1050,7 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       breakoutSession: setupContext.breakoutSession,
       actualEntrySession: executionEvidence.actualEntrySession,
       initialEntryTime: executionEvidence.initialEntryTime,
+      initialEntryFillPrice: executionEvidence.initialEntryFillPrice,
       entryBasis: executionEvidence.entryBasis,
       originalPositionQty: executionEvidence.originalPositionQty,
       intendedTriggerType,
@@ -886,8 +1060,6 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   };
 }
 
-// Reuses the Setup evaluation history endpoint: one evaluation carries both
-// dimensions, so Entry does not need a separate history listing.
 async function listEvaluations(userId, tradeId) {
   const setupQualityService = require('./setupQualityService');
   return setupQualityService.listEvaluations(userId, tradeId);
@@ -903,6 +1075,7 @@ module.exports = {
   getEntryDimensionConfig,
   enabledEntryCriteria,
   assertValidEntryConfiguration,
+  entryDependencyNeeds,
   requiredEntryUserInputsFromConfig,
   allowedTriggerTypesFromConfig,
   getSetupContext,
@@ -912,5 +1085,6 @@ module.exports = {
   referenceSessionDates,
   neededVolatilityMethods,
   volatilityPeriod,
+  computeEntryDependencyFingerprint,
   toFrontendEvaluation
 };

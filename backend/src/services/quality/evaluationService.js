@@ -29,6 +29,7 @@ const db = require('../../config/database');
 const { CRITERION_STATUS, EVALUATION_STATUS } = require('./constants');
 const { aggregateDimension } = require('./aggregation');
 const { deriveScoreForCriterion } = require('./scoring');
+const { setupDependencyFingerprint } = require('./dependencyFingerprint');
 
 const EVALUATION_COLUMNS = `
   id, user_id, trade_id, profile_version_id, status,
@@ -423,7 +424,7 @@ async function getEvaluation(evaluationId, userId) {
 async function saveSetupProgress(evaluationId, userId, data = {}) {
   const lookup = await db.query(
     `
-      SELECT e.id, e.status, v.configuration
+      SELECT e.id, e.status, e.profile_version_id, e.results, e.detected_context, e.evidence_snapshot, v.configuration
       FROM trade_quality_evaluations e
       JOIN quality_profile_versions v ON v.id = e.profile_version_id
       JOIN quality_profiles p ON p.id = v.profile_id
@@ -456,19 +457,52 @@ async function saveSetupProgress(evaluationId, userId, data = {}) {
   const dimResult = { criterionResults: setupResults.criterionResults || [] };
   const rows = normalizeCriterionRows('setup', setupConfig, dimResult);
   const recomputed = aggregateDimension(setupConfig, rows);
-  const setupSummary = {
-    setup_score: recomputed.score,
-    setup_grade: recomputed.grade,
-    setup_compliance: recomputed.compliance,
-    setup_coverage: recomputed.coverage
-  };
 
-  // The stored results envelope keeps one key per configured dimension so
-  // later phases (and any full-dimension consumer) can rely on a stable shape.
-  // Entry/Management are explicitly `null` because Phase 2 never evaluates
-  // them — nothing is fabricated to satisfy a completed-dimension contract,
-  // and Phase 3/4 replace these nulls with their own recomputed aggregates.
-  const persistedResults = { setup: recomputed, entry: null, management: null };
+  // Setup -> Entry dependency fingerprint (server-computed, never client
+  // trusted). A still-valid Entry (and future Management) result may be
+  // preserved ONLY when the dependencies Entry consumes are unchanged. A
+  // changed Pivot/breakout/evidence context atomically replaces Setup and
+  // clears downstream results AND their flat summaries, so the results JSON and
+  // the flat columns can never disagree.
+  const detectedContextInput =
+    data.detectedContext && typeof data.detectedContext === 'object'
+      ? data.detectedContext
+      : {};
+  const newFingerprint = setupDependencyFingerprint({
+    profileVersionId: lookup.rows[0].profile_version_id,
+    boundary: detectedContextInput.boundary,
+    evidenceSnapshot: data.evidenceSnapshot
+  });
+  const existingDetected = parseJsonField(lookup.rows[0].detected_context) || {};
+  const existingFingerprint = existingDetected.setup_dependency_fingerprint ?? null;
+  const existingResults = parseJsonField(lookup.rows[0].results) || {};
+  const dependenciesUnchanged =
+    existingFingerprint !== null &&
+    existingFingerprint === newFingerprint &&
+    existingResults.setup !== null &&
+    existingResults.setup !== undefined;
+
+  const persistedResults = {
+    setup: recomputed,
+    entry: dependenciesUnchanged && existingResults.entry ? existingResults.entry : null,
+    management:
+      dependenciesUnchanged && existingResults.management ? existingResults.management : null
+  };
+  const persistedDetectedContext = {
+    ...detectedContextInput,
+    setup_dependency_fingerprint: newFingerprint
+  };
+  // When the Setup dependency is unchanged a still-valid Entry result (and its
+  // provenance block / Initial R) is preserved. The Setup snapshot is replaced
+  // by the fresh Setup evidence; the Entry block is merged back in.
+  let persistedEvidenceSnapshot = data.evidenceSnapshot ?? null;
+  if (dependenciesUnchanged && persistedEvidenceSnapshot && typeof persistedEvidenceSnapshot === 'object') {
+    const existingSnapshot = parseJsonField(lookup.rows[0].evidence_snapshot) || {};
+    if (existingSnapshot.entry !== undefined) {
+      persistedEvidenceSnapshot = { ...persistedEvidenceSnapshot, entry: existingSnapshot.entry };
+    }
+  }
+  const summaries = summariesFromResults(persistedResults);
 
   const updated = await db.query(
     `
@@ -482,6 +516,14 @@ async function saveSetupProgress(evaluationId, userId, data = {}) {
         setup_grade = $8,
         setup_compliance = $9,
         setup_coverage = $10,
+        entry_score = $11,
+        entry_grade = $12,
+        entry_compliance = $13,
+        entry_coverage = $14,
+        management_score = $15,
+        management_grade = $16,
+        management_compliance = $17,
+        management_coverage = $18,
         evaluated_at = CURRENT_TIMESTAMP
       WHERE id = $1
         AND user_id = $2
@@ -492,13 +534,21 @@ async function saveSetupProgress(evaluationId, userId, data = {}) {
       evaluationId,
       userId,
       JSON.stringify(persistedResults),
-      data.evidenceSnapshot ?? null,
+      persistedEvidenceSnapshot,
       data.userInputs ?? null,
-      data.detectedContext ?? null,
-      setupSummary.setup_score,
-      setupSummary.setup_grade,
-      setupSummary.setup_compliance,
-      setupSummary.setup_coverage
+      persistedDetectedContext,
+      summaries.setup_score,
+      summaries.setup_grade,
+      summaries.setup_compliance,
+      summaries.setup_coverage,
+      summaries.entry_score,
+      summaries.entry_grade,
+      summaries.entry_compliance,
+      summaries.entry_coverage,
+      summaries.management_score,
+      summaries.management_grade,
+      summaries.management_compliance,
+      summaries.management_coverage
     ]
   );
   return updated.rows[0] || null;
@@ -525,7 +575,7 @@ async function saveSetupProgress(evaluationId, userId, data = {}) {
 async function saveEntryProgress(evaluationId, userId, data = {}) {
   const lookup = await db.query(
     `
-      SELECT e.id, e.status, e.results, v.configuration
+      SELECT e.id, e.status, e.results, e.detected_context, v.configuration
       FROM trade_quality_evaluations e
       JOIN quality_profile_versions v ON v.id = e.profile_version_id
       JOIN quality_profiles p ON p.id = v.profile_id
@@ -540,6 +590,26 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
   if (lookup.rows.length === 0) {
     return null;
   }
+  // Optimistic Setup-dependency guard: Entry computed against a server-derived
+  // fingerprint from the Setup context it loaded. If the persisted Setup
+  // dependency changed while Entry evidence work was in flight, stale Entry
+  // results must never attach to the newer Setup. The value is server-derived
+  // (never client-trusted) and is re-checked in the UPDATE predicate to close
+  // the read/write race.
+  const currentDetected = parseJsonField(lookup.rows[0].detected_context) || {};
+  const currentFingerprint = currentDetected.setup_dependency_fingerprint ?? null;
+  const expectedFingerprint =
+    data.dependencyFingerprint === undefined || data.dependencyFingerprint === null
+      ? null
+      : String(data.dependencyFingerprint);
+  if (expectedFingerprint !== null && currentFingerprint !== expectedFingerprint) {
+    const staleError = new Error(
+      'Entry evidence is stale: the Setup dependency changed while Entry was being evaluated. Re-run Entry prepare/evaluate against the current Setup.'
+    );
+    staleError.code = 'STALE_DEPENDENCY';
+    throw staleError;
+  }
+
   const configuration = lookup.rows[0].configuration;
   if (
     configuration === null ||
@@ -598,6 +668,7 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
       WHERE id = $1
         AND user_id = $2
         AND ${TERMINAL_STATUS_SQL}
+        AND COALESCE(detected_context->>'setup_dependency_fingerprint', '') = $11
       RETURNING ${EVALUATION_COLUMNS}
     `,
     [
@@ -610,9 +681,19 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
       recomputed.score,
       recomputed.grade,
       recomputed.compliance,
-      recomputed.coverage
+      recomputed.coverage,
+      expectedFingerprint ?? ''
     ]
   );
+  if (updated.rows.length === 0) {
+    // The lookup confirmed a non-terminal row, so a zero-row UPDATE means the
+    // Setup-dependency predicate no longer holds: reject the stale write.
+    const staleError = new Error(
+      'Entry results were not saved because the Setup dependency changed during evaluation. Re-run Entry prepare/evaluate.'
+    );
+    staleError.code = 'STALE_DEPENDENCY';
+    throw staleError;
+  }
   return updated.rows[0] || null;
 }
 

@@ -982,17 +982,6 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
           detectionEvidence: { baseStart: null, pivot: null }
         };
 
-  const detectedContext = buildDetectedContext({ entryDate, detections });
-  const evidenceSnapshot = buildEvidenceSnapshot({
-    trade,
-    evidence,
-    entryDate,
-    bars,
-    fromDate,
-    toDate,
-    boundary: null
-  });
-
   const existingUserInputs = parseJsonField(evaluation.user_inputs, 'user_inputs') || {};
   const stagedBaseStart = structuralRequired && baseStartForPivot
     ? { date: baseStartForPivot.date, source: baseStartForPivot.source }
@@ -1006,7 +995,7 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
   // changes ANY semantic dependency that can affect Setup results — evidence,
   // confirmed/adjusted Base Start (date OR provenance source), or the Pivot
   // detection context — the old Setup result must not stay represented as
-  // valid. The context change and the Setup-result invalidation are persisted
+  // valid. The context change and the dependency cascade are persisted
   // ATOMICALLY in one UPDATE below; the draft id is retained and Run Setup
   // Quality is required again.
   const storedSnapshot = parseJsonField(evaluation.evidence_snapshot, 'evidence_snapshot');
@@ -1021,6 +1010,32 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
     stagedBaseStart,
     detections
   });
+
+  // When the Setup dependency context is UNCHANGED, a previously evaluated
+  // Setup boundary + its Entry dependency fingerprint are still valid: preserve
+  // them so a still-valid Entry result remains coherent and re-runnable. On a
+  // dependency change they are intentionally dropped (Entry is cleared below).
+  const preservedBoundary = !contextChanged && storedDetected && storedDetected.boundary
+    ? storedDetected.boundary
+    : null;
+
+  const detectedContext = buildDetectedContext({ entryDate, detections });
+  if (!contextChanged && storedDetected) {
+    detectedContext.boundary = storedDetected.boundary || null;
+    detectedContext.confirmations = storedDetected.confirmations || null;
+    detectedContext.setup_dependency_fingerprint =
+      storedDetected.setup_dependency_fingerprint || null;
+  }
+  const evidenceSnapshot = buildEvidenceSnapshot({
+    trade,
+    evidence,
+    entryDate,
+    bars,
+    fromDate,
+    toDate,
+    boundary: preservedBoundary
+  });
+
   // Phase 3 dependency cascade: a Setup/Pivot semantic change invalidates
   // Setup, Entry (breakout/effective trigger/Initial R), and Management
   // (future Initial R consumers). The context write and the cascade clear are

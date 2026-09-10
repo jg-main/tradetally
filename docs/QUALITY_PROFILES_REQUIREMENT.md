@@ -1400,6 +1400,23 @@ minutes_after_first_trigger
 
 Do not automatically fail second-break entries in v1; retain them as evidence unless the profile explicitly requires first break.
 
+**Implementation clarification (Phase 3 hardening).** Trigger Compliance is
+decided by the ACTUAL first opening execution print (the earliest opening-side
+fill), which is distinct from Entry Basis (the VWAP of all opening-side fills
+before the first reduction). When the first print cannot be proven — no
+fill-level evidence, or two opening fills sharing the earliest timestamp — the
+result is UNKNOWN, never a blended entry price.
+
+An ORH trigger is formed in the persisted Phase-2 breakout session; its
+opening-range and trigger-cross evidence is read from that session's intraday
+bars, while entry-time pace/LOD use the actual entry session's bars. With
+1-minute OHLC evidence, `trigger_cross_number` is exposed only when an execution
+print establishes it; otherwise the number of bars above the threshold is
+retained as `bars_above_threshold` and a crossing inside an interval is recorded
+with `trigger_time_precision = '1min_interval'` (`first_cross_bar_open` /
+`first_cross_bar_close`), never a fabricated exact tick time. A sustained run of
+bars above the threshold is not counted as multiple crossings.
+
 Canonical quality scoring for Trigger Compliance (binary; no partial credit):
 
 ```text
@@ -1559,6 +1576,23 @@ range across the configured reference sessions. A reference session contributes
 only when its same-time intraday evidence is usable; if fewer than
 `reference_sessions` usable sessions exist the criterion is UNKNOWN.
 
+**Implementation clarification (Phase 3 hardening).** The configured
+`reference_sessions` count is honored exactly, with a documented supported
+maximum of 250 (a larger configured value is rejected before evidence loading,
+never silently truncated).
+
+**Evidence sufficiency and same-minute precision.** Pace and observable-LOD
+metrics are exact only when the decision cutoff is exactly on the source
+interval boundary AND every expected 1-minute interval from the regular-session
+open through the cutoff is present. Excluding the single bar that CONTAINS the
+cutoff avoids look-ahead but does not make the measurement exact: the partially
+observed interval could contain unobserved volume or an unobserved extreme.
+With only 1-minute OHLC evidence and no finer/tick source, a mid-interval cutoff
+is therefore UNKNOWN for Volume Pace, Range Pace and the observable LOD (and
+consequently Initial Stop). A missing historical same-time interval makes that
+reference session unusable; missing/negative volume is invalid. Cache coverage
+metadata never upgrades a sparse provider/cache result into sufficient evidence.
+
 Also retain:
 
 ```text
@@ -1683,6 +1717,24 @@ Do not infer that the user's real stop was the rule-based reference stop.
 
 A reference/hypothetical stop may be displayed separately.
 
+**Implementation clarification (Phase 3 hardening).** TradeTally has no
+stop-order lifecycle and no stop-establishment timestamp; `trades.stop_loss` is
+a single mutable field that may be a planned/default/current value (Trade.create
+auto-populates it from the user's default stop settings) and `risk_level_history`
+records only changes. It is therefore NOT evidence of the FIRST actual protective
+stop: Initial Stop is UNKNOWN, Stop Width is consequently UNKNOWN, and Initial R
+remains unavailable. The stored level is surfaced only as a reference
+(planned/current) stop. A known result requires a genuinely trustworthy
+initial-stop source (e.g. a broker stop-order record) whose provenance
+establishes it as the first actual stop.
+
+`minimum_tick` requires an authoritative stored/known price increment
+(`trades.tick_size`, or the existing futures contract tick helper). For a stock
+with no authoritative stored increment, `minimum_tick` is unavailable (Initial
+Stop UNKNOWN); a fixed $0.01 buffer must be configured explicitly as
+`minimum_buffer_method = fixed_dollars`, `minimum_buffer_value = 0.01`. A
+market-wide heuristic must never be substituted for instrument evidence.
+
 Canonical quality scoring for Initial Stop (binary; no partial credit):
 
 ```text
@@ -1718,6 +1770,15 @@ Initial R is immutable
 ```
 
 Later stop changes must never redefine R.
+
+**Implementation clarification (Phase 3 hardening).** Immutability is enforced
+inside a single evaluation: once a stored Initial R is `available` with an
+`established_at`, it is frozen. A later current/planned stop value, a position
+edit, or conflicting evidence is reported as a conflict and NEVER silently
+rebases `initial_stop`, `r_per_share`, `initial_risk_dollars` or `established_at`.
+An initially-unavailable Initial R may be established exactly once (before
+terminalization) when trustworthy evidence first appears; thereafter it is
+frozen. Correcting the historical source requires a new evaluation.
 
 All R-normalized analytics use the original R.
 

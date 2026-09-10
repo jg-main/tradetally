@@ -51,13 +51,15 @@ function normalizeBar(raw) {
   if (high < open || high < close || high < low) return null;
   if (low > open || low > close) return null;
   const volume = raw.volume === null || raw.volume === undefined ? null : Number(raw.volume);
+  // Negative volume is invalid evidence, not a finite usable value.
+  const usableVolume = Number.isFinite(volume) && volume >= 0 ? volume : null;
   return {
     time,
     open,
     high,
     low,
     close,
-    volume: Number.isFinite(volume) ? volume : null
+    volume: usableVolume
   };
 }
 
@@ -120,16 +122,20 @@ async function storeBars(symbol, session, bars, source) {
      ON CONFLICT (symbol, interval, ts) DO NOTHING`,
     params
   );
+  // Coverage metadata must reflect the ACTUAL span of bars returned; it must
+  // never claim full-session coverage for a partial/sparse result.
+  const firstTs = Math.min(...bars.map((bar) => bar.time));
+  const lastTs = Math.max(...bars.map((bar) => bar.time));
   await db.query(
     `INSERT INTO intraday_candle_coverage (symbol, interval, session_date, from_ts, to_ts, source, candle_count)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (symbol, interval, session_date) DO UPDATE
-       SET from_ts = EXCLUDED.from_ts,
-           to_ts = EXCLUDED.to_ts,
+       SET from_ts = LEAST(intraday_candle_coverage.from_ts, EXCLUDED.from_ts),
+           to_ts = GREATEST(intraday_candle_coverage.to_ts, EXCLUDED.to_ts),
            source = EXCLUDED.source,
            candle_count = EXCLUDED.candle_count,
            fetched_at = NOW()`,
-    [symbol, INTERVAL, session.date, session.openEpoch, session.closeEpoch, source, bars.length]
+    [symbol, INTERVAL, session.date, firstTs, lastTs, source, bars.length]
   );
 }
 
@@ -175,25 +181,31 @@ async function loadSessionIntradayBars(symbol, sessionDate, userId) {
 
   let cached = [];
   try {
-    const coverage = await getCoverage(symbolUpper, sessionDate);
-    if (coverage && Number(coverage.from_ts) <= session.openEpoch && Number(coverage.to_ts) >= session.closeEpoch) {
-      cached = await getCachedBars(symbolUpper, session.openEpoch, session.closeEpoch);
-    } else if (coverage) {
-      cached = await getCachedBars(symbolUpper, session.openEpoch, session.closeEpoch);
-    }
+    cached = await getCachedBars(symbolUpper, session.openEpoch, session.closeEpoch);
   } catch (cacheError) {
     cached = [];
   }
   const regularCached = filterRegularSession(cached, session);
-  if (regularCached.length > 0) {
+  const expectedCount = expectedSessionIntervalCount(session, RESOLUTION_SECONDS);
+  const coverageOf = (bars) => ({
+    count: bars.length,
+    expectedCount,
+    firstEpoch: bars.length > 0 ? bars[0].time : null,
+    lastEpoch: bars.length > 0 ? bars[bars.length - 1].time : null
+  });
+
+  // `available` means bars are PRESENT, not that they are metric-sufficient.
+  // Metric-level sufficiency is decided by the pure functions below.
+  if (regularCached.length >= expectedCount && expectedCount > 0) {
     return {
       available: true, bars: regularCached, source: 'intraday_cache', resolution: INTERVAL,
-      resolutionSeconds: RESOLUTION_SECONDS, session, cacheHit: true, reason: null
+      resolutionSeconds: RESOLUTION_SECONDS, session, cacheHit: true, reason: null,
+      coverage: coverageOf(regularCached)
     };
   }
 
   const fetched = await fetchProviderBars(symbolUpper, session, userId);
-  if (fetched.bars.length > 0) {
+  if (fetched.bars.length > regularCached.length) {
     const nowSeconds = Math.floor(Date.now() / 1000);
     if (session.closeEpoch + SESSION_CLOSE_BUFFER_SECONDS < nowSeconds) {
       try {
@@ -204,15 +216,72 @@ async function loadSessionIntradayBars(symbol, sessionDate, userId) {
     }
     return {
       available: true, bars: fetched.bars, source: fetched.source, resolution: INTERVAL,
-      resolutionSeconds: RESOLUTION_SECONDS, session, cacheHit: false, reason: null
+      resolutionSeconds: RESOLUTION_SECONDS, session, cacheHit: false, reason: null,
+      coverage: coverageOf(fetched.bars)
+    };
+  }
+  if (regularCached.length > 0) {
+    return {
+      available: true, bars: regularCached, source: 'intraday_cache', resolution: INTERVAL,
+      resolutionSeconds: RESOLUTION_SECONDS, session, cacheHit: true,
+      reason: 'Provider returned no additional bars; cached evidence may be partial.',
+      coverage: coverageOf(regularCached)
     };
   }
 
   return {
     available: false, bars: [], source: null, resolution: INTERVAL,
     resolutionSeconds: RESOLUTION_SECONDS, session, cacheHit: false,
-    reason: fetched.error || `No regular-session intraday data available for ${symbolUpper} on ${sessionDate}.`
+    reason: fetched.error || `No regular-session intraday data available for ${symbolUpper} on ${sessionDate}.`,
+    coverage: coverageOf([])
   };
+}
+
+// ---------------------------------------------------------------------------
+// Evidence sufficiency (finding 5)
+// ---------------------------------------------------------------------------
+//
+// A metric is knowable from 1-minute evidence ONLY when:
+//   - the cutoff is exactly on a 1-minute interval boundary (no partially
+//     observed interval can contain an unobserved extreme or extra volume);
+//   - every expected interval from the session open through the cutoff is
+//     present (no gaps).
+// Otherwise the metric is UNKNOWN. Merely excluding the bar that CONTAINS the
+// cutoff does not make the measurement exact.
+
+function intervalAlignment(cutoffEpoch, openEpoch, resolutionSeconds = RESOLUTION_SECONDS) {
+  if (!isFiniteNumber(cutoffEpoch) || !isFiniteNumber(openEpoch)) {
+    return { aligned: false, completedIntervals: null, partialSeconds: null };
+  }
+  const offset = cutoffEpoch - openEpoch;
+  if (offset < 0) return { aligned: false, completedIntervals: null, partialSeconds: null };
+  return {
+    aligned: offset % resolutionSeconds === 0,
+    completedIntervals: Math.floor(offset / resolutionSeconds),
+    partialSeconds: offset % resolutionSeconds
+  };
+}
+
+// Expected interval OPEN times fully contained in [fromEpoch, toEpoch).
+function expectedIntervalStarts(fromEpoch, toEpoch, resolutionSeconds = RESOLUTION_SECONDS) {
+  const starts = [];
+  if (!isFiniteNumber(fromEpoch) || !isFiniteNumber(toEpoch)) return starts;
+  for (let start = fromEpoch; start + resolutionSeconds <= toEpoch; start += resolutionSeconds) {
+    starts.push(start);
+  }
+  return starts;
+}
+
+function missingIntervalStarts(bars, fromEpoch, toEpoch, resolutionSeconds = RESOLUTION_SECONDS) {
+  const present = new Set((bars || []).map((bar) => bar.time));
+  return expectedIntervalStarts(fromEpoch, toEpoch, resolutionSeconds).filter(
+    (start) => !present.has(start)
+  );
+}
+
+function expectedSessionIntervalCount(session, resolutionSeconds = RESOLUTION_SECONDS) {
+  if (!session || !isFiniteNumber(session.openEpoch) || !isFiniteNumber(session.closeEpoch)) return 0;
+  return Math.max(0, Math.floor((session.closeEpoch - session.openEpoch) / resolutionSeconds));
 }
 
 // ---------------------------------------------------------------------------
@@ -220,20 +289,30 @@ async function loadSessionIntradayBars(symbol, sessionDate, userId) {
 // ---------------------------------------------------------------------------
 
 // Cumulative regular-session volume of bars fully observable at the cutoff.
-// Returns null when any observable bar has unknown volume (incomplete sum).
+// Returns null when any observable bar has unknown/negative volume.
 function cumulativeVolumeThrough(bars, cutoffEpoch, resolutionSeconds = RESOLUTION_SECONDS) {
   const observable = observableBars(bars, cutoffEpoch, resolutionSeconds);
   let total = 0;
   for (const bar of observable) {
-    if (!isFiniteNumber(bar.volume)) return null;
+    if (!isFiniteNumber(bar.volume) || bar.volume < 0) return null;
     total += bar.volume;
   }
   return total;
 }
 
-// High/low/range over bars fully observable at the cutoff, optionally including
-// observed execution print prices (e.g. actual opening fills).
-function rangeThrough(bars, cutoffEpoch, { resolutionSeconds = RESOLUTION_SECONDS, extraPrices = [] } = {}) {
+function observationsThrough(observations, cutoffEpoch) {
+  return (observations || []).filter(
+    (observation) => isFiniteNumber(observation.epoch) && observation.epoch <= cutoffEpoch
+  );
+}
+
+// High/low/range over bars fully observable at the cutoff, plus observed
+// execution observations whose timestamp is <= the cutoff.
+function rangeThrough(
+  bars,
+  cutoffEpoch,
+  { resolutionSeconds = RESOLUTION_SECONDS, extraObservations = [] } = {}
+) {
   const observable = observableBars(bars, cutoffEpoch, resolutionSeconds);
   let high = -Infinity;
   let low = Infinity;
@@ -243,10 +322,10 @@ function rangeThrough(bars, cutoffEpoch, { resolutionSeconds = RESOLUTION_SECOND
     low = Math.min(low, bar.low);
     lastObservableEpoch = lastObservableEpoch === null ? bar.time : Math.max(lastObservableEpoch, bar.time);
   }
-  for (const price of extraPrices) {
-    if (!isFiniteNumber(price) || price <= 0) continue;
-    high = Math.max(high, price);
-    low = Math.min(low, price);
+  for (const observation of observationsThrough(extraObservations, cutoffEpoch)) {
+    if (!isFiniteNumber(observation.price) || observation.price <= 0) continue;
+    high = Math.max(high, observation.price);
+    low = Math.min(low, observation.price);
   }
   if (!Number.isFinite(high) || !Number.isFinite(low)) {
     return { high: null, low: null, range: null, observableBars: observable.length, lastObservableEpoch };
@@ -270,7 +349,7 @@ function rangeThrough(bars, cutoffEpoch, { resolutionSeconds = RESOLUTION_SECOND
  * @param {Array} params.referenceSessions - [{ date, openEpoch, bars }].
  * @param {number} params.requiredSessions
  * @param {'volume'|'range'} params.kind
- * @param {Array} [params.extraPrices] - observed entry prints (today only).
+ * @param {Array} [params.extraObservations] - timestamped execution prints.
  * @returns {object}
  */
 function computePaceMetric({
@@ -280,48 +359,97 @@ function computePaceMetric({
   referenceSessions,
   requiredSessions,
   kind,
-  extraPrices = []
+  extraObservations = []
 }) {
   const resolutionSeconds = RESOLUTION_SECONDS;
-  const elapsed = entryCutoffEpoch - entrySession.openEpoch;
-  const valueFor = (bars, cutoffEpoch, prices) =>
+  const openEpoch = entrySession.openEpoch;
+  const elapsed = entryCutoffEpoch - openEpoch;
+  const entryAlignment = intervalAlignment(entryCutoffEpoch, openEpoch, resolutionSeconds);
+
+  const failure = (reason, extra = {}) => ({
+    available: false,
+    kind,
+    today: null,
+    expected: null,
+    pace: null,
+    usableSessions: 0,
+    requiredSessions: requiredSessions || null,
+    elapsedSeconds: elapsed,
+    cutoffEpoch: entryCutoffEpoch,
+    referenceCutoffs: [],
+    resolution: INTERVAL,
+    resolutionSeconds,
+    reason,
+    ...extra
+  });
+
+  if (!entryAlignment.aligned) {
+    return failure(
+      'The entry cutoff is not exactly on a 1-minute interval boundary; a partially observed interval could contain unobserved activity, so this metric is UNKNOWN.',
+      { precision: 'partial_interval', partialSeconds: entryAlignment.partialSeconds }
+    );
+  }
+
+  const entryMissing = missingIntervalStarts(
+    entrySessionBars, openEpoch, entryCutoffEpoch, resolutionSeconds
+  );
+  if (entryMissing.length > 0) {
+    return failure(
+      `The entry-session evidence has ${entryMissing.length} missing 1-minute interval(s) through the entry cutoff; the metric is UNKNOWN.`,
+      { precision: 'gap', missingIntervals: entryMissing.length }
+    );
+  }
+
+  const valueFor = (bars, cutoffEpoch) =>
     kind === 'volume'
       ? cumulativeVolumeThrough(bars, cutoffEpoch, resolutionSeconds)
-      : (() => {
-          const r = rangeThrough(bars, cutoffEpoch, { resolutionSeconds, extraPrices: prices });
-          return r.range;
-        })();
+      : rangeThrough(bars, cutoffEpoch, { resolutionSeconds }).range;
 
   const today = kind === 'volume'
     ? cumulativeVolumeThrough(entrySessionBars, entryCutoffEpoch, resolutionSeconds)
-    : (() => {
-        const r = rangeThrough(entrySessionBars, entryCutoffEpoch, { resolutionSeconds, extraPrices });
-        return r.range;
-      })();
+    : rangeThrough(entrySessionBars, entryCutoffEpoch, {
+        resolutionSeconds,
+        extraObservations
+      }).range;
+
+  if (!isFiniteNumber(today)) {
+    return failure(
+      kind === 'volume'
+        ? 'Entry-session cumulative volume through the cutoff is unavailable (missing or invalid volume).'
+        : 'Entry-session range through the cutoff is unavailable.'
+    );
+  }
 
   const references = [];
   const usableValues = [];
   for (const reference of referenceSessions || []) {
     const cutoff = reference.openEpoch + elapsed;
-    const value = valueFor(reference.bars, cutoff, []);
+    const referenceMissing = missingIntervalStarts(
+      reference.bars, reference.openEpoch, cutoff, resolutionSeconds
+    );
+    const value = referenceMissing.length === 0 ? valueFor(reference.bars, cutoff) : null;
     const usable = isFiniteNumber(value);
     if (usable) usableValues.push(value);
-    references.push({ date: reference.date, value: usable ? value : null, cutoffEpoch: cutoff, usable });
+    references.push({
+      date: reference.date,
+      value: usable ? value : null,
+      cutoffEpoch: cutoff,
+      usable,
+      missingIntervals: referenceMissing.length
+    });
   }
 
   const expected = usableValues.length > 0
     ? usableValues.reduce((sum, value) => sum + value, 0) / usableValues.length
     : null;
 
-  const todayUsable = isFiniteNumber(today);
   const available =
-    todayUsable &&
     isFiniteNumber(expected) &&
     expected > 0 &&
     usableValues.length >= (Number.isInteger(requiredSessions) ? requiredSessions : 0);
 
   let pace = null;
-  if (todayUsable && isFiniteNumber(expected) && expected > 0) {
+  if (isFiniteNumber(expected) && expected > 0) {
     pace = today / expected;
   }
 
@@ -338,29 +466,62 @@ function computePaceMetric({
     referenceCutoffs: references,
     resolution: INTERVAL,
     resolutionSeconds,
+    precision: 'exact_1min',
     reason: available
       ? null
-      : !todayUsable
-        ? 'Entry-session evidence through the entry cutoff is unavailable.'
-        : !isFiniteNumber(expected) || expected <= 0
-          ? 'Same-time historical reference evidence is unavailable.'
-          : `Only ${usableValues.length} usable reference session(s); ${requiredSessions} required.`
+      : !isFiniteNumber(expected) || expected <= 0
+        ? 'Same-time historical reference evidence is unavailable.'
+        : `Only ${usableValues.length} usable reference session(s); ${requiredSessions} required.`
   };
 }
 
 /**
- * Observable LOD from the session open through the reference time, using only
- * fully-observable bars plus observed execution prints. Later lows are never
- * included. Returns null when no price observation exists.
+ * Observable LOD from the session open through the reference time. Only fully
+ * observable bars plus timestamped execution observations <= the reference time
+ * contribute. The metric is exact ONLY when the reference time is interval
+ * aligned and there are no gaps; otherwise `low` is null with a reason and the
+ * caller must treat Initial Stop as UNKNOWN.
  */
-function observableLod({ bars, openEpoch, referenceEpoch, resolutionSeconds = RESOLUTION_SECONDS, extraPrices = [] }) {
+function observableLod({
+  bars,
+  openEpoch,
+  referenceEpoch,
+  resolutionSeconds = RESOLUTION_SECONDS,
+  extraObservations = []
+}) {
+  const alignment = intervalAlignment(referenceEpoch, openEpoch, resolutionSeconds);
+  if (!alignment.aligned) {
+    return {
+      low: null,
+      high: null,
+      lastObservableEpoch: null,
+      observableBars: 0,
+      precision: 'partial_interval',
+      reason:
+        'The stop-establishment reference time is not exactly on a 1-minute interval boundary; the observable LOD is UNKNOWN.'
+    };
+  }
   const scoped = (bars || []).filter((bar) => !isFiniteNumber(openEpoch) || bar.time >= openEpoch);
-  const range = rangeThrough(scoped, referenceEpoch, { resolutionSeconds, extraPrices });
+  const missing = missingIntervalStarts(scoped, openEpoch, referenceEpoch, resolutionSeconds);
+  if (missing.length > 0) {
+    return {
+      low: null,
+      high: null,
+      lastObservableEpoch: null,
+      observableBars: 0,
+      precision: 'gap',
+      missingIntervals: missing.length,
+      reason: `The entry-session evidence has ${missing.length} missing 1-minute interval(s) through the reference time; the observable LOD is UNKNOWN.`
+    };
+  }
+  const range = rangeThrough(scoped, referenceEpoch, { resolutionSeconds, extraObservations });
   return {
     low: range.low,
     high: range.high,
     lastObservableEpoch: range.lastObservableEpoch,
-    observableBars: range.observableBars
+    observableBars: range.observableBars,
+    precision: 'exact_1min',
+    reason: null
   };
 }
 
@@ -370,6 +531,10 @@ module.exports = {
   normalizeIntradayBars,
   filterRegularSession,
   loadSessionIntradayBars,
+  intervalAlignment,
+  expectedIntervalStarts,
+  missingIntervalStarts,
+  expectedSessionIntervalCount,
   cumulativeVolumeThrough,
   rangeThrough,
   computePaceMetric,

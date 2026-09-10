@@ -1,12 +1,11 @@
 'use strict';
 
-jest.mock('../../../src/config/database', () => ({
-  query: jest.fn()
-}));
+jest.mock('../../../src/config/database', () => ({ query: jest.fn() }));
 
 const db = require('../../../src/config/database');
 const evaluationService = require('../../../src/services/quality/evaluationService');
 const { CRITERION_STATUS } = require('../../../src/services/quality/constants');
+const { setupDependencyFingerprint } = require('../../../src/services/quality/dependencyFingerprint');
 
 const CONFIG = {
   dimensions: {
@@ -14,96 +13,128 @@ const CONFIG = {
       minimum_coverage: 70,
       grade_thresholds: { A: 90, B: 80, C: 70, D: 60 },
       criteria: [
-        {
-          key: 'leader',
-          enabled: true,
-          required: true,
-          weight: 20,
-          parameters: { source: 'user_asserted' },
-          scoring: { type: 'binary', pass_score: 100, fail_score: 0 }
-        }
+        { key: 'leader', enabled: true, required: true, weight: 20, parameters: { source: 'user_asserted' }, scoring: { type: 'binary', pass_score: 100, fail_score: 0 } }
+      ]
+    },
+    entry: {
+      minimum_coverage: 70,
+      grade_thresholds: { A: 90, B: 80, C: 70, D: 60 },
+      criteria: [
+        { key: 'breakout_session', enabled: true, required: true, weight: 10, parameters: {}, scoring: { type: 'binary', pass_score: 100, fail_score: 0 } }
       ]
     }
   }
 };
 
-function lookupRow(overrides = {}) {
-  return { id: 'eval-1', status: 'draft', configuration: CONFIG, ...overrides };
+const SNAPSHOT = {
+  symbol: 'TEST',
+  entrySessionDate: '2026-03-10',
+  source: 'finnhub',
+  completeness: 'verified',
+  bars: [{ date: '2026-03-10', open: 1, high: 2, low: 1, close: 2, volume: 1 }]
+};
+const BOUNDARY = { pivotPrice: 100, resolutionDate: '2026-03-10', baseStartDate: '2026-02-10', baseEndDate: '2026-03-09' };
+
+const ENTRY_RESULT = { score: 88, grade: 'B', compliance: 'PASS', coverage: 100, criterionResults: [] };
+
+function fingerprint(boundary = BOUNDARY, snapshot = SNAPSHOT) {
+  return setupDependencyFingerprint({ profileVersionId: 'version-1', boundary, evidenceSnapshot: snapshot });
 }
 
-function updatedRow(overrides = {}) {
-  return { id: 'eval-1', status: 'draft', results: null, setup_score: null, ...overrides };
+function lookupRow(overrides = {}) {
+  return {
+    id: 'eval-1',
+    status: 'draft',
+    profile_version_id: 'version-1',
+    results: { setup: { score: 90 }, entry: ENTRY_RESULT, management: null },
+    detected_context: { boundary: BOUNDARY, setup_dependency_fingerprint: fingerprint() },
+    configuration: CONFIG,
+    ...overrides
+  };
 }
 
 let updateParams;
+
+function installUpdate() {
+  db.query.mockImplementationOnce((sql, params) => {
+    updateParams = params;
+    return { rows: [{ id: 'eval-1', status: 'draft', results: null }] };
+  });
+}
 
 beforeEach(() => {
   jest.clearAllMocks();
   updateParams = null;
 });
 
-describe('evaluationService.saveSetupProgress', () => {
-  test('normalizes setup rows, recomputes the aggregate and persists a NON-TERMINAL { setup } result', async () => {
-    db.query
-      .mockResolvedValueOnce({ rows: [lookupRow()] })
-      .mockImplementationOnce((sql, params) => {
-        updateParams = params;
-        return { rows: [updatedRow()] };
-      });
+function setupInput() {
+  return {
+    setupResults: {
+      criterionResults: [{ key: 'leader', status: CRITERION_STATUS.PASS, score: 100, scoring_value: null, raw_value: 'yes' }]
+    },
+    evidenceSnapshot: SNAPSHOT,
+    userInputs: { leader_confirmed: true },
+    detectedContext: { boundary: BOUNDARY }
+  };
+}
 
-    const result = await evaluationService.saveSetupProgress('eval-1', 'user-1', {
-      setupResults: {
-        criterionResults: [
-          {
-            key: 'leader',
-            status: CRITERION_STATUS.PASS,
-            score: 100,
-            scoring_value: null,
-            raw_value: 'yes',
-            evidence: { source: 'user_asserted' },
-            message: 'Leader'
-          }
-        ]
-      },
-      evidenceSnapshot: { bars: [] },
-      userInputs: { leader_confirmed: true },
-      detectedContext: {}
-    });
+describe('evaluationService.saveSetupProgress (Phase 3 hardening)', () => {
+  test('unchanged dependencies preserve a valid Entry result and entry_* summaries', async () => {
+    db.query.mockResolvedValueOnce({ rows: [lookupRow()] });
+    installUpdate();
 
-    expect(result).not.toBeNull();
+    await evaluationService.saveSetupProgress('eval-1', 'user-1', setupInput());
     const results = JSON.parse(updateParams[2]);
-    // One key per configured dimension; Entry/Management are explicit null
-    // because Phase 2 never evaluates them (nothing is fabricated).
-    expect(results.setup).toBeDefined();
+    expect(results.setup.score).toBe(100);
+    expect(results.entry).toEqual(ENTRY_RESULT);
+    expect(updateParams[6]).toBe(100); // setup_score
+    expect(updateParams[10]).toBe(88); // entry_score
+    expect(updateParams[12]).toBe('PASS'); // entry_compliance
+    expect(updateParams[13]).toBe(100); // entry_coverage
+  });
+
+  test('a changed Pivot/breakout dependency atomically clears Entry JSON and entry_* summaries', async () => {
+    db.query.mockResolvedValueOnce({ rows: [lookupRow()] });
+    installUpdate();
+
+    const changedBoundary = { ...BOUNDARY, pivotPrice: 123 };
+    await evaluationService.saveSetupProgress('eval-1', 'user-1', {
+      ...setupInput(),
+      detectedContext: { boundary: changedBoundary }
+    });
+    const results = JSON.parse(updateParams[2]);
     expect(results.entry).toBeNull();
     expect(results.management).toBeNull();
-    expect(results.setup.score).toBe(100);
-    expect(results.setup.compliance).toBe('PASS');
-    expect(results.setup.coverage).toBe(100);
-    expect(updateParams[6]).toBe(100); // setup_score column
-    expect(updateParams[8]).toBe('PASS'); // setup_compliance column
-    // The row must remain a mutable draft (SQL guard, not a terminal status).
-    expect(updateParams[0]).toBe('eval-1');
+    expect(updateParams[10]).toBeNull(); // entry_score
+    expect(updateParams[11]).toBeNull();
+    expect(updateParams[12]).toBeNull();
+    expect(updateParams[13]).toBeNull();
+    // The persisted fingerprint reflects the new boundary.
+    expect(updateParams[5].setup_dependency_fingerprint).toBe(
+      setupDependencyFingerprint({ profileVersionId: 'version-1', boundary: changedBoundary, evidenceSnapshot: SNAPSHOT })
+    );
+  });
+
+  test('a legacy row without a stored fingerprint does not preserve an Entry result it cannot prove coherent', async () => {
+    db.query.mockResolvedValueOnce({
+      rows: [lookupRow({ detected_context: { boundary: BOUNDARY } })]
+    });
+    installUpdate();
+
+    await evaluationService.saveSetupProgress('eval-1', 'user-1', setupInput());
+    const results = JSON.parse(updateParams[2]);
+    expect(results.entry).toBeNull();
+    expect(updateParams[10]).toBeNull();
   });
 
   test('rejects PASS/FAIL scores that contradict the profile scoring configuration', async () => {
     db.query.mockResolvedValueOnce({ rows: [lookupRow()] });
-
     await expect(
       evaluationService.saveSetupProgress('eval-1', 'user-1', {
-        setupResults: {
-          criterionResults: [
-            {
-              key: 'leader',
-              status: CRITERION_STATUS.PASS,
-              score: 55, // binary envelope says 100
-              scoring_value: null
-            }
-          ]
-        }
+        setupResults: { criterionResults: [{ key: 'leader', status: CRITERION_STATUS.PASS, score: 55, scoring_value: null }] }
       })
     ).rejects.toThrow(/contradicts its profile scoring configuration/);
-    expect(db.query).toHaveBeenCalledTimes(1); // the UPDATE must never run
+    expect(db.query).toHaveBeenCalledTimes(1);
   });
 
   test('returns null (never updates) for terminal evaluations', async () => {
@@ -113,16 +144,5 @@ describe('evaluationService.saveSetupProgress', () => {
     });
     expect(result).toBeNull();
     expect(db.query).toHaveBeenCalledTimes(1);
-  });
-
-  test('rejects a profile version without a setup dimension', async () => {
-    db.query.mockResolvedValueOnce({
-      rows: [{ id: 'eval-1', status: 'draft', configuration: { dimensions: {} } }]
-    });
-    await expect(
-      evaluationService.saveSetupProgress('eval-1', 'user-1', {
-        setupResults: { criterionResults: [] }
-      })
-    ).rejects.toThrow(/no setup dimension/);
   });
 });

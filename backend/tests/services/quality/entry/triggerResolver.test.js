@@ -1,8 +1,9 @@
 'use strict';
 
-// Entry trigger resolution (docs/QUALITY_PROFILES_REQUIREMENT.md section 24):
-// direct Pivot, ORH completion validity, effective trigger floor, penetration,
-// and the point-in-time bar cutoff.
+// Entry trigger resolution (docs/QUALITY_PROFILES_REQUIREMENT.md section 24;
+// Phase 3 hardening findings 2 and 9): first execution print, breakout-session
+// ORH coherence, completion validity, effective-trigger floor, and honest
+// crossing precision.
 
 const { resolveTrigger } = require('../../../../src/services/quality/entry/triggerResolver');
 const { regularSessionBounds } = require('../../../../src/services/quality/entry/sessionTime');
@@ -18,38 +19,40 @@ function minuteBars(fromMinute, toMinute, high, low = high - 1, volume = 100) {
   return bars;
 }
 
-function baseExecution(minute, price) {
+// First opening execution print (distinct from Entry Basis).
+function firstPrint(minute, price) {
   const epoch = OPEN + minute * 60 + 30;
   return {
     available: true,
     direction: 'long',
     entryBasis: price,
     initialEntryEpoch: epoch,
-    initialEntryTime: new Date(epoch * 1000).toISOString()
+    initialEntryTime: new Date(epoch * 1000).toISOString(),
+    initialEntryFillPrice: price,
+    initialEntryFillEpoch: epoch,
+    initialEntryFillTime: new Date(epoch * 1000).toISOString(),
+    initialEntryFillTrustworthy: true,
+    ambiguousFirstFill: false
   };
 }
 
 const SETUP = { confirmedPivot: 100, breakoutSession: SESSION };
 
+function resolve(overrides) {
+  return resolveTrigger({
+    parameters: { allowed_types: ['BO-PIVOT', 'BO-ORH-60'], minimum_penetration_pct: 0 },
+    setupContext: SETUP,
+    ...overrides
+  });
+}
+
 describe('triggerResolver', () => {
-  test('BO-PIVOT passes strictly above the confirmed Pivot, fails otherwise', () => {
-    const pass = resolveTrigger({
-      triggerType: 'BO-PIVOT',
-      parameters: { allowed_types: ['BO-PIVOT'], minimum_penetration_pct: 0 },
-      setupContext: SETUP,
-      executionEvidence: baseExecution(65, 101),
-      intraday: null
-    });
+  test('BO-PIVOT uses the first print and passes strictly above the confirmed Pivot', () => {
+    const pass = resolve({ triggerType: 'BO-PIVOT', executionEvidence: firstPrint(65, 101), intraday: null });
     expect(pass.status).toBe('PASS');
     expect(pass.effectiveTrigger).toBe(100);
 
-    const fail = resolveTrigger({
-      triggerType: 'BO-PIVOT',
-      parameters: { allowed_types: ['BO-PIVOT'], minimum_penetration_pct: 0 },
-      setupContext: SETUP,
-      executionEvidence: baseExecution(65, 99.99),
-      intraday: null
-    });
+    const fail = resolve({ triggerType: 'BO-PIVOT', executionEvidence: firstPrint(65, 99.99), intraday: null });
     expect(fail.status).toBe('FAIL');
   });
 
@@ -58,98 +61,119 @@ describe('triggerResolver', () => {
       triggerType: 'BO-PIVOT',
       parameters: { allowed_types: ['BO-PIVOT'], minimum_penetration_pct: 1 },
       setupContext: SETUP,
-      executionEvidence: baseExecution(65, 100.5),
+      executionEvidence: firstPrint(65, 100.5),
       intraday: null
     });
     expect(result.status).toBe('FAIL');
     expect(result.evidence.cross_threshold).toBeCloseTo(101, 12);
   });
 
+  test('an untrustworthy first print (blended entry price) is UNKNOWN', () => {
+    const result = resolve({
+      triggerType: 'BO-PIVOT',
+      executionEvidence: {
+        available: true,
+        direction: 'long',
+        entryBasis: 101,
+        initialEntryEpoch: OPEN + 65 * 60 + 30,
+        initialEntryFillPrice: 101,
+        initialEntryFillEpoch: OPEN + 65 * 60 + 30,
+        initialEntryFillTrustworthy: false,
+        ambiguousFirstFill: true
+      },
+      intraday: null
+    });
+    expect(result.status).toBe('UNKNOWN');
+    expect(result.reason).toMatch(/FIRST opening execution print/);
+  });
+
   test('BO-ORH-60 cannot be valid before the opening range completes', () => {
-    const result = resolveTrigger({
+    const result = resolve({
       triggerType: 'BO-ORH-60',
-      parameters: { allowed_types: ['BO-ORH-60'], minimum_penetration_pct: 0 },
-      setupContext: SETUP,
-      executionEvidence: baseExecution(20, 110), // 09:50 ET < 10:30
-      intraday: { entrySessionBars: minuteBars(0, 30, 111), resolution: '1min', resolutionSeconds: 60 }
+      executionEvidence: firstPrint(20, 110),
+      intraday: {
+        breakoutSession: SESSION,
+        breakoutSessionBars: minuteBars(0, 30, 111),
+        resolution: '1min',
+        resolutionSeconds: 60
+      }
     });
     expect(result.status).toBe('FAIL');
     expect(result.evidence.entry_before_opening_range_complete).toBe(true);
   });
 
   test('ORH effective trigger is max(pivot, opening-range high) and never below the pivot', () => {
-    const bars = minuteBars(0, 60, 105); // opening range high 105
-    const pass = resolveTrigger({
+    const pass = resolve({
       triggerType: 'BO-ORH-60',
-      parameters: { allowed_types: ['BO-ORH-60'], minimum_penetration_pct: 0 },
-      setupContext: SETUP,
-      executionEvidence: baseExecution(61, 106),
-      intraday: { entrySessionBars: bars, resolution: '1min', resolutionSeconds: 60 }
+      executionEvidence: firstPrint(61, 106),
+      intraday: { breakoutSession: SESSION, breakoutSessionBars: minuteBars(0, 60, 105), resolution: '1min', resolutionSeconds: 60 }
     });
     expect(pass.status).toBe('PASS');
     expect(pass.openingRangeHigh).toBe(105);
     expect(pass.effectiveTrigger).toBe(105);
 
-    const lowRange = minuteBars(0, 60, 98); // opening range below pivot
-    const floored = resolveTrigger({
+    const floored = resolve({
       triggerType: 'BO-ORH-60',
-      parameters: { allowed_types: ['BO-ORH-60'], minimum_penetration_pct: 0 },
-      setupContext: SETUP,
-      executionEvidence: baseExecution(61, 101),
-      intraday: { entrySessionBars: lowRange, resolution: '1min', resolutionSeconds: 60 }
+      executionEvidence: firstPrint(61, 101),
+      intraday: { breakoutSession: SESSION, breakoutSessionBars: minuteBars(0, 60, 98), resolution: '1min', resolutionSeconds: 60 }
     });
     expect(floored.effectiveTrigger).toBe(100);
     expect(floored.status).toBe('PASS');
   });
 
-  test('ORH without intraday evidence after completion is UNKNOWN, never fabricated', () => {
-    const result = resolveTrigger({
+  test('a missing opening-range interval makes ORH UNKNOWN (sparse evidence)', () => {
+    const sparse = minuteBars(0, 60, 105).filter((bar) => bar.time !== OPEN + 10 * 60);
+    const result = resolve({
       triggerType: 'BO-ORH-60',
-      parameters: { allowed_types: ['BO-ORH-60'], minimum_penetration_pct: 0 },
-      setupContext: SETUP,
-      executionEvidence: baseExecution(61, 106),
-      intraday: null
+      executionEvidence: firstPrint(61, 106),
+      intraday: { breakoutSession: SESSION, breakoutSessionBars: sparse, resolution: '1min', resolutionSeconds: 60 }
     });
+    expect(result.status).toBe('UNKNOWN');
+    expect(result.reason).toMatch(/incomplete/);
+  });
+
+  test('no breakout-session bars after completion is UNKNOWN', () => {
+    const result = resolve({ triggerType: 'BO-ORH-60', executionEvidence: firstPrint(61, 106), intraday: null });
     expect(result.status).toBe('UNKNOWN');
   });
 
-  test('bars AFTER the entry cutoff never change the resolved trigger', () => {
-    const before = minuteBars(0, 60, 105);
+  test('a sustained run above the threshold is NOT counted as N crossings', () => {
+    const openingRange = minuteBars(0, 60, 105); // effective trigger 105
+    const sustainedAbove = minuteBars(60, 71, 106); // 11 post-range bars above 105
+    const result = resolve({
+      triggerType: 'BO-ORH-60',
+      executionEvidence: firstPrint(71, 107),
+      intraday: { breakoutSession: SESSION, breakoutSessionBars: [...openingRange, ...sustainedAbove], resolution: '1min', resolutionSeconds: 60 }
+    });
+    expect(result.status).toBe('PASS');
+    expect(result.triggerCrossNumber).toBeNull();
+    expect(result.barsAboveThreshold).toBe(11);
+    expect(result.triggerTimePrecision).toBe('1min_interval');
+    expect(result.evidence.first_cross_bar_open).toBe(OPEN + 60 * 60);
+    expect(result.evidence.first_cross_bar_close).toBe(OPEN + 61 * 60);
+  });
+
+  test('an execution print that is the first crossing has an exact execution timestamp', () => {
+    const bars = minuteBars(0, 60, 99); // entire opening range below the pivot threshold
+    const result = resolve({
+      triggerType: 'BO-ORH-60',
+      executionEvidence: firstPrint(61, 106),
+      intraday: { breakoutSession: SESSION, breakoutSessionBars: bars, resolution: '1min', resolutionSeconds: 60 }
+    });
+    expect(result.status).toBe('PASS');
+    expect(result.triggerCrossNumber).toBe(1);
+    expect(result.triggerTimePrecision).toBe('execution_timestamp');
+    expect(result.evidence.minutes_after_first_trigger).toBe(0);
+  });
+
+  test('bars after the entry cutoff never change the resolved trigger', () => {
+    const before = minuteBars(0, 61, 105);
     const withFuture = [...before, ...minuteBars(90, 200, 9999)];
-    const first = resolveTrigger({
-      triggerType: 'BO-ORH-60',
-      parameters: { allowed_types: ['BO-ORH-60'], minimum_penetration_pct: 0 },
-      setupContext: SETUP,
-      executionEvidence: baseExecution(61, 106),
-      intraday: { entrySessionBars: before, resolution: '1min', resolutionSeconds: 60 }
-    });
-    const second = resolveTrigger({
-      triggerType: 'BO-ORH-60',
-      parameters: { allowed_types: ['BO-ORH-60'], minimum_penetration_pct: 0 },
-      setupContext: SETUP,
-      executionEvidence: baseExecution(61, 106),
-      intraday: { entrySessionBars: withFuture, resolution: '1min', resolutionSeconds: 60 }
-    });
+    const first = resolve({ triggerType: 'BO-ORH-60', executionEvidence: firstPrint(61, 106), intraday: { breakoutSession: SESSION, breakoutSessionBars: before, resolution: '1min', resolutionSeconds: 60 } });
+    const second = resolve({ triggerType: 'BO-ORH-60', executionEvidence: firstPrint(61, 106), intraday: { breakoutSession: SESSION, breakoutSessionBars: withFuture, resolution: '1min', resolutionSeconds: 60 } });
     expect(second.status).toBe(first.status);
     expect(second.openingRangeHigh).toBe(first.openingRangeHigh);
     expect(second.effectiveTrigger).toBe(first.effectiveTrigger);
-  });
-
-  test('a second-break entry is not automatically failed', () => {
-    const bars = [
-      ...minuteBars(0, 5, 105),
-      ...minuteBars(5, 10, 100, 99), // price dips back below the trigger
-      ...minuteBars(10, 60, 105)
-    ];
-    const result = resolveTrigger({
-      triggerType: 'BO-ORH-60',
-      parameters: { allowed_types: ['BO-ORH-60'], minimum_penetration_pct: 0 },
-      setupContext: SETUP,
-      executionEvidence: baseExecution(61, 106),
-      intraday: { entrySessionBars: bars, resolution: '1min', resolutionSeconds: 60 }
-    });
-    expect(result.status).toBe('PASS');
-    expect(result.evidence.trigger_cross_number).toBeGreaterThanOrEqual(1);
   });
 
   test('require_pivot_resolution fails a direct-Pivot entry before the breakout session opens', () => {
@@ -162,8 +186,10 @@ describe('triggerResolver', () => {
         available: true,
         direction: 'long',
         entryBasis: 105,
-        initialEntryEpoch: beforeOpen,
-        initialEntryTime: new Date(beforeOpen * 1000).toISOString()
+        initialEntryFillPrice: 105,
+        initialEntryFillEpoch: beforeOpen,
+        initialEntryFillTrustworthy: true,
+        ambiguousFirstFill: false
       },
       intraday: null
     });
@@ -176,7 +202,7 @@ describe('triggerResolver', () => {
       triggerType: 'BO-ORH-60',
       parameters: { allowed_types: ['BO-PIVOT'], minimum_penetration_pct: 0 },
       setupContext: SETUP,
-      executionEvidence: baseExecution(61, 106),
+      executionEvidence: firstPrint(61, 106),
       intraday: null
     });
     expect(result.status).toBe('UNKNOWN');

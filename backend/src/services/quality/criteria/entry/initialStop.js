@@ -46,12 +46,15 @@ function evaluate({ key = 'initial_stop', entryEvidence = {}, stopEvidence = {},
   const lod = intradayMetrics.lod || {};
   if (typeof lod.low !== 'number' || !Number.isFinite(lod.low)) {
     return unknownResult(
-      'The observable LOD through the stop-establishment reference time could not be established; Initial Stop is UNKNOWN.',
+      lod.reason
+        ? `The observable LOD through the stop-establishment reference time could not be established: ${lod.reason}`
+        : 'The observable LOD through the stop-establishment reference time could not be established; Initial Stop is UNKNOWN.',
       {
         initial_stop_price: stopEvidence.price,
         stop_evidence_source: stopEvidence.source,
         reference_time: stopEvidence.referenceTime,
-        reason: 'intraday_evidence_unavailable'
+        lod_precision: lod.precision || null,
+        lod_reason: lod.reason || null
       }
     );
   }

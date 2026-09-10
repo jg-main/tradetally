@@ -78,33 +78,58 @@ function computeInitialR({ direction, entryBasis, originalPositionQty, stopEvide
 }
 
 /**
- * Preserves an already-established Initial R for this evaluation when the
- * frozen inputs are unchanged; otherwise establishes it now.
+ * Resolves Initial R for ONE evaluation.
+ *
+ * Immutability contract: once a stored Initial R is available and has an
+ * `established_at`, it is FROZEN. A later current/planned stop value, a later
+ * position edit, or any conflicting evidence MUST NOT redefine initial_stop,
+ * r_per_share, initial_risk_dollars or established_at inside the same
+ * evaluation. Conflicts are reported, never silently applied. A new evaluation
+ * is the correct place to establish a different R.
+ *
+ * An initially-unavailable Initial R may still become established exactly once
+ * (before terminalization) when trustworthy evidence first appears; after that
+ * it is frozen.
  */
 function resolveInitialR({ computed, storedInitialR, now = new Date() }) {
-  if (!computed.available) {
-    return { ...computed, immutable: false, established_at: null, preserved: false };
-  }
   const stored = storedInitialR && typeof storedInitialR === 'object' ? storedInitialR : null;
-  if (
-    stored &&
-    stored.available === true &&
-    stored.entry_basis === computed.entry_basis &&
-    stored.initial_stop === computed.initial_stop &&
-    stored.original_position_qty === computed.original_position_qty &&
-    stored.established_at
-  ) {
+  const frozen = stored && stored.available === true && stored.established_at;
+
+  if (frozen) {
+    const conflictFields = [];
+    if (!computed.available) {
+      conflictFields.push('current_evidence_unavailable');
+    } else {
+      if (stored.entry_basis !== computed.entry_basis) conflictFields.push('entry_basis');
+      if (stored.initial_stop !== computed.initial_stop) conflictFields.push('initial_stop');
+      if (stored.original_position_qty !== computed.original_position_qty) {
+        conflictFields.push('original_position_qty');
+      }
+    }
+    return {
+      ...stored,
+      immutable: true,
+      frozen: true,
+      preserved: true,
+      conflict: conflictFields.length > 0,
+      conflict_fields: conflictFields
+    };
+  }
+
+  if (!computed.available) {
     return {
       ...computed,
-      established_at: stored.established_at,
-      immutable: stored.immutable !== false,
-      preserved: true
+      established_at: null,
+      immutable: false,
+      frozen: false,
+      preserved: false
     };
   }
   return {
     ...computed,
     established_at: now.toISOString(),
     immutable: true,
+    frozen: true,
     preserved: false
   };
 }

@@ -1,11 +1,11 @@
 'use strict';
 
-// Typed stop-buffer methods (docs/QUALITY_PROFILES_REQUIREMENT.md section 29.3).
+// Typed stop-buffer methods (docs/QUALITY_PROFILES_REQUIREMENT.md section 29.3;
+// Phase 3 hardening finding 6: no fabricated stock tick size).
 
 const {
   resolveBuffer,
-  resolveTickSize,
-  US_EQUITY_MIN_INCREMENT
+  resolveTickSize
 } = require('../../../../src/services/quality/entry/buffer');
 
 const ADR = { available: true, dollars: 4 };
@@ -24,21 +24,29 @@ describe('entry stop buffer', () => {
     expect(result.source).toBe('instrument_tick_size');
   });
 
-  test('stocks without a stored tick size use the US-equity minimum increment', () => {
+  test('a known futures contract tick size is used', () => {
+    const tick = resolveTickSize({
+      trade: { instrument_type: 'future', underlying_asset: 'ES' }
+    });
+    expect(tick.available).toBe(true);
+    expect(tick.source).toBe('futures_contract_tick_size');
+  });
+
+  test('a stock with NO stored tick size cannot resolve minimum_tick', () => {
+    const tick = resolveTickSize({ trade: { instrument_type: 'stock' } });
+    expect(tick.available).toBe(false);
     const result = resolveBuffer({
       criterionParameters: { minimum_buffer_method: 'minimum_tick', minimum_buffer_value: 1 },
       entryBasis: 101,
       volatilityByMethod: { ADR, ATR },
       trade: { instrument_type: 'stock' }
     });
-    expect(result.available).toBe(true);
-    expect(result.buffer).toBe(US_EQUITY_MIN_INCREMENT);
-    expect(result.source).toBe('us_equity_minimum_increment');
+    expect(result.available).toBe(false);
+    // No guessed increment may ever produce a buffer (hence no Initial Stop grade).
+    expect(result.buffer).toBeNull();
   });
 
   test('an option without a stored tick size cannot resolve a buffer', () => {
-    const tick = resolveTickSize({ trade: { instrument_type: 'option' }, entryBasis: 2 });
-    expect(tick.available).toBe(false);
     const result = resolveBuffer({
       criterionParameters: { minimum_buffer_method: 'minimum_tick', minimum_buffer_value: 1 },
       entryBasis: 2,

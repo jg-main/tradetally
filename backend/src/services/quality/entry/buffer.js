@@ -10,24 +10,19 @@
 //   ATR_fraction   value * ATR$    (requires the ATR volatility reference)
 //   ADR_fraction   value * ADR$    (requires the ADR volatility reference)
 //
-// Tick size is resolved from existing TradeTally information only:
+// Tick size is resolved ONLY from existing authoritative TradeTally
+// instrument metadata:
 //   - the trade's stored `tick_size` when present (any instrument type);
-//   - futures contract tick size from utils/futuresUtils when known;
-//   - otherwise the US-equity minimum pricing increment for stocks.
+//   - the futures contract tick size from utils/futuresUtils when known.
 //
-// `minimum_tick` is therefore fully supported for stocks (canonical BO) and for
-// futures with a known contract tick, and for any instrument type that stores
-// an explicit `tick_size`. For an option/crypto instrument WITHOUT a stored
-// tick size, TradeTally does not carry an authoritative price increment, so the
-// buffer is unavailable and Initial Stop becomes UNKNOWN rather than fabricating
-// a tick. Profile authors targeting those instruments should configure
-// `fixed_dollars`, `percentage`, `ATR_fraction` or `ADR_fraction` instead.
+// There is no authoritative per-instrument stock tick size in TradeTally (the
+// SEC Rule 612 minimum increment is a market-wide rule, not stored instrument
+// metadata). A stock with no stored tick_size therefore makes `minimum_tick`
+// unavailable and Initial Stop UNKNOWN — this milestone MUST NOT substitute a
+// guessed heuristic. A profile that intends a fixed $0.01 buffer must configure
+// `minimum_buffer_method = fixed_dollars` + `minimum_buffer_value = 0.01`.
 
 const { getFuturesTickSize } = require('../../../utils/futuresUtils');
-
-// SEC Rule 612 / Reg NMS minimum pricing increment for NMS stocks.
-const US_EQUITY_MIN_INCREMENT = 0.01;
-const US_EQUITY_SUB_DOLLAR_INCREMENT = 0.0001;
 
 function asNumber(value) {
   if (value === null || value === undefined || value === '') return null;
@@ -35,7 +30,7 @@ function asNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
-function resolveTickSize({ trade, entryBasis }) {
+function resolveTickSize({ trade }) {
   const stored = asNumber(trade && trade.tick_size);
   if (stored !== null && stored > 0) {
     return { available: true, tickSize: stored, source: 'instrument_tick_size' };
@@ -56,19 +51,11 @@ function resolveTickSize({ trade, entryBasis }) {
     };
   }
 
-  if (instrumentType === 'stock') {
-    const reference = asNumber(entryBasis);
-    const tickSize = reference !== null && reference >= 1
-      ? US_EQUITY_MIN_INCREMENT
-      : US_EQUITY_SUB_DOLLAR_INCREMENT;
-    return { available: true, tickSize, source: 'us_equity_minimum_increment' };
-  }
-
   return {
     available: false,
     tickSize: null,
     source: null,
-    reason: `No valid price increment can be established for instrument type "${instrumentType}".`
+    reason: `No authoritative price increment is stored for instrument type "${instrumentType}"; minimum_tick is unavailable (use fixed_dollars/percentage/ATR_fraction/ADR_fraction).`
   };
 }
 
@@ -91,7 +78,7 @@ function resolveBuffer({ criterionParameters = {}, entryBasis, volatilityByMetho
 
   switch (method) {
     case 'minimum_tick': {
-      const tick = resolveTickSize({ trade, entryBasis });
+      const tick = resolveTickSize({ trade });
       if (!tick.available) {
         return { ...base, source: tick.source, reason: tick.reason };
       }
@@ -139,8 +126,6 @@ function resolveBuffer({ criterionParameters = {}, entryBasis, volatilityByMetho
 }
 
 module.exports = {
-  US_EQUITY_MIN_INCREMENT,
-  US_EQUITY_SUB_DOLLAR_INCREMENT,
   resolveTickSize,
   resolveBuffer
 };

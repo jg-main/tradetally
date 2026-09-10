@@ -94,7 +94,9 @@ function installDbRouter(overrides = {}) {
         return { rows: [merged] };
       }
       if (sql.includes('results = $3')) {
-        // saveSetupProgress UPDATE.
+        // saveSetupProgress UPDATE (Phase 3 hardening: also carries
+        // entry_*/management_* summaries derived from preserved downstream
+        // dimensions).
         updateCall = { sql, params };
         const results = typeof params[2] === 'string' ? JSON.parse(params[2]) : params[2];
         const row = makeEvaluationRow({
@@ -106,7 +108,15 @@ function installDbRouter(overrides = {}) {
           setup_score: params[6],
           setup_grade: params[7],
           setup_compliance: params[8],
-          setup_coverage: params[9]
+          setup_coverage: params[9],
+          entry_score: params[10],
+          entry_grade: params[11],
+          entry_compliance: params[12],
+          entry_coverage: params[13],
+          management_score: params[14],
+          management_grade: params[15],
+          management_compliance: params[16],
+          management_coverage: params[17]
         });
         if (overrides.trackEvalRow) existingDraft = row;
         return { rows: [row] };
@@ -124,9 +134,16 @@ function installDbRouter(overrides = {}) {
       if (overrides.trackEvalRow) existingDraft = row;
       return { rows: [row] };
     }
-    if (sql.includes('SELECT e.id, e.status, v.configuration')) {
+    if (sql.includes('v.configuration') && sql.includes('e.profile_version_id')) {
       return {
-        rows: [{ id: EVAL_ID, status: overrides.evalStatus || 'draft', configuration: overrides.versionConfiguration || CANONICAL_CONFIG }]
+        rows: [{
+          id: EVAL_ID,
+          status: overrides.evalStatus || 'draft',
+          profile_version_id: VERSION_ID,
+          results: (existingDraft && existingDraft.results) || null,
+          detected_context: (existingDraft && existingDraft.detected_context) || null,
+          configuration: overrides.versionConfiguration || CANONICAL_CONFIG
+        }]
       };
     }
     if (sql.includes('FROM quality_profile_versions v') && sql.includes('p.name AS profile_name')) {

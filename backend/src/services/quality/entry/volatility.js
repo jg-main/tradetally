@@ -15,10 +15,11 @@
 //   ATR: TR_i = max(High_i - Low_i, |High_i - PrevClose_i|, |Low_i - PrevClose_i|)
 //        ATR  = mean(TR over the last N completed sessions)   (price units)
 //
-// The period is profile configuration (owned by the stop_width criterion).
-// CANONICAL_ADR_PERIOD is only a documented mathematical fallback for the
-// canonical ADR20 definition when no criterion in the profile configures a
-// period; it is not used to override a configured value.
+// The period is profile configuration (owned by the stop_width criterion). It
+// has NO runtime default: the orchestrator validates the owner and passes an
+// explicit period, so a missing/invalid period is a hard configuration error
+// rather than a silently-applied canonical value. CANONICAL_ADR_PERIOD records
+// the canonical ADR20 definition for documentation/tests only.
 
 const CANONICAL_ADR_PERIOD = 20;
 
@@ -38,7 +39,13 @@ function isFiniteNumber(value) {
  *   sessions?:Array, reason?:string}}
  */
 function computeVolatility({ dailyBars, entryIndex, method, period, entryBasis }) {
-  const resolvedPeriod = Number.isInteger(period) && period > 0 ? period : CANONICAL_ADR_PERIOD;
+  if (!Number.isInteger(period) || period < 1) {
+    return {
+      available: false,
+      reason: 'The volatility period is required profile configuration and was not supplied; the reference is unavailable.'
+    };
+  }
+  const resolvedPeriod = period;
   const resolvedMethod = method === 'ATR' ? 'ATR' : 'ADR';
 
   if (!Array.isArray(dailyBars) || dailyBars.length === 0) {

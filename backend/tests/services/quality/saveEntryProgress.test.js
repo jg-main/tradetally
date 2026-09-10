@@ -108,4 +108,42 @@ describe('evaluationService.saveEntryProgress', () => {
     expect(result).toBeNull();
     expect(db.query).toHaveBeenCalledTimes(1);
   });
+
+  test('rejects a stale Entry write whose Setup dependency fingerprint no longer matches', async () => {
+    db.query.mockResolvedValueOnce({
+      rows: [lookupRow({ detected_context: { setup_dependency_fingerprint: 'fingerprint-B' } })]
+    });
+    await expect(
+      evaluationService.saveEntryProgress('eval-1', 'user-1', {
+        entryResults: { criterionResults: [{ key: 'breakout_session', status: CRITERION_STATUS.PASS, score: 100, scoring_value: null }] },
+        dependencyFingerprint: 'fingerprint-A'
+      })
+    ).rejects.toMatchObject({ code: 'STALE_DEPENDENCY' });
+    // The stale UPDATE must never run.
+    expect(db.query).toHaveBeenCalledTimes(1);
+  });
+
+  test('accepts an Entry write whose dependency fingerprint still matches', async () => {
+    db.query
+      .mockResolvedValueOnce({ rows: [lookupRow({ detected_context: { setup_dependency_fingerprint: 'fingerprint-A' } })] })
+      .mockImplementationOnce((sql, params) => ({ rows: [{ id: 'eval-1', status: 'draft', results: null }], params }));
+    const result = await evaluationService.saveEntryProgress('eval-1', 'user-1', {
+      entryResults: { criterionResults: [{ key: 'breakout_session', status: CRITERION_STATUS.PASS, score: 100, scoring_value: null }] },
+      dependencyFingerprint: 'fingerprint-A'
+    });
+    expect(result).not.toBeNull();
+    expect(db.query).toHaveBeenCalledTimes(2);
+  });
+
+  test('a zero-row UPDATE (dependency changed during evaluation) is a stale-dependency error', async () => {
+    db.query
+      .mockResolvedValueOnce({ rows: [lookupRow()] })
+      .mockResolvedValueOnce({ rows: [] });
+    await expect(
+      evaluationService.saveEntryProgress('eval-1', 'user-1', {
+        entryResults: { criterionResults: [{ key: 'breakout_session', status: CRITERION_STATUS.PASS, score: 100, scoring_value: null }] },
+        dependencyFingerprint: 'fingerprint-A'
+      })
+    ).rejects.toMatchObject({ code: 'STALE_DEPENDENCY' });
+  });
 });

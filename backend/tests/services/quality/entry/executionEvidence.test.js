@@ -58,7 +58,33 @@ describe('executionEvidenceService', () => {
     expect(evidence.firstReductionTime).toBe('2026-03-12T14:00:00.000Z');
   });
 
-  test('trade-level fallback is used with explicit provenance when fills are absent', () => {
+  test('the first opening execution print is distinct from the Entry Basis', () => {
+    const trade = longTrade([
+      { action: 'buy', quantity: 100, price: 101, datetime: '2026-03-10T14:00:00Z' },
+      { action: 'buy', quantity: 100, price: 110, datetime: '2026-03-10T14:20:00Z' },
+      { action: 'sell', quantity: 50, price: 120, datetime: '2026-03-10T15:00:00Z' }
+    ]);
+    const evidence = normalizeExecutionEvidence(trade);
+    // Entry Basis includes BOTH pre-reduction opening fills...
+    expect(evidence.entryBasis).toBeCloseTo(105.5, 12);
+    // ...but the first print is the 10:00 / 101 fill.
+    expect(evidence.initialEntryFillPrice).toBe(101);
+    expect(evidence.initialEntryFillTime).toBe('2026-03-10T14:00:00.000Z');
+    expect(evidence.initialEntryFillTrustworthy).toBe(true);
+    expect(evidence.ambiguousFirstFill).toBe(false);
+  });
+
+  test('two opening fills sharing the earliest timestamp are flagged ambiguous', () => {
+    const trade = longTrade([
+      { action: 'buy', quantity: 100, price: 101, datetime: '2026-03-10T14:00:00Z' },
+      { action: 'buy', quantity: 50, price: 102, datetime: '2026-03-10T14:00:00Z' }
+    ]);
+    const evidence = normalizeExecutionEvidence(trade);
+    expect(evidence.ambiguousFirstFill).toBe(true);
+    expect(evidence.initialEntryFillTrustworthy).toBe(false);
+  });
+
+  test('trade-level fallback is NOT a trustworthy first print', () => {
     const trade = longTrade([], {
       entry_time: '2026-03-10T13:31:00Z',
       entry_price: 25,
@@ -69,7 +95,8 @@ describe('executionEvidenceService', () => {
     expect(evidence.originalPositionQty).toBe(100);
     expect(evidence.entryBasis).toBe(25);
     expect(evidence.provenance.source).toBe('trade_level_fields');
-    expect(evidence.provenance.limitations.length).toBeGreaterThan(0);
+    expect(evidence.initialEntryFillTrustworthy).toBe(false);
+    expect(evidence.ambiguousFirstFill).toBe(true);
   });
 
   test('missing execution evidence is reported as unavailable', () => {

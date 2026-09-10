@@ -68,7 +68,10 @@ describe('entry volatility', () => {
     expect(result.reason).toMatch(/needs/);
   });
 
-  test('the documented canonical fallback period is ADR20', () => {
+  test('no period is silently defaulted (canonical ADR20 is documentation only)', () => {
+    const result = computeVolatility({ dailyBars: BARS, entryIndex: 6, method: 'ADR', period: undefined, entryBasis: 20 });
+    expect(result.available).toBe(false);
+    expect(result.reason).toMatch(/period is required/);
     expect(CANONICAL_ADR_PERIOD).toBe(20);
   });
 });

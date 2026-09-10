@@ -36,6 +36,20 @@ const SUPPORTED_BUFFER_METHODS = Object.freeze([
   'ADR_fraction'
 ]);
 
+// Explicit technical supported maximum for same-time historical reference
+// sessions. The configured count is honored exactly; a configured value above
+// this is REJECTED before any evidence loading rather than silently capped.
+const MAX_REFERENCE_SESSIONS = 250;
+
+// Shared-policy ownership. Some criterion parameter blocks are read by more
+// than one enabled criterion; when any consumer is enabled the owner's block
+// must be explicitly validated even if the owner itself is disabled, so runtime
+// can never fall back to invented trading policy.
+const TRIGGER_POLICY_OWNER = 'trigger_compliance';
+const TRIGGER_POLICY_CONSUMERS = Object.freeze(['trigger_compliance', 'entry_extension']);
+const VOLATILITY_POLICY_OWNER = 'stop_width';
+const VOLATILITY_POLICY_CONSUMERS = Object.freeze(['stop_width', 'entry_extension']);
+
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -174,7 +188,63 @@ function validateParameters(key, parameters) {
     }
     if (error) errors.push(error);
   }
+
+  // Explicit technical bound: a configured reference-session count is honored,
+  // never silently truncated. Values above the documented supported maximum are
+  // rejected before execution.
+  if ((key === 'volume_pace' || key === 'range_pace') &&
+      Number.isInteger(parameters.reference_sessions) &&
+      parameters.reference_sessions > MAX_REFERENCE_SESSIONS) {
+    errors.push(
+      `criterion "${key}" parameter "reference_sessions" must be <= ${MAX_REFERENCE_SESSIONS} (documented supported maximum); got ${parameters.reference_sessions}`
+    );
+  }
   return errors;
+}
+
+// Validates a shared policy owner's block when a consumer depends on it, even
+// if the owner criterion is disabled. Prevents runtime fallbacks to invented
+// trigger policy / volatility period.
+function validateSharedPolicyOwners(entryConfig, enabledKeys) {
+  const errors = [];
+
+  const triggerConsumerEnabled = enabledKeys.some((key) => TRIGGER_POLICY_CONSUMERS.includes(key));
+  if (triggerConsumerEnabled && !enabledKeys.includes(TRIGGER_POLICY_OWNER)) {
+    const owner = entryConfig.criteria.find((criterion) => criterion.key === TRIGGER_POLICY_OWNER);
+    if (!owner || !owner.parameters || typeof owner.parameters !== 'object') {
+      errors.push(
+        `criterion "${TRIGGER_POLICY_OWNER}" parameters are required because an enabled criterion consumes trigger policy`
+      );
+    } else {
+      errors.push(
+        ...validateParameters(TRIGGER_POLICY_OWNER, owner.parameters).map(
+          (error) => `[shared policy owner] ${error}`
+        )
+      );
+    }
+  }
+
+  const volatilityConsumerEnabled =
+    enabledKeys.some((key) => VOLATILITY_POLICY_CONSUMERS.includes(key)) ||
+    (enabledKeys.includes('initial_stop') && stopBufferUsesVolatilityFraction(entryConfig));
+  if (volatilityConsumerEnabled && !enabledKeys.includes(VOLATILITY_POLICY_OWNER)) {
+    const owner = entryConfig.criteria.find((criterion) => criterion.key === VOLATILITY_POLICY_OWNER);
+    const period = owner && owner.parameters ? owner.parameters.period : undefined;
+    const periodError = checkPositiveInteger(period, `criterion "${VOLATILITY_POLICY_OWNER}" parameter "period"`);
+    if (periodError) {
+      errors.push(
+        `[shared policy owner] ${periodError} is required because an enabled criterion consumes the volatility reference`
+      );
+    }
+  }
+
+  return errors;
+}
+
+function stopBufferUsesVolatilityFraction(entryConfig) {
+  const initialStop = entryConfig.criteria.find((criterion) => criterion.key === 'initial_stop');
+  const method = initialStop && initialStop.parameters ? initialStop.parameters.minimum_buffer_method : null;
+  return method === 'ATR_fraction' || method === 'ADR_fraction';
 }
 
 /**
@@ -188,22 +258,33 @@ function validateEntryCriteria(entryConfig) {
   if (!entryConfig || !Array.isArray(entryConfig.criteria)) {
     return errors;
   }
+  const enabledKeys = [];
   for (const criterion of entryConfig.criteria) {
     const enabled = criterion.enabled === undefined ? true : criterion.enabled;
     if (!enabled) continue;
+    enabledKeys.push(criterion.key);
     errors.push(...validateParameters(criterion.key, criterion.parameters));
   }
+  // Validate shared policy owners that enabled criteria depend on, even when
+  // the owner criterion itself is disabled.
+  errors.push(...validateSharedPolicyOwners(entryConfig, enabledKeys));
   return errors;
 }
 
 module.exports = {
   PARAMETER_SCHEMAS,
+  MAX_REFERENCE_SESSIONS,
+  TRIGGER_POLICY_OWNER,
+  TRIGGER_POLICY_CONSUMERS,
+  VOLATILITY_POLICY_OWNER,
+  VOLATILITY_POLICY_CONSUMERS,
   SUPPORTED_TRIGGER_TYPES,
   SUPPORTED_VOLATILITY_METHODS,
   SUPPORTED_EXTENSION_NORMALIZATIONS,
   SUPPORTED_BUFFER_METHODS,
   validateParameters,
   validateEntryCriteria,
+  validateSharedPolicyOwners,
   checkPositiveInteger,
   checkNonNegativeNumber,
   checkPositiveNumber

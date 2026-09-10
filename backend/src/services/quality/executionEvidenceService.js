@@ -80,12 +80,12 @@ function normalizeFills(executions, direction) {
       const entryTime = toEpochSeconds(exec.entry_time ?? exec.entryTime);
       const entryPrice = asNumber(exec.entry_price ?? exec.entryPrice);
       if (entryTime && entryPrice !== null) {
-        fills.push({ timeEpoch: entryTime, price: entryPrice, quantity, action: openingAction, raw: exec });
+        fills.push({ timeEpoch: entryTime, price: entryPrice, quantity, action: openingAction, source: 'executions_jsonb', raw: exec });
       }
       const exitTime = toEpochSeconds(exec.exit_time ?? exec.exitTime);
       const exitPrice = asNumber(exec.exit_price ?? exec.exitPrice);
       if (exitTime && exitPrice !== null) {
-        fills.push({ timeEpoch: exitTime, price: exitPrice, quantity, action: closingAction, raw: exec });
+        fills.push({ timeEpoch: exitTime, price: exitPrice, quantity, action: closingAction, source: 'executions_jsonb', raw: exec });
       }
     }
   } else {
@@ -96,9 +96,9 @@ function normalizeFills(executions, direction) {
       if (!quantity || price === null || !time) continue;
       const action = normalizeAction(exec.action || exec.side || '');
       if (isBuyAction(action)) {
-        fills.push({ timeEpoch: time, price, quantity, action: 'buy', raw: exec });
+        fills.push({ timeEpoch: time, price, quantity, action: 'buy', source: 'executions_jsonb', raw: exec });
       } else if (isSellAction(action)) {
-        fills.push({ timeEpoch: time, price, quantity, action: 'sell', raw: exec });
+        fills.push({ timeEpoch: time, price, quantity, action: 'sell', source: 'executions_jsonb', raw: exec });
       }
     }
   }
@@ -159,11 +159,22 @@ function reconstructFromFills(fills, direction) {
   const basis = weightedAverage(openingFills);
   if (basis === null) return null;
 
+  const firstFill = openingFills[0];
+  // If more than one opening fill shares the earliest timestamp, the source
+  // cannot establish which was the FIRST execution print. Preserve the
+  // ambiguity instead of fabricating an ordering.
+  const ambiguousFirstFill =
+    openingFills.filter((fill) => fill.timeEpoch === firstFill.timeEpoch).length > 1;
+
   return {
     openingFills,
     originalPositionQty: openingFills.reduce((sum, fill) => sum + fill.quantity, 0),
     entryBasis: basis,
-    initialEntryEpoch: openingFills[0].timeEpoch,
+    initialEntryEpoch: firstFill.timeEpoch,
+    initialEntryFillPrice: firstFill.price,
+    initialEntryFillEpoch: firstFill.timeEpoch,
+    initialEntryFillTrustworthy: !ambiguousFirstFill && firstFill.source !== 'trade_level_fields',
+    ambiguousFirstFill,
     firstReductionEpoch: firstReductionTime,
     sawClosingBeforeOpening
   };
@@ -204,9 +215,17 @@ function normalizeExecutionEvidence(trade) {
             : []
         },
         originalPositionQty: reconstructed.originalPositionQty,
+        // Entry Basis = VWAP of ALL opening-side fills before the first
+        // reduction (section 28) — distinct from the first execution print.
         entryBasis: reconstructed.entryBasis,
         initialEntryEpoch: reconstructed.initialEntryEpoch,
         initialEntryTime: new Date(reconstructed.initialEntryEpoch * 1000).toISOString(),
+        // The ACTUAL first opening execution print (used by Trigger Compliance).
+        initialEntryFillPrice: reconstructed.initialEntryFillPrice,
+        initialEntryFillEpoch: reconstructed.initialEntryFillEpoch,
+        initialEntryFillTime: new Date(reconstructed.initialEntryFillEpoch * 1000).toISOString(),
+        initialEntryFillTrustworthy: reconstructed.initialEntryFillTrustworthy,
+        ambiguousFirstFill: reconstructed.ambiguousFirstFill,
         actualEntrySession: sessionDateInZone(reconstructed.initialEntryEpoch),
         firstReductionTime: reconstructed.firstReductionEpoch === null
           ? null
@@ -239,6 +258,13 @@ function normalizeExecutionEvidence(trade) {
       entryBasis: entryPrice,
       initialEntryEpoch: entryEpoch,
       initialEntryTime: new Date(entryEpoch * 1000).toISOString(),
+      // trade.entry_price may be a blended average: it is NOT a trustworthy
+      // first execution print, so Trigger Compliance must stay UNKNOWN.
+      initialEntryFillPrice: entryPrice,
+      initialEntryFillEpoch: entryEpoch,
+      initialEntryFillTime: new Date(entryEpoch * 1000).toISOString(),
+      initialEntryFillTrustworthy: false,
+      ambiguousFirstFill: true,
       actualEntrySession: sessionDateInZone(entryEpoch),
       firstReductionTime: null,
       fills: [{
@@ -264,6 +290,11 @@ function normalizeExecutionEvidence(trade) {
     entryBasis: null,
     initialEntryEpoch: null,
     initialEntryTime: null,
+    initialEntryFillPrice: null,
+    initialEntryFillEpoch: null,
+    initialEntryFillTime: null,
+    initialEntryFillTrustworthy: false,
+    ambiguousFirstFill: true,
     actualEntrySession: null,
     firstReductionTime: null,
     fills: [],

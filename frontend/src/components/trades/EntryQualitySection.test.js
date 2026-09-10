@@ -211,6 +211,25 @@ describe('EntryQualitySection', () => {
     expect(mockStoreInstance.prepare).not.toHaveBeenCalled()
   })
 
+  it('shows the first execution print distinctly and marks the actual initial stop UNKNOWN with a reference stop', async () => {
+    const evaluation = persistedEvaluation()
+    evaluation.evidence_snapshot.entry.execution.initial_entry_fill_price = 101
+    evaluation.evidence_snapshot.entry.execution.initial_entry_fill_trustworthy = true
+    evaluation.evidence_snapshot.entry.stop = {
+      available: false,
+      reference_stop: { price: 99, source: 'trade_stop_loss_field', semantics: 'planned_or_current_trade_stop' }
+    }
+    evaluation.evidence_snapshot.entry.initial_r = { available: false }
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([evaluation])
+    const wrapper = mountSection()
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="entry-initial-fill"]').text()).toContain('101.00')
+    expect(wrapper.get('[data-testid="entry-actual-stop"]').text()).toContain('UNKNOWN')
+    expect(wrapper.get('[data-testid="entry-reference-stop"]').text()).toContain('99.00')
+    expect(wrapper.get('[data-testid="entry-initial-r"]').text()).toBe('N/A')
+  })
+
   it('renders FAIL and UNKNOWN criterion states distinctly', async () => {
     mockStoreInstance.fetchEvaluations.mockResolvedValue([
       persistedEvaluation()

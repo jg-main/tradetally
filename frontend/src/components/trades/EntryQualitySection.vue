@@ -76,6 +76,13 @@
           </div>
         </div>
         <div class="rounded-md bg-gray-50 px-3 py-2 dark:bg-gray-800">
+          <div class="text-[11px] uppercase tracking-wide text-gray-500 dark:text-gray-400">First Execution Print</div>
+          <div class="font-semibold text-gray-800 dark:text-gray-100" data-testid="entry-initial-fill">
+            {{ initialFillPrice != null ? formatPrice(initialFillPrice) : '—' }}
+          </div>
+          <div class="text-[10px] text-gray-400">{{ firstFillTrustLabel }}</div>
+        </div>
+        <div class="rounded-md bg-gray-50 px-3 py-2 dark:bg-gray-800">
           <div class="text-[11px] uppercase tracking-wide text-gray-500 dark:text-gray-400">Entry Basis</div>
           <div class="font-semibold text-gray-800 dark:text-gray-100" data-testid="entry-basis">
             {{ formatPrice(entryBasis) }}
@@ -98,6 +105,15 @@
           <div class="text-[11px] uppercase tracking-wide text-gray-500 dark:text-gray-400">Initial R</div>
           <div class="font-semibold text-gray-800 dark:text-gray-100" data-testid="entry-initial-r">
             {{ initialRText }}
+          </div>
+        </div>
+        <div class="rounded-md bg-gray-50 px-3 py-2 dark:bg-gray-800">
+          <div class="text-[11px] uppercase tracking-wide text-gray-500 dark:text-gray-400">Actual Initial Stop</div>
+          <div class="font-semibold" :class="actualStopAvailable ? 'text-gray-800 dark:text-gray-100' : 'text-amber-600 dark:text-amber-400'" data-testid="entry-actual-stop">
+            {{ actualStopText }}
+          </div>
+          <div v-if="referenceStop != null" class="text-[10px] text-gray-400" data-testid="entry-reference-stop">
+            reference (planned/current): {{ formatPrice(referenceStop) }}
           </div>
         </div>
       </div>
@@ -357,6 +373,36 @@ const initialRText = computed(() => {
     || evaluation.value?.evidence_snapshot?.entry?.initial_r
   if (initialR && initialR.available) return `$${formatPrice(initialR.r_per_share)} / share`
   return 'N/A'
+})
+
+const initialFillPrice = computed(() => {
+  if (prepared.value && prepared.value.executionEvidence) {
+    return prepared.value.executionEvidence.initialEntryFillPrice
+  }
+  const execution = evaluation.value?.evidence_snapshot?.entry?.execution
+  return execution ? execution.initial_entry_fill_price : null
+})
+
+const firstFillTrustLabel = computed(() => {
+  const trustworthy = prepared.value?.executionEvidence?.initialEntryFillTrustworthy
+    ?? evaluation.value?.evidence_snapshot?.entry?.execution?.initial_entry_fill_trustworthy
+  return trustworthy ? 'actual fill' : 'not provable (UNKNOWN)'
+})
+
+const referenceStop = computed(() => {
+  const stop = evaluation.value?.evidence_snapshot?.entry?.stop
+  return stop && stop.reference_stop ? stop.reference_stop.price : null
+})
+
+const actualStopAvailable = computed(() => {
+  const stop = evaluation.value?.evidence_snapshot?.entry?.stop
+  return !!(stop && stop.available)
+})
+
+const actualStopText = computed(() => {
+  if (!actualStopAvailable.value) return 'UNKNOWN'
+  const stop = evaluation.value?.evidence_snapshot?.entry?.stop
+  return formatPrice(stop.price)
 })
 
 const scoreText = computed(() => (entrySummary.value && typeof entrySummary.value.score === 'number' ? entrySummary.value.score : 'N/A'))
