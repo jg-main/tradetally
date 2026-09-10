@@ -55,19 +55,27 @@ function passingEntryPayload(extra = {}) {
 }
 
 let updateParams;
+let updateSql;
 
-function installSuccessfulUpdate() {
+function installSuccessfulUpdate({ row } = {}) {
   db.query
-    .mockResolvedValueOnce({ rows: [lookupRow()] })
+    .mockResolvedValueOnce({ rows: [row || lookupRow()] })
     .mockImplementationOnce((sql, params) => {
+      updateSql = sql;
       updateParams = params;
       return { rows: [{ id: 'eval-1', status: 'draft', results: null }] };
     });
 }
 
+function highestPlaceholder(sql) {
+  const matches = sql.match(/\$\d+/g) || [];
+  return matches.reduce((max, token) => Math.max(max, Number(token.slice(1))), 0);
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   updateParams = null;
+  updateSql = null;
 });
 
 describe('evaluationService.saveEntryProgress (Entry-owned state merge)', () => {
@@ -174,7 +182,8 @@ describe('evaluationService.saveEntryProgress (Setup CAS + intended-trigger CAS)
     expect(updateParams[4].immutable_semantic_context.intended_trigger).toEqual(
       expect.objectContaining({ value: 'BO-PIVOT', source: 'user_asserted', asserted_at: expect.any(String) })
     );
-    expect(updateParams[12]).toBe('BO-PIVOT');
+    // The true-establish predicate has NO trigger placeholder: only $1..$12.
+    expect(updateParams).toHaveLength(12);
   });
 
   test('two concurrent first assertions cannot both win (loser is INTENDED_TRIGGER_IMMUTABLE)', async () => {
@@ -287,5 +296,41 @@ describe('evaluationService.saveEntryProgress — SQL construction (PostgreSQL v
     const sql = db.query.mock.calls[1][0];
     expect(sql).toContain("status NOT IN ('completed', 'insufficient_data')");
     expect(sql).not.toMatch(/\be\.status\b/);
+  });
+});
+
+describe('saveEntryProgress — SQL placeholder/parameter parity (BLOCKER regression)', () => {
+  test('mode none: highest $N placeholder equals params.length', async () => {
+    installSuccessfulUpdate();
+    await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload({
+      intendedTrigger: { mode: 'none' }
+    }));
+    expect(highestPlaceholder(updateSql)).toBe(updateParams.length);
+    expect(updateParams).toHaveLength(12);
+  });
+
+  test('mode establish: no unused $13 and highest $N equals params.length', async () => {
+    installSuccessfulUpdate({ row: lookupRow() }); // observed an EMPTY trigger
+    await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload({
+      intendedTrigger: { mode: 'establish', value: 'BO-PIVOT' }
+    }));
+    // The empty-trigger predicate must not bind a trigger parameter.
+    expect(updateSql).not.toContain('$13');
+    expect(updateSql).toContain("COALESCE(user_inputs->>'intended_trigger_type', '') = ''");
+    expect(updateParams).toHaveLength(12);
+    expect(highestPlaceholder(updateSql)).toBe(updateParams.length);
+  });
+
+  test('mode preserve: $13 is bound and highest $N equals params.length', async () => {
+    installSuccessfulUpdate({
+      row: lookupRow({ user_inputs: { leader_confirmed: true, intended_trigger_type: 'BO-PIVOT' } })
+    });
+    await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload({
+      intendedTrigger: { mode: 'preserve', value: 'BO-PIVOT' }
+    }));
+    expect(updateSql).toContain('$13');
+    expect(updateParams).toHaveLength(13);
+    expect(updateParams[12]).toBe('BO-PIVOT');
+    expect(highestPlaceholder(updateSql)).toBe(updateParams.length);
   });
 });

@@ -26,11 +26,13 @@
 // result is UNKNOWN — TradeTally does not claim a first print it cannot prove.
 //
 // PRECISION: 1-minute OHLC bars can prove THAT a crossing occurred inside an
-// interval, but not an exact tick timestamp. `trigger_cross_number` is exposed
-// only when the evidence can establish it (an execution print); otherwise
-// `bars_above_threshold` is retained and trigger_time uses an explicit
-// `1min_interval` precision. A sustained run of bars above the threshold is
-// never counted as N crossings.
+// interval, but not an exact tick timestamp. The trader's execution print proves
+// the trader's own fill, NOT the market's first above-trigger trade, so it can
+// never establish `trigger_cross_number` or an exact `trigger_time`; those stay
+// null unless suitable evidence actually establishes them. Only the first
+// observed above-threshold interval bounds are retained (`1min_interval`
+// precision) plus `bars_above_threshold`. A sustained run of bars above the
+// threshold is never counted as N crossings.
 
 const { CRITERION_STATUS } = require('../constants');
 const {

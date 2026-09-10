@@ -810,9 +810,9 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
     // A true establish claimant may only claim an EMPTY trigger. It must never
     // match an already-established value, otherwise two concurrent same-value
     // claims could both succeed and the second would overwrite the first
-    // asserted_at (immutable provenance violation).
+    // asserted_at (immutable provenance violation). The predicate has NO trigger
+    // bind parameter, so none is pushed (params stay $1..$12).
     where.push(`COALESCE(user_inputs->>'intended_trigger_type', '') = ''`);
-    params.push(intended.value);
   } else if (intendedMode === 'preserve') {
     where.push(`COALESCE(user_inputs->>'intended_trigger_type', '') = $13`);
     params.push(intended.value);
