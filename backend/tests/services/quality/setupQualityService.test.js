@@ -73,64 +73,35 @@ function installDbRouter(overrides = {}) {
       if (overrides.failAtomicUpdate) {
         throw new Error('simulated db failure');
       }
-      if (sql.includes('setup_score = NULL')) {
-        // ATOMIC prepare context + Setup-result invalidation UPDATE: one
-        // statement carries the new evidence/detected/user-input context AND
-        // the cleared Setup result.
-        const preserved = params[5];
-        const base = existingDraft || makeEvaluationRow();
-        const merged = {
-          ...base,
-          results: preserved === null ? null : typeof preserved === 'string' ? JSON.parse(preserved) : preserved,
-          setup_score: null,
-          setup_grade: null,
-          setup_compliance: null,
-          setup_coverage: null,
-          evidence_snapshot: params[2],
-          detected_context: params[3],
-          user_inputs: params[4]
-        };
-        if (overrides.trackEvalRow) existingDraft = merged;
-        return { rows: [merged] };
+      if (overrides.updateReturnsEmpty) {
+        // Simulates a lost compare-and-swap: the row changed (or reached a
+        // terminal state) between the read and the UPDATE.
+        return { rows: [] };
       }
-      if (sql.includes('results = $3')) {
-        // saveSetupProgress UPDATE (Phase 3 hardening: also carries
-        // entry_*/management_* summaries derived from preserved downstream
-        // dimensions).
-        updateCall = { sql, params };
-        const results = typeof params[2] === 'string' ? JSON.parse(params[2]) : params[2];
-        const row = makeEvaluationRow({
-          status: 'draft',
-          results,
-          evidence_snapshot: params[3],
-          user_inputs: params[4],
-          detected_context: params[5],
-          setup_score: params[6],
-          setup_grade: params[7],
-          setup_compliance: params[8],
-          setup_coverage: params[9],
-          entry_score: params[10],
-          entry_grade: params[11],
-          entry_compliance: params[12],
-          entry_coverage: params[13],
-          management_score: params[14],
-          management_grade: params[15],
-          management_compliance: params[16],
-          management_coverage: params[17]
-        });
-        if (overrides.trackEvalRow) existingDraft = row;
-        return { rows: [row] };
-      }
-      // prepare() context refresh: evidence_snapshot / detected_context /
-      // user_inputs. Unchanged columns (results, setup_* etc.) are preserved
-      // from the existing draft (real DB behavior).
-      const base = existingDraft || makeEvaluationRow();
-      const row = {
-        ...base,
-        evidence_snapshot: params[2],
-        detected_context: params[3],
-        user_inputs: params[4]
-      };
+      // Both Setup write paths (persistPrepareContext and saveSetupProgress)
+      // now persist the full coherent state: results, evidence snapshot,
+      // user inputs, detected context, and every flat summary column.
+      updateCall = { sql, params };
+      const results = typeof params[2] === 'string' ? JSON.parse(params[2]) : params[2];
+      const row = makeEvaluationRow({
+        status: 'draft',
+        results,
+        evidence_snapshot: params[3],
+        user_inputs: params[4],
+        detected_context: params[5],
+        setup_score: params[6],
+        setup_grade: params[7],
+        setup_compliance: params[8],
+        setup_coverage: params[9],
+        entry_score: params[10],
+        entry_grade: params[11],
+        entry_compliance: params[12],
+        entry_coverage: params[13],
+        management_score: params[14],
+        management_grade: params[15],
+        management_compliance: params[16],
+        management_coverage: params[17]
+      });
       if (overrides.trackEvalRow) existingDraft = row;
       return { rows: [row] };
     }
@@ -142,6 +113,8 @@ function installDbRouter(overrides = {}) {
           profile_version_id: VERSION_ID,
           results: (existingDraft && existingDraft.results) || null,
           detected_context: (existingDraft && existingDraft.detected_context) || null,
+          evidence_snapshot: (existingDraft && existingDraft.evidence_snapshot) || null,
+          user_inputs: (existingDraft && existingDraft.user_inputs) || null,
           configuration: overrides.versionConfiguration || CANONICAL_CONFIG
         }]
       };
@@ -716,7 +689,7 @@ describe('SetupQualityService.evaluate', () => {
     const reprepared = await prepareDraft({
       confirmedBaseStart: { date: scenario.dateAt(71), source: 'user_adjusted' }
     });
-    expect(reprepared.evaluation.results.setup).toBeUndefined();
+    expect(reprepared.evaluation.results.setup).toBeNull();
     expect(reprepared.evaluation.results.entry).toBeNull();
     expect(reprepared.evaluation.results.management).toBeNull();
     expect(reprepared.evaluation.setup_score).toBeNull();
@@ -735,7 +708,7 @@ describe('SetupQualityService.evaluate', () => {
     // A reload after re-prepare (GET evaluations row) shows Setup as not
     // evaluated: no stale grade.
     const list = await SetupQualityService.listEvaluations(USER_ID, TRADE_ID);
-    expect(list[0].results.setup).toBeUndefined();
+    expect(list[0].results.setup).toBeNull();
     expect(list[0].setup_grade).toBeNull();
 
     // Re-evaluate under B produces fresh Setup results.
@@ -770,16 +743,23 @@ describe('integrity closure (Phase 2 final)', () => {
       confirmedBaseStart: { date: scenario.dateAt(71), source: 'user_adjusted' }
     });
 
-    const updates = db.query.mock.calls
-      .map(([sql]) => sql)
-      .filter((sql) => sql.includes('UPDATE trade_quality_evaluations'));
+    const updateCalls = db.query.mock.calls.filter(([sql]) =>
+      sql.includes('UPDATE trade_quality_evaluations')
+    );
     // Exactly ONE UPDATE: it carries the new context AND the invalidation in the
     // same statement (no separate clear-setup UPDATE can interleave).
-    expect(updates).toHaveLength(1);
-    expect(updates[0]).toContain('evidence_snapshot = $3');
-    expect(updates[0]).toContain('user_inputs = $5');
-    expect(updates[0]).toContain('results = $6');
-    expect(updates[0]).toContain('setup_score = NULL');
+    expect(updateCalls).toHaveLength(1);
+    const [updateSql, updateParams] = updateCalls[0];
+    expect(updateSql).toContain('results = $3');
+    expect(updateSql).toContain('evidence_snapshot = $4');
+    expect(updateSql).toContain('user_inputs = $5');
+    expect(updateSql).toContain('detected_context = $6');
+    expect(updateSql).toContain('setup_score = $7');
+    expect(updateSql).toContain('entry_score = $11');
+    // The single statement writes the invalidated envelope and NULL summaries.
+    expect(JSON.parse(updateParams[2])).toEqual({ setup: null, entry: null, management: null });
+    expect(updateParams[6]).toBeNull();
+    expect(updateParams[10]).toBeNull();
   });
 
   test('a simulated failure mid-persist cannot leave new context paired with stale Setup results', async () => {
@@ -917,7 +897,7 @@ describe('integrity closure (Phase 2 final)', () => {
       confirmedBaseStart: { date: machineBaseDate, source: 'user_adjusted' }
     });
     // Stale Setup invalidated (atomic UPDATE carried the clear).
-    expect(reprepared.evaluation.results.setup).toBeUndefined();
+    expect(reprepared.evaluation.results.setup).toBeNull();
     expect(reprepared.evaluation.setup_grade).toBeNull();
     // Structural date is identical, so the machine Pivot is NOT needlessly
     // invalidated: it remains derived from the same date and still confirms.
@@ -1002,17 +982,30 @@ describe('integrity closure (Phase 2 final)', () => {
     const reprepared = await prepareDraft({
       confirmedBaseStart: { date: scenario.dateAt(71), source: 'user_adjusted' }
     });
-    expect(reprepared.evaluation.results.setup).toBeUndefined();
-    expect(reprepared.evaluation.results.entry).toBeUndefined();
+    expect(reprepared.evaluation.results.setup).toBeNull();
+    expect(reprepared.evaluation.results.entry).toBeNull();
 
-    // The atomic UPDATE must clear Entry AND Management flat summaries too.
-    const invalidationUpdate = db.query.mock.calls
-      .map(([sql]) => sql)
-      .find((sql) => sql.includes('setup_score = NULL'));
-    expect(invalidationUpdate).toBeDefined();
-    expect(invalidationUpdate).toContain('entry_score = NULL');
-    expect(invalidationUpdate).toContain('entry_compliance = NULL');
-    expect(invalidationUpdate).toContain('management_score = NULL');
+    // The atomic UPDATE must clear Entry AND Management flat summaries too, and
+    // drop their evidence/context blocks in the same statement.
+    const invalidationCall = db.query.mock.calls.find(([sql]) =>
+      sql.includes('UPDATE trade_quality_evaluations')
+    );
+    expect(invalidationCall).toBeDefined();
+    const [invalidationSql, invalidationParams] = invalidationCall;
+    expect(invalidationSql).toContain('entry_score = $11');
+    expect(invalidationSql).toContain('entry_compliance = $13');
+    expect(invalidationSql).toContain('management_score = $15');
+    expect(JSON.parse(invalidationParams[2])).toEqual({
+      setup: null,
+      entry: null,
+      management: null
+    });
+    expect(invalidationParams[10]).toBeNull(); // entry_score
+    expect(invalidationParams[12]).toBeNull(); // entry_compliance
+    expect(invalidationParams[14]).toBeNull(); // management_score
+    // Derived Entry evidence/context must not survive an invalidation.
+    expect(invalidationParams[3].entry).toBeUndefined();
+    expect(invalidationParams[5].entry).toBeUndefined();
   });
 });
 
@@ -1169,5 +1162,68 @@ describe('executable-contract closure (Phase 2 final)', () => {
     });
     expect(confirmed.evaluation.user_inputs.base_start.source).toBe('detected_confirmed');
     expect(loadDailyEvidence).toHaveBeenCalledTimes(1); // reuse; no fresh fetch
+  });
+});
+
+describe('Setup downstream-state coherence + CAS (Phase 3 follow-up)', () => {
+  function augmentEntryState() {
+    existingDraft = {
+      ...existingDraft,
+      results: { setup: { score: 96 }, entry: { score: 80 }, management: null },
+      evidence_snapshot: { ...(existingDraft.evidence_snapshot || {}), entry: { probe: 'entry-evidence' } },
+      detected_context: {
+        ...(existingDraft.detected_context || {}),
+        setup_dependency_fingerprint: 'FP',
+        setup_context_revision: '5',
+        entry: { probe: 'entry-context' }
+      },
+      user_inputs: { ...(existingDraft.user_inputs || {}), intended_trigger_type: 'BO-PIVOT' }
+    };
+  }
+
+  test('an unchanged Setup Prepare preserves Entry result, evidence, context and immutable trigger', async () => {
+    await prepareDraft();
+    augmentEntryState();
+
+    const reprepared = await prepareDraft();
+    expect(reprepared.evaluation.results.entry).toEqual({ score: 80 });
+    expect(reprepared.evaluation.evidence_snapshot.entry).toEqual({ probe: 'entry-evidence' });
+    expect(reprepared.evaluation.detected_context.entry).toEqual({ probe: 'entry-context' });
+    expect(reprepared.evaluation.user_inputs.intended_trigger_type).toBe('BO-PIVOT');
+    // The Setup dependency fingerprint (the token that gates downstream
+    // preservation) is NOT dropped by an unchanged Prepare write.
+    expect(reprepared.evaluation.detected_context.setup_dependency_fingerprint).toBe('FP');
+    // Successful write advances the CAS token.
+    expect(reprepared.evaluation.detected_context.setup_context_revision).toBe('6');
+  });
+
+  test('a changed Setup Prepare clears derived Entry evidence/context but keeps the immutable trigger', async () => {
+    await prepareDraft();
+    augmentEntryState();
+
+    const reprepared = await prepareDraft({
+      confirmedBaseStart: { date: scenario.dateAt(71), source: 'user_adjusted' }
+    });
+    expect(reprepared.evaluation.results.entry).toBeNull();
+    expect(reprepared.evaluation.evidence_snapshot.entry).toBeUndefined();
+    expect(reprepared.evaluation.detected_context.entry).toBeUndefined();
+    // The historical semantic assertion is NOT derived downstream state.
+    expect(reprepared.evaluation.user_inputs.intended_trigger_type).toBe('BO-PIVOT');
+  });
+
+  test('a stale Setup Prepare write is rejected with STALE_SETUP_CONTEXT', async () => {
+    installDbRouter({ trackEvalRow: true, updateReturnsEmpty: true });
+    await expect(prepareDraft()).rejects.toMatchObject({ code: 'STALE_SETUP_CONTEXT' });
+  });
+
+  test('a stale Setup Evaluate write is rejected with STALE_SETUP_CONTEXT', async () => {
+    const prepared = await prepareDraft();
+    installDbRouter({ trackEvalRow: true, updateReturnsEmpty: true });
+    await expect(
+      SetupQualityService.evaluate(USER_ID, TRADE_ID, {
+        evaluationId: prepared.evaluation.id,
+        userInputs: confirmedFromPrepared(prepared)
+      })
+    ).rejects.toMatchObject({ code: 'STALE_SETUP_CONTEXT' });
   });
 });

@@ -146,3 +146,85 @@ describe('evaluationService.saveSetupProgress (Phase 3 hardening)', () => {
     expect(db.query).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('Setup downstream-state coherence + compare-and-swap (Phase 3 follow-up)', () => {
+  const existingWithDownstream = () => ({
+    evidence_snapshot: { ...SNAPSHOT, entry: { probe: 'entry-evidence' } },
+    detected_context: {
+      boundary: BOUNDARY,
+      setup_dependency_fingerprint: fingerprint(),
+      entry: { probe: 'entry-context' }
+    },
+    user_inputs: { leader_confirmed: true, intended_trigger_type: 'BO-PIVOT' }
+  });
+
+  test('unchanged Setup evaluate preserves entry result, evidence block and context block', async () => {
+    db.query.mockResolvedValueOnce({ rows: [lookupRow(existingWithDownstream())] });
+    installUpdate();
+
+    await evaluationService.saveSetupProgress('eval-1', 'user-1', setupInput());
+    const results = JSON.parse(updateParams[2]);
+    expect(results.entry).toEqual(ENTRY_RESULT);
+    expect(updateParams[3].entry).toEqual({ probe: 'entry-evidence' });
+    expect(updateParams[5].entry).toEqual({ probe: 'entry-context' });
+    // Immutable semantic assertion survives.
+    expect(updateParams[4].intended_trigger_type).toBe('BO-PIVOT');
+  });
+
+  test('changed Setup dependency atomically clears entry result, evidence, context and summaries', async () => {
+    db.query.mockResolvedValueOnce({ rows: [lookupRow(existingWithDownstream())] });
+    installUpdate();
+
+    const changedBoundary = { ...BOUNDARY, pivotPrice: 130 };
+    await evaluationService.saveSetupProgress('eval-1', 'user-1', {
+      ...setupInput(),
+      detectedContext: { boundary: changedBoundary }
+    });
+    const results = JSON.parse(updateParams[2]);
+    expect(results.entry).toBeNull();
+    expect(updateParams[3].entry).toBeUndefined();
+    expect(updateParams[5].entry).toBeUndefined();
+    expect(updateParams[10]).toBeNull(); // entry_score
+    // The immutable intended trigger is NOT downstream state: it survives.
+    expect(updateParams[4].intended_trigger_type).toBe('BO-PIVOT');
+  });
+
+  test('a stale Setup revision is rejected before any UPDATE', async () => {
+    db.query.mockResolvedValueOnce({
+      rows: [lookupRow({
+        detected_context: {
+          boundary: BOUNDARY,
+          setup_dependency_fingerprint: fingerprint(),
+          setup_context_revision: '2'
+        }
+      })]
+    });
+    await expect(
+      evaluationService.saveSetupProgress('eval-1', 'user-1', {
+        ...setupInput(),
+        expectedSetupRevision: '1'
+      })
+    ).rejects.toMatchObject({ code: 'STALE_SETUP_CONTEXT' });
+    expect(db.query).toHaveBeenCalledTimes(1);
+  });
+
+  test('a matching Setup revision advances the compare-and-swap token', async () => {
+    db.query.mockResolvedValueOnce({
+      rows: [lookupRow({
+        detected_context: {
+          boundary: BOUNDARY,
+          setup_dependency_fingerprint: fingerprint(),
+          setup_context_revision: '2'
+        }
+      })]
+    });
+    installUpdate();
+
+    await evaluationService.saveSetupProgress('eval-1', 'user-1', {
+      ...setupInput(),
+      expectedSetupRevision: '2'
+    });
+    expect(updateParams[5].setup_context_revision).toBe('3');
+    expect(updateParams[18]).toBe('2');
+  });
+});

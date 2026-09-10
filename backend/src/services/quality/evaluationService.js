@@ -30,6 +30,12 @@ const { CRITERION_STATUS, EVALUATION_STATUS } = require('./constants');
 const { aggregateDimension } = require('./aggregation');
 const { deriveScoreForCriterion } = require('./scoring');
 const { setupDependencyFingerprint } = require('./dependencyFingerprint');
+const {
+  applyDownstreamState,
+  nextContextRevision,
+  SETUP_CONTEXT_REVISION_KEY,
+  SETUP_DEPENDENCY_FINGERPRINT_KEY
+} = require('./downstreamState');
 
 const EVALUATION_COLUMNS = `
   id, user_id, trade_id, profile_version_id, status,
@@ -424,7 +430,8 @@ async function getEvaluation(evaluationId, userId) {
 async function saveSetupProgress(evaluationId, userId, data = {}) {
   const lookup = await db.query(
     `
-      SELECT e.id, e.status, e.profile_version_id, e.results, e.detected_context, e.evidence_snapshot, v.configuration
+      SELECT e.id, e.status, e.profile_version_id, e.results, e.detected_context,
+             e.evidence_snapshot, e.user_inputs, v.configuration
       FROM trade_quality_evaluations e
       JOIN quality_profile_versions v ON v.id = e.profile_version_id
       JOIN quality_profiles p ON p.id = v.profile_id
@@ -458,51 +465,69 @@ async function saveSetupProgress(evaluationId, userId, data = {}) {
   const rows = normalizeCriterionRows('setup', setupConfig, dimResult);
   const recomputed = aggregateDimension(setupConfig, rows);
 
-  // Setup -> Entry dependency fingerprint (server-computed, never client
-  // trusted). A still-valid Entry (and future Management) result may be
-  // preserved ONLY when the dependencies Entry consumes are unchanged. A
-  // changed Pivot/breakout/evidence context atomically replaces Setup and
-  // clears downstream results AND their flat summaries, so the results JSON and
-  // the flat columns can never disagree.
   const detectedContextInput =
     data.detectedContext && typeof data.detectedContext === 'object'
       ? data.detectedContext
       : {};
+  const existingDetected = parseJsonField(lookup.rows[0].detected_context) || {};
+  const existingResults = parseJsonField(lookup.rows[0].results) || {};
+  const existingEvidenceSnapshot = parseJsonField(lookup.rows[0].evidence_snapshot) || {};
+  const existingUserInputs = parseJsonField(lookup.rows[0].user_inputs) || {};
+
+  // Setup compare-and-swap (finding 3). `expectedSetupRevision` is the
+  // revision the caller read before doing provider/aggregation work; the
+  // predicate makes a stale write fail instead of overwriting a newer Setup
+  // context and resurrecting invalidated downstream state. When the caller
+  // does not supply one, the lookup's own revision is used (still race-safe).
+  const existingRevision = existingDetected[SETUP_CONTEXT_REVISION_KEY] ?? null;
+  const expectedRevision =
+    data.expectedSetupRevision !== undefined ? data.expectedSetupRevision : existingRevision;
+  if (String(expectedRevision ?? '') !== String(existingRevision ?? '')) {
+    const staleError = new Error(
+      'Setup context is stale: it changed after this request read it. Re-run Setup prepare/evaluate.'
+    );
+    staleError.code = 'STALE_SETUP_CONTEXT';
+    throw staleError;
+  }
+  const nextRevision = nextContextRevision(expectedRevision);
+
+  // Setup -> downstream dependency fingerprint (server-computed, never client
+  // trusted). Unchanged -> preserve every downstream dimension; changed ->
+  // invalidate results AND evidence/context AND flat summaries atomically.
   const newFingerprint = setupDependencyFingerprint({
     profileVersionId: lookup.rows[0].profile_version_id,
     boundary: detectedContextInput.boundary,
     evidenceSnapshot: data.evidenceSnapshot
   });
-  const existingDetected = parseJsonField(lookup.rows[0].detected_context) || {};
-  const existingFingerprint = existingDetected.setup_dependency_fingerprint ?? null;
-  const existingResults = parseJsonField(lookup.rows[0].results) || {};
+  const existingFingerprint = existingDetected[SETUP_DEPENDENCY_FINGERPRINT_KEY] ?? null;
   const dependenciesUnchanged =
     existingFingerprint !== null &&
     existingFingerprint === newFingerprint &&
     existingResults.setup !== null &&
     existingResults.setup !== undefined;
 
-  const persistedResults = {
-    setup: recomputed,
-    entry: dependenciesUnchanged && existingResults.entry ? existingResults.entry : null,
-    management:
-      dependenciesUnchanged && existingResults.management ? existingResults.management : null
-  };
-  const persistedDetectedContext = {
+  const nextDetectedContext = {
     ...detectedContextInput,
-    setup_dependency_fingerprint: newFingerprint
+    [SETUP_DEPENDENCY_FINGERPRINT_KEY]: newFingerprint,
+    [SETUP_CONTEXT_REVISION_KEY]: nextRevision
   };
-  // When the Setup dependency is unchanged a still-valid Entry result (and its
-  // provenance block / Initial R) is preserved. The Setup snapshot is replaced
-  // by the fresh Setup evidence; the Entry block is merged back in.
-  let persistedEvidenceSnapshot = data.evidenceSnapshot ?? null;
-  if (dependenciesUnchanged && persistedEvidenceSnapshot && typeof persistedEvidenceSnapshot === 'object') {
-    const existingSnapshot = parseJsonField(lookup.rows[0].evidence_snapshot) || {};
-    if (existingSnapshot.entry !== undefined) {
-      persistedEvidenceSnapshot = { ...persistedEvidenceSnapshot, entry: existingSnapshot.entry };
+
+  const merged = applyDownstreamState({
+    mode: dependenciesUnchanged ? 'preserve' : 'invalidate',
+    existing: {
+      results: existingResults,
+      evidenceSnapshot: existingEvidenceSnapshot,
+      detectedContext: existingDetected,
+      userInputs: existingUserInputs
+    },
+    next: {
+      results: { setup: recomputed },
+      evidenceSnapshot: data.evidenceSnapshot,
+      detectedContext: nextDetectedContext,
+      userInputs: data.userInputs
     }
-  }
-  const summaries = summariesFromResults(persistedResults);
+  });
+  const summaries = summariesFromResults(merged.results || {});
 
   const updated = await db.query(
     `
@@ -528,15 +553,16 @@ async function saveSetupProgress(evaluationId, userId, data = {}) {
       WHERE id = $1
         AND user_id = $2
         AND ${TERMINAL_STATUS_SQL}
+        AND COALESCE(detected_context->>'${SETUP_CONTEXT_REVISION_KEY}', '') = $19
       RETURNING ${EVALUATION_COLUMNS}
     `,
     [
       evaluationId,
       userId,
-      JSON.stringify(persistedResults),
-      persistedEvidenceSnapshot,
-      data.userInputs ?? null,
-      persistedDetectedContext,
+      merged.results === null ? null : JSON.stringify(merged.results),
+      merged.evidenceSnapshot,
+      merged.userInputs,
+      merged.detectedContext,
       summaries.setup_score,
       summaries.setup_grade,
       summaries.setup_compliance,
@@ -548,9 +574,17 @@ async function saveSetupProgress(evaluationId, userId, data = {}) {
       summaries.management_score,
       summaries.management_grade,
       summaries.management_compliance,
-      summaries.management_coverage
+      summaries.management_coverage,
+      expectedRevision ?? ''
     ]
   );
+  if (updated.rows.length === 0) {
+    const staleError = new Error(
+      'Setup results were not saved because the Setup context changed during evaluation. Re-run Setup prepare/evaluate.'
+    );
+    staleError.code = 'STALE_SETUP_CONTEXT';
+    throw staleError;
+  }
   return updated.rows[0] || null;
 }
 
@@ -652,6 +686,17 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
       : null
   };
 
+  // Entry only writes Entry state: it must carry forward the CURRENT Setup
+  // concurrency token and fingerprint it was guarded against, never a stale
+  // revision it read before some other concurrent Setup write.
+  const detectedContextInput =
+    data.detectedContext && typeof data.detectedContext === 'object' ? data.detectedContext : {};
+  const persistedDetectedContext = {
+    ...detectedContextInput,
+    [SETUP_DEPENDENCY_FINGERPRINT_KEY]: currentDetected[SETUP_DEPENDENCY_FINGERPRINT_KEY] ?? null,
+    [SETUP_CONTEXT_REVISION_KEY]: currentDetected[SETUP_CONTEXT_REVISION_KEY] ?? null
+  };
+
   const updated = await db.query(
     `
       UPDATE trade_quality_evaluations
@@ -677,7 +722,7 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
       JSON.stringify(persistedResults),
       data.evidenceSnapshot ?? null,
       data.userInputs ?? null,
-      data.detectedContext ?? null,
+      persistedDetectedContext,
       recomputed.score,
       recomputed.grade,
       recomputed.compliance,

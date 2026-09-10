@@ -126,7 +126,18 @@
             User asserted
           </span>
         </div>
+        <div
+          v-if="intendedTriggerLocked"
+          class="mt-2 flex items-center gap-2"
+          data-testid="entry-intended-trigger-locked"
+        >
+          <span class="rounded-md border border-gray-300 bg-gray-100 px-2 py-1 text-xs font-semibold text-gray-800 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200">
+            {{ intendedTriggerType }}
+          </span>
+          <span class="text-[10px] text-gray-400">locked</span>
+        </div>
         <select
+          v-else
           v-model="intendedTriggerType"
           class="mt-2 rounded-md border border-gray-300 bg-white px-2 py-1 text-xs text-gray-800 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200"
           data-testid="entry-intended-trigger"
@@ -135,8 +146,13 @@
           <option v-for="type in allowedTriggerTypes" :key="type" :value="type">{{ type }}</option>
         </select>
         <p class="mt-1 text-[10px] text-gray-400">
-          The intended trigger is stored with provenance user_asserted and cannot be relabelled after
-          the fact to improve the grade.
+          <template v-if="intendedTriggerLocked">
+            The intended trigger is frozen for this evaluation. Changing it requires a new evaluation.
+          </template>
+          <template v-else>
+            The intended trigger is stored with provenance user_asserted and cannot be relabelled
+            afterwards. Once saved it becomes locked.
+          </template>
         </p>
       </div>
 
@@ -309,9 +325,22 @@ function hydratedRequiredInputs() {
 const requiredInputs = computed(() => hydratedRequiredInputs())
 const requiresIntendedTrigger = computed(() => requiredInputs.value.includes('intended_trigger_type'))
 
+// Once the intended trigger is persisted it is frozen for this evaluation: the
+// selector becomes read-only and changing it requires a new evaluation.
+const intendedTriggerLocked = computed(() => {
+  const preparedTrigger = prepared.value && prepared.value.intendedTrigger
+  if (preparedTrigger && preparedTrigger.established) return true
+  const inputs = evaluation.value && evaluation.value.user_inputs
+  if (inputs && typeof inputs.intended_trigger_type === 'string' && inputs.intended_trigger_type) {
+    return true
+  }
+  const detected = evaluation.value && evaluation.value.detected_context
+  return !!(detected && detected.entry && detected.entry.intended_trigger && detected.entry.intended_trigger.value)
+})
+
 const canEvaluate = computed(() => {
   if (!setupReady.value) return false
-  if (requiresIntendedTrigger.value && !intendedTriggerType.value) return false
+  if (requiresIntendedTrigger.value && !intendedTriggerLocked.value && !intendedTriggerType.value) return false
   return true
 })
 
@@ -420,18 +449,22 @@ const complianceClass = computed(() => {
 function hydrateFromEvaluation(value) {
   if (!value) return
   const inputs = value.user_inputs || {}
-  if (typeof inputs.intended_trigger_type === 'string') {
+  if (typeof inputs.intended_trigger_type === 'string' && inputs.intended_trigger_type) {
     intendedTriggerType.value = inputs.intended_trigger_type
+    return
+  }
+  const detected = value.detected_context
+  if (detected && detected.entry && detected.entry.intended_trigger) {
+    intendedTriggerType.value = detected.entry.intended_trigger.value
   }
 }
 
 function hydrateFromPrepared(value) {
-  if (value.executionEvidence) {
-    // Surface provenance/context already computed by prepare.
-  }
   const detected = value.evaluation && value.evaluation.detected_context
   const inputs = value.evaluation && value.evaluation.user_inputs
-  if (inputs && typeof inputs.intended_trigger_type === 'string') {
+  if (value.intendedTrigger && value.intendedTrigger.established) {
+    intendedTriggerType.value = value.intendedTrigger.value
+  } else if (inputs && typeof inputs.intended_trigger_type === 'string') {
     intendedTriggerType.value = inputs.intended_trigger_type
   } else if (detected && detected.entry && detected.entry.intended_trigger) {
     intendedTriggerType.value = detected.entry.intended_trigger.value

@@ -153,7 +153,7 @@ describe('triggerResolver', () => {
     expect(result.evidence.first_cross_bar_close).toBe(OPEN + 61 * 60);
   });
 
-  test('an execution print that is the first crossing has an exact execution timestamp', () => {
+  test('a fill above the trigger proves compliance but NOT a first market crossing', () => {
     const bars = minuteBars(0, 60, 99); // entire opening range below the pivot threshold
     const result = resolve({
       triggerType: 'BO-ORH-60',
@@ -161,9 +161,17 @@ describe('triggerResolver', () => {
       intraday: { breakoutSession: SESSION, breakoutSessionBars: bars, resolution: '1min', resolutionSeconds: 60 }
     });
     expect(result.status).toBe('PASS');
-    expect(result.triggerCrossNumber).toBe(1);
-    expect(result.triggerTimePrecision).toBe('execution_timestamp');
-    expect(result.evidence.minutes_after_first_trigger).toBe(0);
+    // The execution print is proof of the user's fill, not of the market's
+    // first trade above the trigger.
+    expect(result.triggerCrossNumber).toBeNull();
+    expect(result.triggerTime).toBeNull();
+    expect(result.triggerTimePrecision).toBeNull();
+    expect(result.minutesAfterFirstTrigger).toBeNull();
+    expect(result.evidence.entry_observation_above_threshold).toBe(true);
+    expect(result.evidence.entry_execution_price).toBe(106);
+    expect(result.evidence.entry_execution_time).toBeTruthy();
+    expect(result.evidence.trigger_time).toBeNull();
+    expect(result.evidence.trigger_cross_number).toBeNull();
   });
 
   test('bars after the entry cutoff never change the resolved trigger', () => {

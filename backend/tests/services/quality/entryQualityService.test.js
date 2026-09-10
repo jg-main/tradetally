@@ -272,3 +272,141 @@ describe('EntryQualityService (hardened)', () => {
     ).rejects.toMatchObject({ code: 'ENTRY_SETUP_REQUIRED' });
   });
 });
+
+describe('EntryQualityService — intended trigger immutability (finding 1)', () => {
+  test('the first assertion is persisted with user_asserted provenance', async () => {
+    await EntryQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: EVAL_ID,
+      userInputs: { intended_trigger_type: 'BO-PIVOT' }
+    });
+    const data = evaluationService.saveEntryProgress.mock.calls[0][2];
+    expect(data.userInputs.intended_trigger_type).toBe('BO-PIVOT');
+    expect(data.detectedContext.entry.intended_trigger.value).toBe('BO-PIVOT');
+    expect(data.detectedContext.entry.intended_trigger.source).toBe('user_asserted');
+    expect(data.detectedContext.entry.intended_trigger.assertedAt).toBeTruthy();
+  });
+
+  test('repeating the same assertion is allowed', async () => {
+    evaluationService.getEvaluation.mockResolvedValue(
+      evaluationRow({
+        user_inputs: {
+          ...evaluationRow().user_inputs,
+          intended_trigger_type: 'BO-PIVOT'
+        }
+      })
+    );
+    await EntryQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: EVAL_ID,
+      userInputs: { intended_trigger_type: 'BO-PIVOT' }
+    });
+    expect(evaluationService.saveEntryProgress).toHaveBeenCalledTimes(1);
+  });
+
+  test('omitting the assertion reuses the persisted value', async () => {
+    evaluationService.getEvaluation.mockResolvedValue(
+      evaluationRow({
+        user_inputs: {
+          ...evaluationRow().user_inputs,
+          intended_trigger_type: 'BO-ORH-5'
+        }
+      })
+    );
+    await EntryQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: EVAL_ID,
+      userInputs: {}
+    });
+    const data = evaluationService.saveEntryProgress.mock.calls[0][2];
+    expect(data.userInputs.intended_trigger_type).toBe('BO-ORH-5');
+    expect(data.detectedContext.entry.intended_trigger.value).toBe('BO-ORH-5');
+  });
+
+  test('a different assertion is rejected and no Entry write occurs', async () => {
+    evaluationService.getEvaluation.mockResolvedValue(
+      evaluationRow({
+        user_inputs: {
+          ...evaluationRow().user_inputs,
+          intended_trigger_type: 'BO-PIVOT'
+        }
+      })
+    );
+    await expect(
+      EntryQualityService.evaluate(USER_ID, TRADE_ID, {
+        evaluationId: EVAL_ID,
+        userInputs: { intended_trigger_type: 'BO-ORH-5' }
+      })
+    ).rejects.toMatchObject({ code: 'INTENDED_TRIGGER_IMMUTABLE' });
+    expect(evaluationService.saveEntryProgress).not.toHaveBeenCalled();
+  });
+
+  test('a new evaluation may assert a different trigger', async () => {
+    evaluationService.getEvaluation.mockResolvedValue(evaluationRow());
+    await EntryQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: EVAL_ID,
+      userInputs: { intended_trigger_type: 'BO-ORH-60' }
+    });
+    const data = evaluationService.saveEntryProgress.mock.calls[0][2];
+    expect(data.userInputs.intended_trigger_type).toBe('BO-ORH-60');
+  });
+});
+
+describe('EntryQualityService — Entry-specific daily evidence authority (finding 4)', () => {
+  test('verified Entry-specific daily evidence records the exact volatility sessions', async () => {
+    const config = JSON.parse(JSON.stringify(CONFIG));
+    for (const criterion of config.dimensions.entry.criteria) {
+      criterion.enabled = criterion.key === 'stop_width';
+    }
+    installDbRouter(config);
+    evaluationService.getEvaluation.mockResolvedValue(
+      evaluationRow({
+        detected_context: {},
+        evidence_snapshot: { symbol: 'TEST', resolution: 'daily', entrySessionDate: ENTRY_SESSION, completeness: 'not_required', bars: [] }
+      })
+    );
+    loadDailyEvidence.mockResolvedValue({
+      bars: DAILY_BARS,
+      source: 'finnhub',
+      completeness: 'verified',
+      error: null
+    });
+
+    await EntryQualityService.evaluate(USER_ID, TRADE_ID, { evaluationId: EVAL_ID, userInputs: {} });
+    const data = evaluationService.saveEntryProgress.mock.calls[0][2];
+    expect(data.evidenceSnapshot.bars).toEqual([]); // Setup snapshot untouched
+    expect(data.evidenceSnapshot.entry.entry_daily.appended).toBe(true);
+    expect(data.evidenceSnapshot.entry.entry_daily.authoritative).toBe(true);
+    expect(data.evidenceSnapshot.entry.entry_daily.requested_window).toBeTruthy();
+    // Exact per-session inputs required to reproduce ADR are persisted.
+    expect(data.evidenceSnapshot.entry.volatility.ADR.sessions.length).toBe(20);
+    expect(data.evidenceSnapshot.entry.volatility.ADR.sessions[0]).toEqual(
+      expect.objectContaining({ date: expect.any(String), high: expect.any(Number), previousClose: expect.any(Number) })
+    );
+  });
+
+  test('cache-only/unverified Entry daily evidence yields UNKNOWN volatility-derived criteria', async () => {
+    evaluationService.getEvaluation.mockResolvedValue(
+      evaluationRow({
+        evidence_snapshot: {
+          symbol: 'TEST', resolution: 'daily', entrySessionDate: ENTRY_SESSION,
+          completeness: 'unverified', source: 'historical_cache', bars: []
+        }
+      })
+    );
+    loadDailyEvidence.mockResolvedValue({
+      bars: DAILY_BARS,
+      source: 'historical_cache',
+      completeness: 'unverified',
+      error: 'cache only'
+    });
+
+    await EntryQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: EVAL_ID,
+      userInputs: { intended_trigger_type: 'BO-PIVOT' }
+    });
+    const data = evaluationService.saveEntryProgress.mock.calls[0][2];
+    expect(data.evidenceSnapshot.entry.entry_daily.authoritative).toBe(false);
+    expect(data.evidenceSnapshot.entry.volatility).toEqual({});
+    const byKey = new Map(data.entryResults.criterionResults.map((row) => [row.key, row]));
+    expect(byKey.get('entry_extension').status).toBe('UNKNOWN');
+    expect(byKey.get('stop_width').status).toBe('UNKNOWN');
+  });
+});

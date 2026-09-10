@@ -14,7 +14,14 @@ const EntryQualityService = require('../services/quality/entryQualityService');
 function respondError(res, error) {
   if (error instanceof EntryQualityService.EntryQualityInputError) {
     const notFoundCodes = ['TRADE_NOT_FOUND', 'EVALUATION_NOT_FOUND', 'VERSION_NOT_FOUND'];
-    const status = error.code === 'EVALUATION_TERMINAL' || error.code === 'ENTRY_SETUP_REQUIRED'
+    const conflictCodes = [
+      'EVALUATION_TERMINAL',
+      'ENTRY_SETUP_REQUIRED',
+      'INTENDED_TRIGGER_IMMUTABLE',
+      'STALE_DEPENDENCY',
+      'STALE_SETUP_CONTEXT'
+    ];
+    const status = conflictCodes.includes(error.code)
       ? 409
       : notFoundCodes.includes(error.code)
         ? 404

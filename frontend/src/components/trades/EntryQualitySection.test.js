@@ -204,11 +204,26 @@ describe('EntryQualitySection', () => {
     expect(wrapper.find('[data-testid="setup-required"]').exists()).toBe(false)
     expect(wrapper.get('[data-testid="entry-score"]').text()).toBe('88')
     expect(wrapper.get('[data-testid="entry-breakout-session"]').text()).toBe('2026-03-10')
-    expect(wrapper.get('[data-testid="entry-intended-trigger"]').element.value).toBe('BO-PIVOT')
+    // The intended trigger is frozen once persisted: read-only, no editable
+    // selector that would imply relabelling is possible.
+    expect(wrapper.find('[data-testid="entry-intended-trigger"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="entry-intended-trigger-locked"]').text()).toContain('BO-PIVOT')
     // The persisted evaluation (which still carries the valid Setup result) was
     // loaded without any fresh prepare call.
     expect(mockStoreInstance.fetchEvaluations).toHaveBeenCalledWith('trade-1')
     expect(mockStoreInstance.prepare).not.toHaveBeenCalled()
+  })
+
+  it('shows an editable intended-trigger selector before it is established', async () => {
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([setupReadyEvaluation()])
+    mockStoreInstance.prepare.mockResolvedValue(preparedPayload())
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-entry"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="entry-intended-trigger"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="entry-intended-trigger-locked"]').exists()).toBe(false)
   })
 
   it('shows the first execution print distinctly and marks the actual initial stop UNKNOWN with a reference stop', async () => {

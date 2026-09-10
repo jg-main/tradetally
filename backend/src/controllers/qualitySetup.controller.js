@@ -14,7 +14,8 @@ const SetupQualityService = require('../services/quality/setupQualityService');
 function respondError(res, error) {
   if (error instanceof SetupQualityService.SetupQualityInputError) {
     const notFoundCodes = ['TRADE_NOT_FOUND', 'EVALUATION_NOT_FOUND', 'PROFILE_NOT_FOUND', 'VERSION_NOT_FOUND'];
-    const status = error.code === 'EVALUATION_TERMINAL'
+    const conflictCodes = ['EVALUATION_TERMINAL', 'STALE_SETUP_CONTEXT'];
+    const status = conflictCodes.includes(error.code)
       ? 409
       : notFoundCodes.includes(error.code)
         ? 404

@@ -71,6 +71,20 @@ describe('qualityEntry.controller', () => {
     const res2 = mockRes();
     await controller.evaluateEntryQuality(mockReq({ body: { evaluationId: 'e' } }), res2, jest.fn());
     expect(res2.status).toHaveBeenCalledWith(409);
+
+    EntryQualityService.evaluate.mockRejectedValue(
+      new EntryQualityService.EntryQualityInputError('frozen', 'INTENDED_TRIGGER_IMMUTABLE')
+    );
+    const res3 = mockRes();
+    await controller.evaluateEntryQuality(mockReq({ body: { evaluationId: 'e' } }), res3, jest.fn());
+    expect(res3.status).toHaveBeenCalledWith(409);
+
+    EntryQualityService.evaluate.mockRejectedValue(
+      new EntryQualityService.EntryQualityInputError('stale setup', 'STALE_SETUP_CONTEXT')
+    );
+    const res4 = mockRes();
+    await controller.evaluateEntryQuality(mockReq({ body: { evaluationId: 'e' } }), res4, jest.fn());
+    expect(res4.status).toHaveBeenCalledWith(409);
   });
 
   test('maps not-found errors to 404 and validation errors to 400', async () => {

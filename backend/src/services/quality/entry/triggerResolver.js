@@ -100,6 +100,11 @@ function resolveTrigger({
     triggerTimePrecision: null,
     entryPrintPrice: firstPrintPrice ?? null,
     entryPrintTime: isoOrNull(firstPrintEpoch),
+    // The execution print proves the user's fill was above the trigger; it does
+    // NOT prove this was the market's first crossing.
+    entryObservationAboveThreshold: null,
+    entryExecutionTime: isoOrNull(firstPrintEpoch),
+    entryExecutionPrice: isFiniteNumber(firstPrintPrice) ? firstPrintPrice : null,
     triggerCrossNumber: null,
     barsAboveThreshold: null,
     minutesAfterFirstTrigger: null,
@@ -197,10 +202,14 @@ function resolveTrigger({
         trigger_time_precision: crossing.triggerTimePrecision,
         first_cross_bar_open: crossing.firstCrossBarOpen,
         first_cross_bar_close: crossing.firstCrossBarClose,
+        observed_interval_only: crossing.observedIntervalOnly,
         trigger_cross_number: crossing.triggerCrossNumber,
         bars_above_threshold: crossing.barsAboveThreshold,
         trigger_cross_number_method: crossing.method,
         minutes_after_first_trigger: crossing.minutesAfterFirstTrigger,
+        entry_observation_above_threshold: crossing.entryObservationAboveThreshold,
+        entry_execution_time: isoOrNull(crossing.entryExecutionEpoch),
+        entry_execution_price: crossing.entryExecutionPrice,
         market_evidence_resolution: intraday ? intraday.resolution || '1min' : null
       }
     };
@@ -306,10 +315,14 @@ function resolveTrigger({
       trigger_time_precision: crossing.triggerTimePrecision,
       first_cross_bar_open: crossing.firstCrossBarOpen,
       first_cross_bar_close: crossing.firstCrossBarClose,
+      observed_interval_only: crossing.observedIntervalOnly,
       trigger_cross_number: crossing.triggerCrossNumber,
       bars_above_threshold: crossing.barsAboveThreshold,
       trigger_cross_number_method: crossing.method,
       minutes_after_first_trigger: crossing.minutesAfterFirstTrigger,
+      entry_observation_above_threshold: crossing.entryObservationAboveThreshold,
+      entry_execution_time: isoOrNull(crossing.entryExecutionEpoch),
+      entry_execution_price: crossing.entryExecutionPrice,
       market_evidence_resolution: intraday.resolution || '1min'
     }
   };
@@ -333,7 +346,7 @@ function pivotCrossingEvidence(intraday, session, firstPrintEpoch, threshold, fi
     (bar) => !session || (bar.time >= session.openEpoch && bar.time < session.closeEpoch)
   );
   const crossing = crossingEvidence(observable, threshold);
-  return finalizeCrossing(crossing, firstPrintEpoch, firstPrint > threshold);
+  return finalizeCrossing(crossing, firstPrintEpoch, firstPrint, firstPrint > threshold);
 }
 
 function orhCrossingEvidence(breakoutBars, session, firstPrintEpoch, threshold, resolutionSeconds, firstPrint) {
@@ -341,35 +354,34 @@ function orhCrossingEvidence(breakoutBars, session, firstPrintEpoch, threshold, 
     (bar) => !session || (bar.time >= session.openEpoch && bar.time < session.closeEpoch)
   );
   const crossing = crossingEvidence(observable, threshold);
-  return finalizeCrossing(crossing, firstPrintEpoch, firstPrint > threshold);
+  return finalizeCrossing(crossing, firstPrintEpoch, firstPrint, firstPrint > threshold);
 }
 
-function finalizeCrossing(crossing, entryPrintEpoch, passed) {
+// Never fabricates an exact first-market-crossing time/count. 1-minute OHLC
+// evidence can only bound a crossing to an interval; the execution print proves
+// the user's fill was above the trigger, not that the market had not already
+// traded above it earlier.
+function finalizeCrossing(crossing, entryPrintEpoch, entryPrintPrice, passed) {
   const firstCrossBar = crossing.firstCrossBar;
+  const entryObservationAboveThreshold = passed === true;
+  const entryExecutionEpoch = isFiniteNumber(entryPrintEpoch) ? entryPrintEpoch : null;
+  const entryExecutionPrice = isFiniteNumber(entryPrintPrice) ? entryPrintPrice : null;
   if (firstCrossBar) {
     return {
       barsAboveThreshold: crossing.barsAbove,
+      // Cross number is not knowable from OHLC.
       triggerCrossNumber: null,
+      // The actual first market crossing time is not knowable: only the interval.
       triggerTime: null,
       triggerTimePrecision: '1min_interval',
       firstCrossBarOpen: firstCrossBar.time,
       firstCrossBarClose: firstCrossBar.time + 60,
       minutesAfterFirstTrigger: null,
-      method: '1min_ohlc_interval_approximation'
-    };
-  }
-  if (passed) {
-    // The execution print itself is the first observed above-threshold trade:
-    // this is an exact execution timestamp (not a fabricated market crossing).
-    return {
-      barsAboveThreshold: 0,
-      triggerCrossNumber: 1,
-      triggerTime: entryPrintEpoch,
-      triggerTimePrecision: 'execution_timestamp',
-      firstCrossBarOpen: null,
-      firstCrossBarClose: null,
-      minutesAfterFirstTrigger: 0,
-      method: 'execution_print'
+      method: '1min_ohlc_interval_observation',
+      observedIntervalOnly: true,
+      entryObservationAboveThreshold,
+      entryExecutionEpoch,
+      entryExecutionPrice
     };
   }
   return {
@@ -380,7 +392,11 @@ function finalizeCrossing(crossing, entryPrintEpoch, passed) {
     firstCrossBarOpen: null,
     firstCrossBarClose: null,
     minutesAfterFirstTrigger: null,
-    method: null
+    method: null,
+    observedIntervalOnly: false,
+    entryObservationAboveThreshold,
+    entryExecutionEpoch,
+    entryExecutionPrice
   };
 }
 

@@ -195,11 +195,15 @@ function entryDependencyNeeds(entryConfig) {
 
   const initialStop = enabledCriterion(entryConfig, 'initial_stop');
   const bufferMethod = initialStop ? initialStop.parameters.minimum_buffer_method : null;
-  const needsDailyEvidence =
+  const needsVolatility =
     has('stop_width') ||
     has('entry_extension') ||
     bufferMethod === 'ATR_fraction' ||
     bufferMethod === 'ADR_fraction';
+  const needsReferenceSessions = has('volume_pace') || has('range_pace');
+  // Daily bars are needed both for the volatility reference AND to establish the
+  // historical same-time reference-session identity for pace criteria.
+  const needsDailyEvidence = needsVolatility || needsReferenceSessions;
 
   return {
     enabledKeys,
@@ -208,7 +212,8 @@ function entryDependencyNeeds(entryConfig) {
     needsTriggerIntraday,
     needsEntryIntraday,
     needsDailyEvidence,
-    needsReferenceSessions: has('volume_pace') || has('range_pace'),
+    needsVolatility,
+    needsReferenceSessions,
     has
   };
 }
@@ -399,28 +404,43 @@ function buildVolatilityByMethod({ methods, dailyBars, entryIndex, entryBasis, p
 // snapshot when it contains enough completed sessions before the entry session;
 // otherwise fetches Entry-specific daily evidence and appends it separately
 // (never replacing the Setup snapshot).
-async function resolveEntryDailyEvidence({ evaluation, trade, userId, entrySession, period }) {
+async function resolveEntryDailyEvidence({ evaluation, trade, userId, entrySession, requiredHistory }) {
   const snapshot = setupSnapshot(evaluation);
   const setupBars = normalizeDailyBars(Array.isArray(snapshot.bars) ? snapshot.bars : []);
-  const requiredHistory = period + 2;
   const setupIndexMap = indexByDate(setupBars);
   const setupIndex = entrySession && setupIndexMap.has(entrySession) ? setupIndexMap.get(entrySession) : -1;
+  const setupCompleteness = snapshot.completeness || 'unverified';
+  const history = Number.isInteger(requiredHistory) && requiredHistory > 0 ? requiredHistory : 2;
 
-  if (setupIndex >= requiredHistory) {
+  if (setupIndex >= history) {
     return {
       bars: setupBars,
       index: setupIndex,
       source: snapshot.source || 'setup_snapshot',
-      completeness: snapshot.completeness || 'unverified',
+      completeness: setupCompleteness,
+      // ADR/ATR may only be established from provider-verified daily evidence.
+      authoritative: setupCompleteness === 'verified',
       appended: false,
+      window: null,
+      entrySession,
       error: null
     };
   }
 
   const symbol = String((trade && trade.symbol) || '').trim().toUpperCase();
-  const fromDate = entrySession ? subtractDays(entrySession, period * 3 + 14) : null;
+  const fromDate = entrySession ? subtractDays(entrySession, history * 3 + 14) : null;
   if (!symbol || !fromDate) {
-    return { bars: setupBars, index: setupIndex, source: 'setup_snapshot', completeness: 'unverified', appended: false, error: 'no entry daily window' };
+    return {
+      bars: setupBars,
+      index: setupIndex,
+      source: 'setup_snapshot',
+      completeness: 'unverified',
+      authoritative: false,
+      appended: false,
+      window: null,
+      entrySession,
+      error: 'no entry daily window'
+    };
   }
   const loaded = await loadDailyEvidence({ symbol, userId, fromDate, toDate: entrySession });
   const bars = normalizeDailyBars(loaded.bars);
@@ -430,8 +450,12 @@ async function resolveEntryDailyEvidence({ evaluation, trade, userId, entrySessi
     bars,
     index,
     source: loaded.source,
-    completeness: loaded.completeness,
+    completeness: loaded.completeness || 'unverified',
+    // Cache-only/unverified evidence is never authoritative for ADR/ATR.
+    authoritative: loaded.completeness === 'verified' && index >= history,
     appended: true,
+    window: { fromDate, toDate: entrySession },
+    entrySession,
     error: loaded.error || null
   };
 }
@@ -559,7 +583,11 @@ function buildEntryEvidenceBlock({
       ? {
           source: entryDaily.source,
           completeness: entryDaily.completeness,
+          // Only provider-verified daily evidence may establish ADR/ATR.
+          authoritative: entryDaily.authoritative === true,
           appended: entryDaily.appended,
+          requested_window: entryDaily.window || null,
+          entry_session: entryDaily.entrySession || null,
           bars: entryDaily.bars ? entryDaily.bars.length : 0,
           entry_index: entryDaily.index,
           error: entryDaily.error || null
@@ -620,7 +648,10 @@ function buildEntryEvidenceBlock({
               period: value.period,
               dollars: value.dollars ?? null,
               pct: value.pct ?? null,
-              reason: value.reason || null
+              reason: value.reason || null,
+              // Exact per-session inputs used, to reproduce the ADR/ATR
+              // calculation deterministically.
+              sessions: Array.isArray(value.sessions) ? value.sessions : null
             }
           : null
       ])
@@ -687,6 +718,12 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
 
   const setupContext = getSetupContext(evaluation, needs);
   const executionEvidence = normalizeExecutionEvidence(trade);
+  const prepareInputs = parseJsonField(evaluation.user_inputs) || {};
+  const prepareDetected = parseJsonField(evaluation.detected_context) || {};
+  const establishedIntendedTrigger =
+    typeof prepareInputs.intended_trigger_type === 'string' && prepareInputs.intended_trigger_type
+      ? prepareInputs.intended_trigger_type
+      : null;
 
   const unavailableEvidence = [];
   if (!executionEvidence.available) unavailableEvidence.push('execution_evidence');
@@ -760,6 +797,16 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
       needsDailyEvidence: needs.needsDailyEvidence,
       needsReferenceSessions: needs.needsReferenceSessions
     },
+    intendedTrigger: {
+      value: establishedIntendedTrigger,
+      established: !!establishedIntendedTrigger,
+      assertedAt:
+        prepareDetected.entry &&
+        prepareDetected.entry.intended_trigger &&
+        prepareDetected.entry.intended_trigger.assertedAt
+          ? prepareDetected.entry.intended_trigger.assertedAt
+          : null
+    },
     allowedTriggerTypes: allowedTriggerTypesFromConfig(entryConfig),
     requiredEntryUserInputs: requiredEntryUserInputsFromConfig(entryConfig),
     entryCriterionKeys: enabledEntryCriteria(entryConfig).map((criterion) => criterion.key),
@@ -792,20 +839,73 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   const requiredInputs = requiredEntryUserInputsFromConfig(entryConfig);
   const allowedTypes = allowedTriggerTypesFromConfig(entryConfig);
   const raw = rawUserInputs && typeof rawUserInputs === 'object' ? rawUserInputs : {};
-  const intendedTriggerType = parseIntendedTriggerType(raw.intended_trigger_type, {
-    required: requiredInputs.includes('intended_trigger_type'),
-    allowedTypes
-  });
+
+  // Intended trigger is a frozen semantic assertion for this evaluation
+  // (finding 1): the first successful assertion is persisted; later reruns may
+  // repeat it or omit it (reuse), but a different value is rejected. Setup
+  // writes never erase it.
+  const storedInputs = parseJsonField(evaluation.user_inputs) || {};
+  const storedDetected = parseJsonField(evaluation.detected_context) || {};
+  const persistedIntendedTrigger =
+    typeof storedInputs.intended_trigger_type === 'string' && storedInputs.intended_trigger_type
+      ? storedInputs.intended_trigger_type
+      : null;
+  const requestedIntendedTrigger = raw.intended_trigger_type;
+  let intendedTriggerType;
+  let intendedTriggerAssertedAt = null;
+  if (persistedIntendedTrigger) {
+    if (
+      requestedIntendedTrigger === undefined ||
+      requestedIntendedTrigger === null ||
+      requestedIntendedTrigger === ''
+    ) {
+      intendedTriggerType = persistedIntendedTrigger;
+    } else if (requestedIntendedTrigger === persistedIntendedTrigger) {
+      intendedTriggerType = persistedIntendedTrigger;
+    } else {
+      throw new EntryQualityInputError(
+        `intended_trigger_type is immutable for this evaluation (already asserted as "${persistedIntendedTrigger}"). Create a new evaluation to use a different intended trigger.`,
+        'INTENDED_TRIGGER_IMMUTABLE',
+        { persisted: persistedIntendedTrigger, requested: requestedIntendedTrigger, allowedTypes }
+      );
+    }
+    intendedTriggerAssertedAt =
+      storedDetected.entry &&
+      storedDetected.entry.intended_trigger &&
+      storedDetected.entry.intended_trigger.assertedAt
+        ? storedDetected.entry.intended_trigger.assertedAt
+        : null;
+  } else {
+    intendedTriggerType = parseIntendedTriggerType(requestedIntendedTrigger, {
+      required: requiredInputs.includes('intended_trigger_type'),
+      allowedTypes
+    });
+  }
 
   const entrySessionDate = executionEvidence.actualEntrySession || null;
 
-  // Daily evidence (only when a volatility consumer is enabled).
-  const period = needs.needsDailyEvidence ? volatilityPeriod(entryConfig) : null;
+  // Daily evidence. Volatility authority requires VERIFIED provider evidence;
+  // pace criteria also need the daily session identity for reference sessions.
+  const volumeCriterion = enabledCriterion(entryConfig, 'volume_pace');
+  const rangeCriterion = enabledCriterion(entryConfig, 'range_pace');
+  const referenceCount = Math.max(
+    volumeCriterion ? volumeCriterion.parameters.reference_sessions : 0,
+    rangeCriterion ? rangeCriterion.parameters.reference_sessions : 0
+  );
+  const period = needs.needsVolatility ? volatilityPeriod(entryConfig) : null;
+  const requiredDailyHistory = Math.max(period || 0, referenceCount || 0) + 2;
   const entryDaily = needs.needsDailyEvidence
-    ? await resolveEntryDailyEvidence({ evaluation, trade, userId, entrySession: entrySessionDate, period })
+    ? await resolveEntryDailyEvidence({
+        evaluation,
+        trade,
+        userId,
+        entrySession: entrySessionDate,
+        requiredHistory: requiredDailyHistory
+      })
     : null;
   const dailyBars = entryDaily ? entryDaily.bars : [];
   const entryIndex = entryDaily ? entryDaily.index : -1;
+  const dailyAuthoritative = !!(entryDaily && entryDaily.authoritative);
 
   // Intraday evidence: breakout session (trigger) and actual entry session
   // (pace/LOD) are loaded SEPARATELY and never mixed (finding 9).
@@ -820,14 +920,17 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     : [];
 
   const stopEvidence = resolveStopEvidence({ trade, executionEvidence });
-  const methods = neededVolatilityMethods(entryConfig);
-  const volatilityByMethod = buildVolatilityByMethod({
-    methods,
-    dailyBars,
-    entryIndex,
-    entryBasis: executionEvidence.entryBasis,
-    period
-  });
+  const methods = needs.needsVolatility ? neededVolatilityMethods(entryConfig) : new Set();
+  const volatilityByMethod =
+    needs.needsVolatility && dailyAuthoritative
+      ? buildVolatilityByMethod({
+          methods,
+          dailyBars,
+          entryIndex,
+          entryBasis: executionEvidence.entryBasis,
+          period
+        })
+      : {};
 
   const initialStopCriterion = enabledCriterion(entryConfig, 'initial_stop');
   const buffer = initialStopCriterion
@@ -869,12 +972,6 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     lod.reason = 'Entry-session intraday evidence is unavailable.';
   }
 
-  const volumeCriterion = enabledCriterion(entryConfig, 'volume_pace');
-  const rangeCriterion = enabledCriterion(entryConfig, 'range_pace');
-  const referenceCount = Math.max(
-    volumeCriterion ? volumeCriterion.parameters.reference_sessions : 0,
-    rangeCriterion ? rangeCriterion.parameters.reference_sessions : 0
-  );
   const referenceSessions = entryIntraday && entryIntraday.available
     ? await loadReferenceSessions({ symbol, userId, dailyBars, entryIndex, count: referenceCount })
     : [];
@@ -968,8 +1065,6 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   const criterionRows = buildEntryCriterionRows(entryConfig, context);
 
   const storedSnapshot = parseJsonField(evaluation.evidence_snapshot) || {};
-  const storedInputs = parseJsonField(evaluation.user_inputs) || {};
-  const storedDetected = parseJsonField(evaluation.detected_context) || {};
 
   const entryEvidenceBlock = buildEntryEvidenceBlock({
     executionEvidence,
@@ -1003,7 +1098,11 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       evaluatedAt: new Date().toISOString(),
       allowed_trigger_types: allowedTypes,
       intended_trigger: intendedTriggerType
-        ? { value: intendedTriggerType, source: 'user_asserted' }
+        ? {
+            value: intendedTriggerType,
+            source: 'user_asserted',
+            assertedAt: intendedTriggerAssertedAt || new Date().toISOString()
+          }
         : null,
       breakout_session: setupContext.breakoutSession,
       actual_entry_session: executionEvidence.actualEntrySession,
@@ -1054,6 +1153,7 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       entryBasis: executionEvidence.entryBasis,
       originalPositionQty: executionEvidence.originalPositionQty,
       intendedTriggerType,
+      intendedTriggerEstablished: true,
       effectiveTrigger: triggerResolution ? triggerResolution.effectiveTrigger : null,
       initialR
     }

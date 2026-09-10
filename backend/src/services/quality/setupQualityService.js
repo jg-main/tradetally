@@ -33,8 +33,14 @@ const {
   createEvaluation,
   saveSetupProgress,
   getEvaluation,
+  summariesFromResults,
   EVALUATION_COLUMNS
 } = require('./evaluationService');
+const {
+  applyDownstreamState,
+  nextContextRevision,
+  SETUP_CONTEXT_REVISION_KEY
+} = require('./downstreamState');
 const profileService = require('./profileService');
 const { loadDailyEvidence } = require('./marketEvidenceService');
 const { normalizeDailyBars, indexByDate, addCalendarDays, calendarDaysForSessions } = require('./dailyEvidence');
@@ -759,45 +765,99 @@ const CLEARABLE_DIMENSIONS = Object.freeze(['setup', 'entry', 'management']);
 
 async function persistPrepareContext(evaluationId, userId, payload) {
   const db = require('../../config/database');
-  const clearDimensions = (Array.isArray(payload.clearDimensions) ? payload.clearDimensions : [])
-    .filter((dimension) => CLEARABLE_DIMENSIONS.includes(dimension));
-  const params = [
-    evaluationId,
-    userId,
-    payload.evidenceSnapshot,
-    payload.detectedContext,
-    payload.userInputs
-  ];
-  let setClause = `
-      evidence_snapshot = $3,
-      detected_context = $4,
-      user_inputs = $5`;
-  if (clearDimensions.length > 0) {
-    setClause += `,
-      results = $6`;
-    for (const dimension of clearDimensions) {
-      setClause += `,
-      ${dimension}_score = NULL,
-      ${dimension}_grade = NULL,
-      ${dimension}_compliance = NULL,
-      ${dimension}_coverage = NULL`;
-    }
-    params.push(payload.preservedResults ?? null);
+  const mode = payload.mode === 'invalidate' ? 'invalidate' : 'preserve';
+  const existingDetected =
+    payload.existingDetectedContext && typeof payload.existingDetectedContext === 'object'
+      ? payload.existingDetectedContext
+      : {};
+
+  // Setup compare-and-swap (finding 3): the token is the revision the caller
+  // read before doing provider/detection work. A stale write must fail rather
+  // than overwrite a newer context and resurrect invalidated downstream state.
+  const existingRevision = existingDetected[SETUP_CONTEXT_REVISION_KEY] ?? null;
+  const expectedRevision =
+    payload.expectedSetupRevision !== undefined ? payload.expectedSetupRevision : existingRevision;
+  if (String(expectedRevision ?? '') !== String(existingRevision ?? '')) {
+    throw new SetupQualityInputError(
+      'Setup context is stale: it changed after this request read it. Re-run Setup prepare.',
+      'STALE_SETUP_CONTEXT'
+    );
   }
+  const nextRevision = nextContextRevision(expectedRevision);
+
+  const merged = applyDownstreamState({
+    mode,
+    existing: {
+      results: payload.existingResults,
+      evidenceSnapshot: payload.existingEvidenceSnapshot,
+      detectedContext: existingDetected,
+      userInputs: payload.existingUserInputs
+    },
+    next: {
+      results: payload.results,
+      evidenceSnapshot: payload.evidenceSnapshot,
+      detectedContext: {
+        ...(payload.detectedContext && typeof payload.detectedContext === 'object'
+          ? payload.detectedContext
+          : {}),
+        [SETUP_CONTEXT_REVISION_KEY]: nextRevision
+      },
+      userInputs: payload.userInputs
+    }
+  });
+  const summaries = summariesFromResults(merged.results || {});
+
   const updated = await db.query(
     `
       UPDATE trade_quality_evaluations
-      SET ${setClause}
+      SET
+        results = $3,
+        evidence_snapshot = $4,
+        user_inputs = $5,
+        detected_context = $6,
+        setup_score = $7,
+        setup_grade = $8,
+        setup_compliance = $9,
+        setup_coverage = $10,
+        entry_score = $11,
+        entry_grade = $12,
+        entry_compliance = $13,
+        entry_coverage = $14,
+        management_score = $15,
+        management_grade = $16,
+        management_compliance = $17,
+        management_coverage = $18
       WHERE id = $1 AND user_id = $2
         AND status NOT IN ('completed', 'insufficient_data')
+        AND COALESCE(detected_context->>'${SETUP_CONTEXT_REVISION_KEY}', '') = $19
       RETURNING ${EVALUATION_COLUMNS}
     `,
-    params
+    [
+      evaluationId,
+      userId,
+      merged.results === null ? null : JSON.stringify(merged.results),
+      merged.evidenceSnapshot,
+      merged.userInputs,
+      merged.detectedContext,
+      summaries.setup_score,
+      summaries.setup_grade,
+      summaries.setup_compliance,
+      summaries.setup_coverage,
+      summaries.entry_score,
+      summaries.entry_grade,
+      summaries.entry_compliance,
+      summaries.entry_coverage,
+      summaries.management_score,
+      summaries.management_grade,
+      summaries.management_compliance,
+      summaries.management_coverage,
+      expectedRevision ?? ''
+    ]
   );
   if (updated.rows.length === 0) {
     throw new SetupQualityInputError(
-      'Evaluation could not be updated (it may have reached a terminal state).',
-      'EVALUATION_TERMINAL'
+      'Setup context could not be updated because it changed or reached a terminal state. Re-run Setup prepare/evaluate.',
+      'STALE_SETUP_CONTEXT'
     );
   }
   return updated.rows[0];
@@ -1040,26 +1100,29 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
   // Setup, Entry (breakout/effective trigger/Initial R), and Management
   // (future Initial R consumers). The context write and the cascade clear are
   // atomic (single UPDATE in persistPrepareContext).
-  const clearDimensions = hasSetupResult && contextChanged
-    ? ['setup', 'entry', 'management']
-    : [];
-
   // A STRUCTURAL Base Start date change invalidates any previously confirmed
   // Pivot: never leave an old pivot confirmation in the persisted user_inputs.
   // A provenance-only change (same date, different source) keeps the pivot
   // confirmation structurally valid (it was derived under the same date).
   if (baseStartDateChanged) {
-    delete userInputs.pivot;
+    userInputs.pivot = null;
   }
 
+  const expectedSetupRevision = storedDetected
+    ? storedDetected[SETUP_CONTEXT_REVISION_KEY] ?? null
+    : null;
+
   const finalRow = await persistPrepareContext(evaluation.id, userId, {
+    mode: contextChanged ? 'invalidate' : 'preserve',
+    results: contextChanged ? { setup: null } : undefined,
     evidenceSnapshot,
     detectedContext,
     userInputs,
-    clearDimensions,
-    preservedResults: clearDimensions.length > 0
-      ? invalidateResultDimensions(evaluation.results, clearDimensions)
-      : undefined
+    existingResults: parseJsonField(evaluation.results, 'results'),
+    existingEvidenceSnapshot: storedSnapshot,
+    existingDetectedContext: storedDetected,
+    existingUserInputs,
+    expectedSetupRevision
   });
 
   return {
@@ -1631,12 +1694,24 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     };
   }
 
-  const updated = await saveSetupProgress(evaluationId, userId, {
-    setupResults: { criterionResults: criterionRows },
-    evidenceSnapshot,
-    userInputs: storedUserInputs,
-    detectedContext
-  });
+  const expectedSetupRevision = storedDetections
+    ? storedDetections[SETUP_CONTEXT_REVISION_KEY] ?? null
+    : null;
+  let updated;
+  try {
+    updated = await saveSetupProgress(evaluationId, userId, {
+      setupResults: { criterionResults: criterionRows },
+      evidenceSnapshot,
+      userInputs: storedUserInputs,
+      detectedContext,
+      expectedSetupRevision
+    });
+  } catch (error) {
+    if (error && error.code === 'STALE_SETUP_CONTEXT') {
+      throw new SetupQualityInputError(error.message, 'STALE_SETUP_CONTEXT');
+    }
+    throw error;
+  }
   if (!updated) {
     throw new SetupQualityInputError(
       'Evaluation could not be updated (it may have reached a terminal state).',
