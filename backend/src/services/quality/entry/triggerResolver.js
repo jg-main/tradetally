@@ -336,9 +336,11 @@ function breakoutIntradayBars(intraday, breakoutSession) {
   return Array.isArray(intraday.breakoutSessionBars) ? intraday.breakoutSessionBars : null;
 }
 
-// Crossing evidence for BO-PIVOT. A crossing is only "established" as a number
-// when an actual execution print is the first observed crossing; otherwise the
-// bar evidence is retained with 1min precision and no fabricated cross count.
+// Crossing evidence for BO-PIVOT. An execution print proves the trader's own
+// fill was above the trigger; it does NOT prove the market's first above-trigger
+// trade, so no trigger_cross_number/trigger_time is exposed from it. Only the
+// observed 1-minute interval bounds are retained (no fabricated cross count,
+// no fabricated exact crossing timestamp).
 function pivotCrossingEvidence(intraday, session, firstPrintEpoch, threshold, firstPrint) {
   const bars = breakoutIntradayBars(intraday, session ? session.date : null) || [];
   const resolutionSeconds = intraday ? intraday.resolutionSeconds || 60 : 60;

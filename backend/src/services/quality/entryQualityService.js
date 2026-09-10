@@ -227,6 +227,14 @@ function requiredEntryUserInputsFromConfig(entryConfig) {
 }
 
 function allowedTriggerTypesFromConfig(entryConfig) {
+  const enabledKeys = enabledEntryCriteria(entryConfig).map((criterion) => criterion.key);
+  const triggerConsumed = enabledKeys.some(
+    (key) => key === 'trigger_compliance' || key === 'entry_extension'
+  );
+  // Criterion-driven (finding 4): a profile with no trigger-consuming criterion
+  // does not need a trigger policy owner block at all.
+  if (!triggerConsumed) return [];
+
   const criterion = entryConfig.criteria.find((entry) => entry.key === 'trigger_compliance');
   const allowed =
     criterion && criterion.parameters && Array.isArray(criterion.parameters.allowed_types)
@@ -720,10 +728,19 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
   const executionEvidence = normalizeExecutionEvidence(trade);
   const prepareInputs = parseJsonField(evaluation.user_inputs) || {};
   const prepareDetected = parseJsonField(evaluation.detected_context) || {};
-  const establishedIntendedTrigger =
-    typeof prepareInputs.intended_trigger_type === 'string' && prepareInputs.intended_trigger_type
-      ? prepareInputs.intended_trigger_type
+  const prepareImmutableTrigger =
+    prepareInputs.immutable_semantic_context &&
+    prepareInputs.immutable_semantic_context.intended_trigger &&
+    typeof prepareInputs.immutable_semantic_context.intended_trigger.value === 'string'
+      ? prepareInputs.immutable_semantic_context.intended_trigger
       : null;
+  const establishedIntendedTrigger =
+    (prepareImmutableTrigger && prepareImmutableTrigger.value) ||
+    (typeof prepareInputs.intended_trigger_type === 'string' && prepareInputs.intended_trigger_type
+      ? prepareInputs.intended_trigger_type
+      : null) ||
+    null;
+  const prepareRequiredInputs = requiredEntryUserInputsFromConfig(entryConfig);
 
   const unavailableEvidence = [];
   if (!executionEvidence.available) unavailableEvidence.push('execution_evidence');
@@ -801,14 +818,16 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
       value: establishedIntendedTrigger,
       established: !!establishedIntendedTrigger,
       assertedAt:
-        prepareDetected.entry &&
-        prepareDetected.entry.intended_trigger &&
-        prepareDetected.entry.intended_trigger.assertedAt
-          ? prepareDetected.entry.intended_trigger.assertedAt
-          : null
+        (prepareImmutableTrigger && prepareImmutableTrigger.asserted_at) ||
+        (prepareDetected.entry &&
+          prepareDetected.entry.intended_trigger &&
+          prepareDetected.entry.intended_trigger.assertedAt) ||
+        null
     },
-    allowedTriggerTypes: allowedTriggerTypesFromConfig(entryConfig),
-    requiredEntryUserInputs: requiredEntryUserInputsFromConfig(entryConfig),
+    allowedTriggerTypes: prepareRequiredInputs.includes('intended_trigger_type')
+      ? allowedTriggerTypesFromConfig(entryConfig)
+      : [],
+    requiredEntryUserInputs: prepareRequiredInputs,
     entryCriterionKeys: enabledEntryCriteria(entryConfig).map((criterion) => criterion.key),
     unavailableEvidence
   };
@@ -837,30 +856,41 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   const symbol = String(trade.symbol || '').trim().toUpperCase();
 
   const requiredInputs = requiredEntryUserInputsFromConfig(entryConfig);
-  const allowedTypes = allowedTriggerTypesFromConfig(entryConfig);
+  // Trigger policy is criterion-driven (finding 4): only consult/validate the
+  // trigger policy owner block when an enabled criterion actually consumes it.
+  const triggerConsumed = requiredInputs.includes('intended_trigger_type');
+  const allowedTypes = triggerConsumed ? allowedTriggerTypesFromConfig(entryConfig) : [];
   const raw = rawUserInputs && typeof rawUserInputs === 'object' ? rawUserInputs : {};
 
   // Intended trigger is a frozen semantic assertion for this evaluation
-  // (finding 1): the first successful assertion is persisted; later reruns may
-  // repeat it or omit it (reuse), but a different value is rejected. Setup
-  // writes never erase it.
+  // (finding 1/2): the first successful assertion is persisted (atomically, via
+  // the saveEntryProgress CAS); later reruns may repeat it or omit it (reuse),
+  // but a different value is rejected. Setup writes never erase it.
   const storedInputs = parseJsonField(evaluation.user_inputs) || {};
   const storedDetected = parseJsonField(evaluation.detected_context) || {};
-  const persistedIntendedTrigger =
-    typeof storedInputs.intended_trigger_type === 'string' && storedInputs.intended_trigger_type
-      ? storedInputs.intended_trigger_type
+  const storedImmutableTrigger =
+    storedInputs.immutable_semantic_context &&
+    storedInputs.immutable_semantic_context.intended_trigger &&
+    typeof storedInputs.immutable_semantic_context.intended_trigger.value === 'string'
+      ? storedInputs.immutable_semantic_context.intended_trigger
       : null;
+  const persistedIntendedTrigger =
+    storedImmutableTrigger && storedImmutableTrigger.value
+      ? storedImmutableTrigger.value
+      : (typeof storedInputs.intended_trigger_type === 'string' && storedInputs.intended_trigger_type
+          ? storedInputs.intended_trigger_type
+          : null);
   const requestedIntendedTrigger = raw.intended_trigger_type;
-  let intendedTriggerType;
+  let intendedTriggerType = null;
+  let intendedTriggerMode = 'none';
   let intendedTriggerAssertedAt = null;
   if (persistedIntendedTrigger) {
     if (
       requestedIntendedTrigger === undefined ||
       requestedIntendedTrigger === null ||
-      requestedIntendedTrigger === ''
+      requestedIntendedTrigger === '' ||
+      requestedIntendedTrigger === persistedIntendedTrigger
     ) {
-      intendedTriggerType = persistedIntendedTrigger;
-    } else if (requestedIntendedTrigger === persistedIntendedTrigger) {
       intendedTriggerType = persistedIntendedTrigger;
     } else {
       throw new EntryQualityInputError(
@@ -869,17 +899,19 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
         { persisted: persistedIntendedTrigger, requested: requestedIntendedTrigger, allowedTypes }
       );
     }
+    intendedTriggerMode = 'preserve';
     intendedTriggerAssertedAt =
-      storedDetected.entry &&
-      storedDetected.entry.intended_trigger &&
-      storedDetected.entry.intended_trigger.assertedAt
-        ? storedDetected.entry.intended_trigger.assertedAt
-        : null;
-  } else {
+      (storedImmutableTrigger && storedImmutableTrigger.asserted_at) ||
+      (storedDetected.entry &&
+        storedDetected.entry.intended_trigger &&
+        storedDetected.entry.intended_trigger.assertedAt) ||
+      null;
+  } else if (triggerConsumed) {
     intendedTriggerType = parseIntendedTriggerType(requestedIntendedTrigger, {
-      required: requiredInputs.includes('intended_trigger_type'),
+      required: true,
       allowedTypes
     });
+    intendedTriggerMode = intendedTriggerType ? 'establish' : 'none';
   }
 
   const entrySessionDate = executionEvidence.actualEntrySession || null;
@@ -972,9 +1004,35 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     lod.reason = 'Entry-session intraday evidence is unavailable.';
   }
 
-  const referenceSessions = entryIntraday && entryIntraday.available
-    ? await loadReferenceSessions({ symbol, userId, dailyBars, entryIndex, count: referenceCount })
-    : [];
+  // Historical pace references must be selected from AUTHORITATIVE daily
+  // session identity (finding 3). A cache-only/unverified daily series cannot
+  // establish the configured previous-N regular sessions, so Volume/Range Pace
+  // become UNKNOWN rather than scoring against arbitrary cached dates.
+  const paceReferenceIdentityVerified = dailyAuthoritative;
+  const paceIdentityUnavailable = (criterion, kind) => ({
+    available: false,
+    kind,
+    today: null,
+    expected: null,
+    pace: null,
+    usableSessions: 0,
+    requiredSessions: criterion.parameters.reference_sessions,
+    elapsedSeconds:
+      entrySession && isFiniteNumber(executionEvidence.initialEntryEpoch)
+        ? executionEvidence.initialEntryEpoch - entrySession.openEpoch
+        : null,
+    cutoffEpoch: isFiniteNumber(executionEvidence.initialEntryEpoch)
+      ? executionEvidence.initialEntryEpoch
+      : null,
+    referenceCutoffs: [],
+    precision: null,
+    reason: 'historical reference-session identity could not be verified'
+  });
+
+  const referenceSessions =
+    entryIntraday && entryIntraday.available && paceReferenceIdentityVerified
+      ? await loadReferenceSessions({ symbol, userId, dailyBars, entryIndex, count: referenceCount })
+      : [];
 
   let volumePace = null;
   let rangePace = null;
@@ -982,25 +1040,29 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   if (entryIntraday && entryIntraday.available && entrySession && isFiniteNumber(executionEvidence.initialEntryEpoch)) {
     const entryCutoffEpoch = executionEvidence.initialEntryEpoch;
     if (volumeCriterion) {
-      volumePace = computePaceMetric({
-        entrySession,
-        entrySessionBars: entryIntraday.bars,
-        entryCutoffEpoch,
-        referenceSessions,
-        requiredSessions: volumeCriterion.parameters.reference_sessions,
-        kind: 'volume'
-      });
+      volumePace = paceReferenceIdentityVerified
+        ? computePaceMetric({
+            entrySession,
+            entrySessionBars: entryIntraday.bars,
+            entryCutoffEpoch,
+            referenceSessions,
+            requiredSessions: volumeCriterion.parameters.reference_sessions,
+            kind: 'volume'
+          })
+        : paceIdentityUnavailable(volumeCriterion, 'volume');
     }
     if (rangeCriterion) {
-      rangePace = computePaceMetric({
-        entrySession,
-        entrySessionBars: entryIntraday.bars,
-        entryCutoffEpoch,
-        referenceSessions,
-        requiredSessions: rangeCriterion.parameters.reference_sessions,
-        kind: 'range',
-        extraObservations
-      });
+      rangePace = paceReferenceIdentityVerified
+        ? computePaceMetric({
+            entrySession,
+            entrySessionBars: entryIntraday.bars,
+            entryCutoffEpoch,
+            referenceSessions,
+            requiredSessions: rangeCriterion.parameters.reference_sessions,
+            kind: 'range',
+            extraObservations
+          })
+        : paceIdentityUnavailable(rangeCriterion, 'range');
       const adr = volatilityByMethod.ADR;
       if (rangePace && rangePace.available && adr && adr.available && adr.dollars > 0) {
         rangeAtEntryOverAdr = rangePace.today / adr.dollars;
@@ -1064,8 +1126,6 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
 
   const criterionRows = buildEntryCriterionRows(entryConfig, context);
 
-  const storedSnapshot = parseJsonField(evaluation.evidence_snapshot) || {};
-
   const entryEvidenceBlock = buildEntryEvidenceBlock({
     executionEvidence,
     setupContext,
@@ -1081,50 +1141,52 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     referenceSessions
   });
 
-  const evidenceSnapshot = {
-    ...storedSnapshot,
-    entry: entryEvidenceBlock
-  };
-
-  const storedUserInputs = { ...storedInputs };
-  if (intendedTriggerType) {
-    storedUserInputs.intended_trigger_type = intendedTriggerType;
-  }
-
-  const detectedContext = {
-    ...storedDetected,
-    version: 2,
-    entry: {
-      evaluatedAt: new Date().toISOString(),
-      allowed_trigger_types: allowedTypes,
-      intended_trigger: intendedTriggerType
-        ? {
-            value: intendedTriggerType,
-            source: 'user_asserted',
-            assertedAt: intendedTriggerAssertedAt || new Date().toISOString()
-          }
-        : null,
-      breakout_session: setupContext.breakoutSession,
-      actual_entry_session: executionEvidence.actualEntrySession,
-      setup_boundary_source: setupContext.boundarySource,
-      initial_r: initialR
-    }
+  // Derived Entry detected-context block. The immutable trigger provenance is
+  // NOT stored here (Setup invalidation clears detected_context.entry); it
+  // lives in user_inputs.immutable_semantic_context, managed by
+  // saveEntryProgress.
+  const entryDetectedContext = {
+    evaluatedAt: new Date().toISOString(),
+    allowed_trigger_types: allowedTypes,
+    intended_trigger: intendedTriggerType
+      ? {
+          value: intendedTriggerType,
+          source: 'user_asserted',
+          assertedAt: intendedTriggerAssertedAt || new Date().toISOString()
+        }
+      : null,
+    breakout_session: setupContext.breakoutSession,
+    actual_entry_session: executionEvidence.actualEntrySession,
+    setup_boundary_source: setupContext.boundarySource,
+    initial_r: initialR
   };
 
   const dependencyFingerprint = computeEntryDependencyFingerprint(evaluation);
 
   let updated;
   try {
+    // Entry persists ONLY Entry-owned state; saveEntryProgress merges it into
+    // the CURRENT DB Setup state (finding 1) and CAS-guards fingerprint +
+    // revision + intended trigger (findings 1/2).
     updated = await saveEntryProgress(evaluationId, userId, {
       entryResults: { criterionResults: criterionRows },
-      evidenceSnapshot,
-      userInputs: storedUserInputs,
-      detectedContext,
-      dependencyFingerprint
+      entryEvidence: entryEvidenceBlock,
+      entryDetectedContext,
+      dependencyFingerprint,
+      intendedTrigger: {
+        mode: intendedTriggerMode,
+        value: intendedTriggerType,
+        assertedAt: intendedTriggerAssertedAt
+      }
     });
   } catch (error) {
-    if (error && error.code === 'STALE_DEPENDENCY') {
-      throw new EntryQualityInputError(error.message, 'STALE_DEPENDENCY');
+    if (
+      error &&
+      (error.code === 'STALE_DEPENDENCY' ||
+        error.code === 'INTENDED_TRIGGER_IMMUTABLE' ||
+        error.code === 'STALE_SETUP_CONTEXT')
+    ) {
+      throw new EntryQualityInputError(error.message, error.code);
     }
     throw error;
   }

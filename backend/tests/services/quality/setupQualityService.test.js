@@ -1177,7 +1177,17 @@ describe('Setup downstream-state coherence + CAS (Phase 3 follow-up)', () => {
         setup_context_revision: '5',
         entry: { probe: 'entry-context' }
       },
-      user_inputs: { ...(existingDraft.user_inputs || {}), intended_trigger_type: 'BO-PIVOT' }
+      user_inputs: {
+        ...(existingDraft.user_inputs || {}),
+        intended_trigger_type: 'BO-PIVOT',
+        immutable_semantic_context: {
+          intended_trigger: {
+            value: 'BO-PIVOT',
+            source: 'user_asserted',
+            asserted_at: '2026-03-10T14:00:00.000Z'
+          }
+        }
+      }
     };
   }
 
@@ -1190,6 +1200,9 @@ describe('Setup downstream-state coherence + CAS (Phase 3 follow-up)', () => {
     expect(reprepared.evaluation.evidence_snapshot.entry).toEqual({ probe: 'entry-evidence' });
     expect(reprepared.evaluation.detected_context.entry).toEqual({ probe: 'entry-context' });
     expect(reprepared.evaluation.user_inputs.intended_trigger_type).toBe('BO-PIVOT');
+    expect(
+      reprepared.evaluation.user_inputs.immutable_semantic_context.intended_trigger.asserted_at
+    ).toBe('2026-03-10T14:00:00.000Z');
     // The Setup dependency fingerprint (the token that gates downstream
     // preservation) is NOT dropped by an unchanged Prepare write.
     expect(reprepared.evaluation.detected_context.setup_dependency_fingerprint).toBe('FP');
@@ -1207,8 +1220,16 @@ describe('Setup downstream-state coherence + CAS (Phase 3 follow-up)', () => {
     expect(reprepared.evaluation.results.entry).toBeNull();
     expect(reprepared.evaluation.evidence_snapshot.entry).toBeUndefined();
     expect(reprepared.evaluation.detected_context.entry).toBeUndefined();
-    // The historical semantic assertion is NOT derived downstream state.
+    // The historical semantic assertion is NOT derived downstream state: both
+    // the value AND its original provenance survive the invalidation.
     expect(reprepared.evaluation.user_inputs.intended_trigger_type).toBe('BO-PIVOT');
+    expect(
+      reprepared.evaluation.user_inputs.immutable_semantic_context.intended_trigger
+    ).toEqual({
+      value: 'BO-PIVOT',
+      source: 'user_asserted',
+      asserted_at: '2026-03-10T14:00:00.000Z'
+    });
   });
 
   test('a stale Setup Prepare write is rejected with STALE_SETUP_CONTEXT', async () => {

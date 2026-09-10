@@ -155,9 +155,9 @@ beforeEach(() => {
     profile_version_id: VERSION_ID,
     status: 'draft',
     results: { setup: evaluationRow().results.setup, entry: { score: 95 }, management: null },
-    evidence_snapshot: data.evidenceSnapshot,
-    user_inputs: data.userInputs,
-    detected_context: data.detectedContext
+    evidence_snapshot: { entry: data.entryEvidence },
+    user_inputs: { intended_trigger_type: data.intendedTrigger ? data.intendedTrigger.value : null },
+    detected_context: { entry: data.entryDetectedContext }
   }));
   loadDailyEvidence.mockResolvedValue({ bars: DAILY_BARS, source: 'finnhub', completeness: 'verified', error: null });
   loadSessionIntradayBars.mockImplementation(async (symbol, sessionDate) => {
@@ -212,13 +212,12 @@ describe('EntryQualityService (hardened)', () => {
     expect(byKey.get('entry_extension').status).toBe('PASS');
 
     // First print vs Entry Basis remain distinct in the persisted snapshot.
-    expect(data.evidenceSnapshot.entry.execution.entry_basis).toBeCloseTo(105.5, 12);
-    expect(data.evidenceSnapshot.entry.execution.initial_entry_fill_price).toBe(101);
-    expect(data.evidenceSnapshot.entry.stop.reference_stop.price).toBe(99);
-    expect(data.evidenceSnapshot.entry.initial_r.available).toBe(false);
-    expect(data.evidenceSnapshot.bars).toEqual(DAILY_BARS);
+    expect(data.entryEvidence.execution.entry_basis).toBeCloseTo(105.5, 12);
+    expect(data.entryEvidence.execution.initial_entry_fill_price).toBe(101);
+    expect(data.entryEvidence.stop.reference_stop.price).toBe(99);
+    expect(data.entryEvidence.initial_r.available).toBe(false);
     // F9: breakout-session evidence is recorded separately from the entry session.
-    expect(data.evidenceSnapshot.entry.intraday.breakout_session.session).toBe(ENTRY_SESSION);
+    expect(data.entryEvidence.intraday.breakout_session.session).toBe(ENTRY_SESSION);
 
     expect(payload.entry.initialEntryFillPrice).toBe(101);
     expect(payload.entry.entryBasis).toBeCloseTo(105.5, 12);
@@ -258,8 +257,7 @@ describe('EntryQualityService (hardened)', () => {
     // Entry-specific daily evidence was fetched separately (Setup snapshot empty).
     expect(loadDailyEvidence).toHaveBeenCalled();
     const data = evaluationService.saveEntryProgress.mock.calls[0][2];
-    expect(data.evidenceSnapshot.entry.entry_daily.appended).toBe(true);
-    expect(data.evidenceSnapshot.bars).toEqual([]);
+    expect(data.entryEvidence.entry_daily.appended).toBe(true);
     expect(data.entryResults.criterionResults.map((row) => row.key)).toEqual(['stop_width']);
   });
 
@@ -280,10 +278,10 @@ describe('EntryQualityService — intended trigger immutability (finding 1)', ()
       userInputs: { intended_trigger_type: 'BO-PIVOT' }
     });
     const data = evaluationService.saveEntryProgress.mock.calls[0][2];
-    expect(data.userInputs.intended_trigger_type).toBe('BO-PIVOT');
-    expect(data.detectedContext.entry.intended_trigger.value).toBe('BO-PIVOT');
-    expect(data.detectedContext.entry.intended_trigger.source).toBe('user_asserted');
-    expect(data.detectedContext.entry.intended_trigger.assertedAt).toBeTruthy();
+    expect(data.intendedTrigger.value).toBe('BO-PIVOT');
+    expect(data.entryDetectedContext.intended_trigger.value).toBe('BO-PIVOT');
+    expect(data.entryDetectedContext.intended_trigger.source).toBe('user_asserted');
+    expect(data.entryDetectedContext.intended_trigger.assertedAt).toBeTruthy();
   });
 
   test('repeating the same assertion is allowed', async () => {
@@ -316,8 +314,8 @@ describe('EntryQualityService — intended trigger immutability (finding 1)', ()
       userInputs: {}
     });
     const data = evaluationService.saveEntryProgress.mock.calls[0][2];
-    expect(data.userInputs.intended_trigger_type).toBe('BO-ORH-5');
-    expect(data.detectedContext.entry.intended_trigger.value).toBe('BO-ORH-5');
+    expect(data.intendedTrigger.value).toBe('BO-ORH-5');
+    expect(data.entryDetectedContext.intended_trigger.value).toBe('BO-ORH-5');
   });
 
   test('a different assertion is rejected and no Entry write occurs', async () => {
@@ -345,7 +343,7 @@ describe('EntryQualityService — intended trigger immutability (finding 1)', ()
       userInputs: { intended_trigger_type: 'BO-ORH-60' }
     });
     const data = evaluationService.saveEntryProgress.mock.calls[0][2];
-    expect(data.userInputs.intended_trigger_type).toBe('BO-ORH-60');
+    expect(data.intendedTrigger.value).toBe('BO-ORH-60');
   });
 });
 
@@ -371,13 +369,12 @@ describe('EntryQualityService — Entry-specific daily evidence authority (findi
 
     await EntryQualityService.evaluate(USER_ID, TRADE_ID, { evaluationId: EVAL_ID, userInputs: {} });
     const data = evaluationService.saveEntryProgress.mock.calls[0][2];
-    expect(data.evidenceSnapshot.bars).toEqual([]); // Setup snapshot untouched
-    expect(data.evidenceSnapshot.entry.entry_daily.appended).toBe(true);
-    expect(data.evidenceSnapshot.entry.entry_daily.authoritative).toBe(true);
-    expect(data.evidenceSnapshot.entry.entry_daily.requested_window).toBeTruthy();
+    expect(data.entryEvidence.entry_daily.appended).toBe(true);
+    expect(data.entryEvidence.entry_daily.authoritative).toBe(true);
+    expect(data.entryEvidence.entry_daily.requested_window).toBeTruthy();
     // Exact per-session inputs required to reproduce ADR are persisted.
-    expect(data.evidenceSnapshot.entry.volatility.ADR.sessions.length).toBe(20);
-    expect(data.evidenceSnapshot.entry.volatility.ADR.sessions[0]).toEqual(
+    expect(data.entryEvidence.volatility.ADR.sessions.length).toBe(20);
+    expect(data.entryEvidence.volatility.ADR.sessions[0]).toEqual(
       expect.objectContaining({ date: expect.any(String), high: expect.any(Number), previousClose: expect.any(Number) })
     );
   });
@@ -403,10 +400,98 @@ describe('EntryQualityService — Entry-specific daily evidence authority (findi
       userInputs: { intended_trigger_type: 'BO-PIVOT' }
     });
     const data = evaluationService.saveEntryProgress.mock.calls[0][2];
-    expect(data.evidenceSnapshot.entry.entry_daily.authoritative).toBe(false);
-    expect(data.evidenceSnapshot.entry.volatility).toEqual({});
+    expect(data.entryEvidence.entry_daily.authoritative).toBe(false);
+    expect(data.entryEvidence.volatility).toEqual({});
     const byKey = new Map(data.entryResults.criterionResults.map((row) => [row.key, row]));
     expect(byKey.get('entry_extension').status).toBe('UNKNOWN');
     expect(byKey.get('stop_width').status).toBe('UNKNOWN');
+  });
+});
+
+describe('EntryQualityService — pace reference-session identity authority (finding 3)', () => {
+  test('unverified daily identity makes Volume Pace and Range Pace UNKNOWN with an explicit reason', async () => {
+    evaluationService.getEvaluation.mockResolvedValue(
+      evaluationRow({
+        evidence_snapshot: {
+          symbol: 'TEST', resolution: 'daily', entrySessionDate: ENTRY_SESSION,
+          completeness: 'unverified', source: 'historical_cache', bars: []
+        }
+      })
+    );
+    loadDailyEvidence.mockResolvedValue({
+      bars: DAILY_BARS, source: 'historical_cache', completeness: 'unverified', error: 'cache only'
+    });
+
+    await EntryQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: EVAL_ID,
+      userInputs: { intended_trigger_type: 'BO-PIVOT' }
+    });
+    const data = evaluationService.saveEntryProgress.mock.calls[0][2];
+    const byKey = new Map(data.entryResults.criterionResults.map((row) => [row.key, row]));
+    expect(byKey.get('volume_pace').status).toBe('UNKNOWN');
+    expect(byKey.get('range_pace').status).toBe('UNKNOWN');
+    expect(byKey.get('volume_pace').evidence.reason).toMatch(/reference-session identity/);
+    expect(byKey.get('range_pace').evidence.reason).toMatch(/reference-session identity/);
+    // No pace value is fabricated even though the intraday bars are "complete".
+    expect(data.entryEvidence.metrics.volume_pace.available).toBe(false);
+    expect(data.entryEvidence.metrics.range_pace.available).toBe(false);
+  });
+});
+
+describe('EntryQualityService — criterion-driven trigger policy (finding 4)', () => {
+  function configWithCriteria(criteria) {
+    const config = JSON.parse(JSON.stringify(CONFIG));
+    config.dimensions.entry.criteria = criteria;
+    return config;
+  }
+
+  test('a stop_width-only profile with NO trigger policy block runs normally', async () => {
+    const config = configWithCriteria([
+      {
+        key: 'stop_width',
+        enabled: true,
+        required: true,
+        weight: 50,
+        parameters: { volatility_method: 'ADR', period: 20, maximum_multiple: 1.0 },
+        scoring: { type: 'step', mode: 'lte', default_score: 0, thresholds: [{ value: 0.5, score: 100 }, { value: 1.0, score: 75 }] }
+      }
+    ]);
+    installDbRouter(config);
+    evaluationService.getEvaluation.mockResolvedValue(
+      evaluationRow({ detected_context: {}, user_inputs: {} })
+    );
+
+    const prepared = await EntryQualityService.prepare(USER_ID, TRADE_ID, { evaluationId: EVAL_ID });
+    expect(prepared.allowedTriggerTypes).toEqual([]);
+    expect(prepared.requiredEntryUserInputs).toEqual([]);
+
+    await EntryQualityService.evaluate(USER_ID, TRADE_ID, { evaluationId: EVAL_ID, userInputs: {} });
+    const data = evaluationService.saveEntryProgress.mock.calls[0][2];
+    expect(data.intendedTrigger.mode).toBe('none');
+    // stop_width evaluated (UNKNOWN: no trustworthy actual stop), no trigger required.
+    expect(data.entryResults.criterionResults.map((row) => row.key)).toEqual(['stop_width']);
+  });
+
+  test('a volume/range-only profile with NO trigger criterion runs normally', async () => {
+    const config = configWithCriteria([
+      { key: 'volume_pace', enabled: true, required: false, weight: 50, parameters: { reference_sessions: 2, target_multiple: 1.4 }, scoring: { type: 'step', mode: 'gte', default_score: 0, thresholds: [{ value: 1.4, score: 85 }] } },
+      { key: 'range_pace', enabled: true, required: false, weight: 50, parameters: { reference_sessions: 2 }, scoring: { type: 'step', mode: 'gte', default_score: 0, thresholds: [{ value: 1.0, score: 70 }] } }
+    ]);
+    installDbRouter(config);
+    evaluationService.getEvaluation.mockResolvedValue(evaluationRow({ detected_context: {}, user_inputs: {} }));
+
+    await EntryQualityService.evaluate(USER_ID, TRADE_ID, { evaluationId: EVAL_ID, userInputs: {} });
+    const data = evaluationService.saveEntryProgress.mock.calls[0][2];
+    expect(data.intendedTrigger.mode).toBe('none');
+    expect(data.entryResults.criterionResults.map((row) => row.key).sort()).toEqual(['range_pace', 'volume_pace']);
+  });
+
+  test('entry_extension with a missing trigger policy is still rejected', () => {
+    const config = configWithCriteria([
+      { key: 'entry_extension', enabled: true, required: false, weight: 50, parameters: { primary_normalization: 'ADR', hard_maximum: 'disabled' }, scoring: { type: 'step', mode: 'lte', default_score: 0, thresholds: [{ value: 0.1, score: 90 }] } }
+    ]);
+    expect(() => EntryQualityService.assertValidEntryConfiguration(config.dimensions.entry)).toThrow(
+      /trigger_compliance|trigger policy/i
+    );
   });
 });

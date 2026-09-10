@@ -28,8 +28,13 @@ const SETUP_CONTEXT_REVISION_KEY = 'setup_context_revision';
 const SETUP_DEPENDENCY_FINGERPRINT_KEY = 'setup_dependency_fingerprint';
 
 // Historical semantic assertions that stay frozen for the lifetime of an
-// evaluation regardless of Setup/Entry recalculation.
-const IMMUTABLE_USER_INPUT_KEYS = Object.freeze(['intended_trigger_type']);
+// evaluation regardless of Setup/Entry recalculation. Kept separate from the
+// derived Entry context so Setup invalidation (which clears
+// detected_context.entry) cannot erase the original provenance.
+const IMMUTABLE_USER_INPUT_KEYS = Object.freeze([
+  'intended_trigger_type',
+  'immutable_semantic_context'
+]);
 
 function asObject(value) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};

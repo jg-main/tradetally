@@ -32,58 +32,80 @@ function lookupRow(overrides = {}) {
     id: 'eval-1',
     status: 'draft',
     results: { setup: SETUP_RESULT, entry: null, management: null },
+    detected_context: { boundary: { pivotPrice: 100 }, setup_dependency_fingerprint: 'F', setup_context_revision: '5' },
+    evidence_snapshot: { bars: [{ date: '2026-03-10' }], setupBoundary: { resolutionDate: '2026-03-10' }, entry: { old: true } },
+    user_inputs: { leader_confirmed: true, base_start: { date: '2026-02-10' } },
     configuration: CONFIG,
     ...overrides
   };
 }
 
+function passingEntryPayload(extra = {}) {
+  return {
+    entryResults: {
+      criterionResults: [
+        { key: 'breakout_session', status: CRITERION_STATUS.PASS, score: 100, scoring_value: null, raw_value: 'same_session' }
+      ]
+    },
+    entryEvidence: { new_entry: true },
+    entryDetectedContext: { new_entry_ctx: true },
+    dependencyFingerprint: 'F',
+    ...extra
+  };
+}
+
 let updateParams;
+
+function installSuccessfulUpdate() {
+  db.query
+    .mockResolvedValueOnce({ rows: [lookupRow()] })
+    .mockImplementationOnce((sql, params) => {
+      updateParams = params;
+      return { rows: [{ id: 'eval-1', status: 'draft', results: null }] };
+    });
+}
 
 beforeEach(() => {
   jest.clearAllMocks();
   updateParams = null;
 });
 
-describe('evaluationService.saveEntryProgress', () => {
-  test('preserves Setup byte-for-byte, replaces Entry and derives entry summaries', async () => {
-    db.query
-      .mockResolvedValueOnce({ rows: [lookupRow()] })
-      .mockImplementationOnce((sql, params) => {
-        updateParams = params;
-        return { rows: [{ id: 'eval-1', status: 'draft', results: null }] };
-      });
-
-    const result = await evaluationService.saveEntryProgress('eval-1', 'user-1', {
-      entryResults: {
-        criterionResults: [
-          { key: 'breakout_session', status: CRITERION_STATUS.PASS, score: 100, scoring_value: null, raw_value: 'same_session' }
-        ]
-      },
-      evidenceSnapshot: { bars: [], entry: { ok: true } },
-      userInputs: { base_start: { date: '2026-02-10' }, intended_trigger_type: 'BO-PIVOT' },
-      detectedContext: { entry: {} }
-    });
-
+describe('evaluationService.saveEntryProgress (Entry-owned state merge)', () => {
+  test('merges Entry state into the CURRENT DB Setup state (never the caller copy)', async () => {
+    installSuccessfulUpdate();
+    const result = await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload());
     expect(result).not.toBeNull();
+
     const results = JSON.parse(updateParams[2]);
     expect(results.setup).toEqual(SETUP_RESULT);
     expect(results.entry.score).toBe(100);
-    expect(results.entry.compliance).toBe('PASS');
-    expect(results.entry.coverage).toBe(100);
     expect(results.management).toBeNull();
-    // entry_* columns only; setup_* untouched by this UPDATE.
-    expect(updateParams[6]).toBe(100); // entry_score
-    expect(updateParams[8]).toBe('PASS'); // entry_compliance
-    expect(updateParams[9]).toBe(100); // entry_coverage
+
+    // Current top-level Setup snapshot preserved; only `.entry` replaced.
+    expect(updateParams[3].bars).toEqual([{ date: '2026-03-10' }]);
+    expect(updateParams[3].setupBoundary).toEqual({ resolutionDate: '2026-03-10' });
+    expect(updateParams[3].entry).toEqual({ new_entry: true });
+
+    // Current Setup semantic inputs preserved; Entry writes no Setup inputs.
+    expect(updateParams[4].leader_confirmed).toBe(true);
+    expect(updateParams[4].base_start).toEqual({ date: '2026-02-10' });
+
+    // Current Setup-level detected context preserved; only `.entry` replaced.
+    expect(updateParams[5].boundary).toEqual({ pivotPrice: 100 });
+    expect(updateParams[5].setup_dependency_fingerprint).toBe('F');
+    expect(updateParams[5].setup_context_revision).toBe('5');
+    expect(updateParams[5].entry).toEqual({ new_entry_ctx: true });
+
+    // entry_* flat columns set.
+    expect(updateParams[6]).toBe(100);
+    expect(updateParams[8]).toBe('PASS');
+    expect(updateParams[9]).toBe(100);
   });
 
-  test('refuses to proceed without an existing Setup result (never silently erases Setup)', async () => {
+  test('refuses to proceed without an existing Setup result', async () => {
     db.query.mockResolvedValueOnce({ rows: [lookupRow({ results: { setup: null, entry: null, management: null } })] });
-
     await expect(
-      evaluationService.saveEntryProgress('eval-1', 'user-1', {
-        entryResults: { criterionResults: [] }
-      })
+      evaluationService.saveEntryProgress('eval-1', 'user-1', { entryResults: { criterionResults: [] } })
     ).rejects.toThrow(/requires an existing Setup result/);
     expect(db.query).toHaveBeenCalledTimes(1);
   });
@@ -92,9 +114,7 @@ describe('evaluationService.saveEntryProgress', () => {
     db.query.mockResolvedValueOnce({ rows: [lookupRow()] });
     await expect(
       evaluationService.saveEntryProgress('eval-1', 'user-1', {
-        entryResults: {
-          criterionResults: [{ key: 'breakout_session', status: CRITERION_STATUS.PASS, score: 12, scoring_value: null }]
-        }
+        entryResults: { criterionResults: [{ key: 'breakout_session', status: CRITERION_STATUS.PASS, score: 12, scoring_value: null }] }
       })
     ).rejects.toThrow(/contradicts its profile scoring configuration/);
     expect(db.query).toHaveBeenCalledTimes(1);
@@ -108,42 +128,104 @@ describe('evaluationService.saveEntryProgress', () => {
     expect(result).toBeNull();
     expect(db.query).toHaveBeenCalledTimes(1);
   });
+});
 
-  test('rejects a stale Entry write whose Setup dependency fingerprint no longer matches', async () => {
+describe('evaluationService.saveEntryProgress (Setup CAS + intended-trigger CAS)', () => {
+  test('rejects a stale fingerprint before any UPDATE', async () => {
     db.query.mockResolvedValueOnce({
-      rows: [lookupRow({ detected_context: { setup_dependency_fingerprint: 'fingerprint-B' } })]
+      rows: [lookupRow({ detected_context: { setup_dependency_fingerprint: 'B', setup_context_revision: '5' } })]
     });
     await expect(
-      evaluationService.saveEntryProgress('eval-1', 'user-1', {
-        entryResults: { criterionResults: [{ key: 'breakout_session', status: CRITERION_STATUS.PASS, score: 100, scoring_value: null }] },
-        dependencyFingerprint: 'fingerprint-A'
-      })
+      evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload())
     ).rejects.toMatchObject({ code: 'STALE_DEPENDENCY' });
-    // The stale UPDATE must never run.
     expect(db.query).toHaveBeenCalledTimes(1);
   });
 
-  test('accepts an Entry write whose dependency fingerprint still matches', async () => {
+  test('a zero-row UPDATE caused by a Setup revision change after lookup is STALE_DEPENDENCY', async () => {
     db.query
-      .mockResolvedValueOnce({ rows: [lookupRow({ detected_context: { setup_dependency_fingerprint: 'fingerprint-A' } })] })
-      .mockImplementationOnce((sql, params) => ({ rows: [{ id: 'eval-1', status: 'draft', results: null }], params }));
-    const result = await evaluationService.saveEntryProgress('eval-1', 'user-1', {
-      entryResults: { criterionResults: [{ key: 'breakout_session', status: CRITERION_STATUS.PASS, score: 100, scoring_value: null }] },
-      dependencyFingerprint: 'fingerprint-A'
-    });
-    expect(result).not.toBeNull();
-    expect(db.query).toHaveBeenCalledTimes(2);
+      .mockResolvedValueOnce({ rows: [lookupRow()] }) // lookup: revision 5
+      .mockResolvedValueOnce({ rows: [] }) // UPDATE lost the CAS
+      .mockResolvedValueOnce({
+        rows: [lookupRow({ detected_context: { setup_dependency_fingerprint: 'F', setup_context_revision: '6' } })]
+      }); // recheck: revision advanced
+    await expect(
+      evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload())
+    ).rejects.toMatchObject({ code: 'STALE_DEPENDENCY' });
   });
 
-  test('a zero-row UPDATE (dependency changed during evaluation) is a stale-dependency error', async () => {
+  test('the UPDATE predicate carries the fingerprint and revision read by saveEntryProgress', async () => {
+    installSuccessfulUpdate();
+    await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload());
+    const sql = db.query.mock.calls[1][0];
+    expect(sql).toContain("detected_context->>'setup_dependency_fingerprint'");
+    expect(sql).toContain("detected_context->>'setup_context_revision'");
+    expect(updateParams[10]).toBe('F');
+    expect(updateParams[11]).toBe('5');
+  });
+
+  test('an intended trigger is established once with full immutable provenance', async () => {
+    installSuccessfulUpdate();
+    await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload({
+      intendedTrigger: { mode: 'establish', value: 'BO-PIVOT' }
+    }));
+    const sql = db.query.mock.calls[1][0];
+    expect(sql).toContain("user_inputs->>'intended_trigger_type'");
+    expect(updateParams[4].intended_trigger_type).toBe('BO-PIVOT');
+    expect(updateParams[4].immutable_semantic_context.intended_trigger).toEqual(
+      expect.objectContaining({ value: 'BO-PIVOT', source: 'user_asserted', asserted_at: expect.any(String) })
+    );
+    expect(updateParams[12]).toBe('BO-PIVOT');
+  });
+
+  test('two concurrent first assertions cannot both win (loser is INTENDED_TRIGGER_IMMUTABLE)', async () => {
     db.query
-      .mockResolvedValueOnce({ rows: [lookupRow()] })
-      .mockResolvedValueOnce({ rows: [] });
+      .mockResolvedValueOnce({ rows: [lookupRow()] }) // both saw no trigger
+      .mockResolvedValueOnce({ rows: [] }) // this UPDATE lost the trigger CAS
+      .mockResolvedValueOnce({
+        rows: [lookupRow({ user_inputs: { leader_confirmed: true, intended_trigger_type: 'BO-ORH-5' } })]
+      }); // recheck: the other request established BO-ORH-5
     await expect(
-      evaluationService.saveEntryProgress('eval-1', 'user-1', {
-        entryResults: { criterionResults: [{ key: 'breakout_session', status: CRITERION_STATUS.PASS, score: 100, scoring_value: null }] },
-        dependencyFingerprint: 'fingerprint-A'
+      evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload({
+        intendedTrigger: { mode: 'establish', value: 'BO-PIVOT' }
+      }))
+    ).rejects.toMatchObject({ code: 'INTENDED_TRIGGER_IMMUTABLE' });
+  });
+
+  test('repeating the established value is allowed (idempotent establish)', async () => {
+    db.query
+      .mockResolvedValueOnce({
+        rows: [lookupRow({ user_inputs: { leader_confirmed: true, intended_trigger_type: 'BO-PIVOT' } })]
       })
-    ).rejects.toMatchObject({ code: 'STALE_DEPENDENCY' });
+      .mockImplementationOnce((sql, params) => {
+        updateParams = params;
+        return { rows: [{ id: 'eval-1', status: 'draft', results: null }] };
+      });
+    await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload({
+      intendedTrigger: { mode: 'establish', value: 'BO-PIVOT' }
+    }));
+    expect(updateParams[4].intended_trigger_type).toBe('BO-PIVOT');
+  });
+
+  test('the original asserted_at survives an Entry rerun (preserve mode)', async () => {
+    db.query
+      .mockResolvedValueOnce({
+        rows: [lookupRow({
+          user_inputs: {
+            leader_confirmed: true,
+            intended_trigger_type: 'BO-PIVOT',
+            immutable_semantic_context: {
+              intended_trigger: { value: 'BO-PIVOT', source: 'user_asserted', asserted_at: '2026-03-10T14:00:00.000Z' }
+            }
+          }
+        })]
+      })
+      .mockImplementationOnce((sql, params) => {
+        updateParams = params;
+        return { rows: [{ id: 'eval-1', status: 'draft', results: null }] };
+      });
+    await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload({
+      intendedTrigger: { mode: 'preserve', value: 'BO-PIVOT' }
+    }));
+    expect(updateParams[4].immutable_semantic_context.intended_trigger.asserted_at).toBe('2026-03-10T14:00:00.000Z');
   });
 });

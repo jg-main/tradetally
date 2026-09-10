@@ -606,10 +606,22 @@ async function saveSetupProgress(evaluationId, userId, data = {}) {
 //   - flat entry_* summary columns derive from the recomputed aggregate; the
 //     setup_* columns are untouched. The row stays non-terminal because
 //     Management is not implemented yet.
+// Entry persists ONLY Entry-owned state. At write time the CURRENT DB Setup
+// state is re-read and preserved; the caller supplies only the Entry result,
+// the derived Entry evidence block, the derived Entry detected-context block,
+// and the Entry-owned immutable semantic assertions. This makes it impossible
+// for a stale Entry task to overwrite a newer Setup result, user inputs, or
+// context (finding 1).
+//
+// Compare-and-swap: the UPDATE predicate requires the fingerprint AND the Setup
+// context revision that saveEntryProgress itself read. A Setup change after
+// that read yields a zero-row UPDATE and is rejected. The intended trigger is
+// additionally CAS-guarded so two concurrent first assertions cannot both win
+// (finding 2).
 async function saveEntryProgress(evaluationId, userId, data = {}) {
   const lookup = await db.query(
     `
-      SELECT e.id, e.status, e.results, e.detected_context, v.configuration
+      SELECT e.id, e.status, e.results, e.detected_context, e.evidence_snapshot, e.user_inputs, v.configuration
       FROM trade_quality_evaluations e
       JOIN quality_profile_versions v ON v.id = e.profile_version_id
       JOIN quality_profiles p ON p.id = v.profile_id
@@ -624,24 +636,45 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
   if (lookup.rows.length === 0) {
     return null;
   }
-  // Optimistic Setup-dependency guard: Entry computed against a server-derived
-  // fingerprint from the Setup context it loaded. If the persisted Setup
-  // dependency changed while Entry evidence work was in flight, stale Entry
-  // results must never attach to the newer Setup. The value is server-derived
-  // (never client-trusted) and is re-checked in the UPDATE predicate to close
-  // the read/write race.
+
+  const currentResults = parseJsonField(lookup.rows[0].results) || {};
   const currentDetected = parseJsonField(lookup.rows[0].detected_context) || {};
-  const currentFingerprint = currentDetected.setup_dependency_fingerprint ?? null;
+  const currentEvidence = parseJsonField(lookup.rows[0].evidence_snapshot) || {};
+  const currentInputs = parseJsonField(lookup.rows[0].user_inputs) || {};
+
+  const currentFingerprint = currentDetected[SETUP_DEPENDENCY_FINGERPRINT_KEY] ?? null;
+  const currentRevision = currentDetected[SETUP_CONTEXT_REVISION_KEY] ?? null;
   const expectedFingerprint =
     data.dependencyFingerprint === undefined || data.dependencyFingerprint === null
       ? null
       : String(data.dependencyFingerprint);
+
+  const currentTrigger =
+    typeof currentInputs.intended_trigger_type === 'string' && currentInputs.intended_trigger_type
+      ? currentInputs.intended_trigger_type
+      : null;
+  const intended = data.intendedTrigger && typeof data.intendedTrigger === 'object'
+    ? data.intendedTrigger
+    : { mode: 'none' };
+
+  // In-memory pre-checks (the authoritative race protection is the SQL CAS
+  // predicate below).
   if (expectedFingerprint !== null && currentFingerprint !== expectedFingerprint) {
-    const staleError = new Error(
-      'Entry evidence is stale: the Setup dependency changed while Entry was being evaluated. Re-run Entry prepare/evaluate against the current Setup.'
-    );
-    staleError.code = 'STALE_DEPENDENCY';
-    throw staleError;
+    throw entryStaleError('STALE_DEPENDENCY');
+  }
+  if (
+    intended.mode === 'establish' &&
+    currentTrigger !== null &&
+    currentTrigger !== intended.value
+  ) {
+    throw entryStaleError('INTENDED_TRIGGER_IMMUTABLE');
+  }
+  if (
+    intended.mode === 'preserve' &&
+    currentTrigger !== null &&
+    currentTrigger !== intended.value
+  ) {
+    throw entryStaleError('INTENDED_TRIGGER_IMMUTABLE');
   }
 
   const configuration = lookup.rows[0].configuration;
@@ -655,12 +688,11 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
   }
   const entryConfig = configuration.dimensions.entry;
 
-  const existingResults = parseJsonField(lookup.rows[0].results);
   if (
-    !existingResults ||
-    typeof existingResults !== 'object' ||
-    !Object.prototype.hasOwnProperty.call(existingResults, 'setup') ||
-    existingResults.setup === null
+    !currentResults ||
+    typeof currentResults !== 'object' ||
+    !Object.prototype.hasOwnProperty.call(currentResults, 'setup') ||
+    currentResults.setup === null
   ) {
     throw new Error(
       'Entry progress requires an existing Setup result; run Setup Quality before Entry Quality.'
@@ -676,26 +708,100 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
   });
   const recomputed = aggregateDimension(entryConfig, rows);
 
-  // Preserve Setup byte-for-byte; replace Entry; keep Management null/progress.
+  // ----- merge FROM CURRENT DB STATE (never from the caller's stale copy) ---
   const persistedResults = {
-    ...existingResults,
-    setup: existingResults.setup,
+    ...currentResults,
+    setup: currentResults.setup,
     entry: recomputed,
-    management: Object.prototype.hasOwnProperty.call(existingResults, 'management')
-      ? existingResults.management
+    management: Object.prototype.hasOwnProperty.call(currentResults, 'management')
+      ? currentResults.management
       : null
   };
 
-  // Entry only writes Entry state: it must carry forward the CURRENT Setup
-  // concurrency token and fingerprint it was guarded against, never a stale
-  // revision it read before some other concurrent Setup write.
-  const detectedContextInput =
-    data.detectedContext && typeof data.detectedContext === 'object' ? data.detectedContext : {};
-  const persistedDetectedContext = {
-    ...detectedContextInput,
-    [SETUP_DEPENDENCY_FINGERPRINT_KEY]: currentDetected[SETUP_DEPENDENCY_FINGERPRINT_KEY] ?? null,
-    [SETUP_CONTEXT_REVISION_KEY]: currentDetected[SETUP_CONTEXT_REVISION_KEY] ?? null
+  const persistedEvidenceSnapshot = {
+    ...currentEvidence,
+    entry: data.entryEvidence ?? null
   };
+
+  const persistedDetectedContext = {
+    ...currentDetected,
+    entry: data.entryDetectedContext ?? null,
+    [SETUP_DEPENDENCY_FINGERPRINT_KEY]: currentFingerprint,
+    [SETUP_CONTEXT_REVISION_KEY]: currentRevision
+  };
+
+  const persistedUserInputs = { ...currentInputs };
+  if (intended.mode === 'establish') {
+    const previousContext =
+      currentInputs.immutable_semantic_context &&
+      typeof currentInputs.immutable_semantic_context === 'object'
+        ? currentInputs.immutable_semantic_context
+        : {};
+    const previousTrigger =
+      previousContext.intended_trigger && typeof previousContext.intended_trigger === 'object'
+        ? previousContext.intended_trigger
+        : {};
+    persistedUserInputs.intended_trigger_type = intended.value;
+    // Full immutable provenance: never regenerated on rerun.
+    persistedUserInputs.immutable_semantic_context = {
+      ...previousContext,
+      intended_trigger: {
+        value: intended.value,
+        source: 'user_asserted',
+        asserted_at: previousTrigger.asserted_at || intended.assertedAt || new Date().toISOString()
+      }
+    };
+  } else if (intended.mode === 'preserve' && currentTrigger) {
+    persistedUserInputs.intended_trigger_type = currentTrigger;
+    const hasProvenance =
+      currentInputs.immutable_semantic_context &&
+      currentInputs.immutable_semantic_context.intended_trigger &&
+      currentInputs.immutable_semantic_context.intended_trigger.asserted_at;
+    if (!hasProvenance) {
+      // Legacy row: backfill provenance once so it survives Setup invalidation.
+      persistedUserInputs.immutable_semantic_context = {
+        ...(currentInputs.immutable_semantic_context || {}),
+        intended_trigger: {
+          value: currentTrigger,
+          source: 'user_asserted',
+          asserted_at: intended.assertedAt || new Date().toISOString()
+        }
+      };
+    }
+  }
+
+  // ----- SQL compare-and-swap ---------------------------------------------
+  const where = [
+    'id = $1',
+    'user_id = $2',
+    TERMINAL_STATUS_SQL,
+    `COALESCE(detected_context->>'${SETUP_DEPENDENCY_FINGERPRINT_KEY}', '') = $11`,
+    `COALESCE(detected_context->>'${SETUP_CONTEXT_REVISION_KEY}', '') = $12`
+  ];
+  const params = [
+    evaluationId,
+    userId,
+    JSON.stringify(persistedResults),
+    persistedEvidenceSnapshot,
+    persistedUserInputs,
+    persistedDetectedContext,
+    recomputed.score,
+    recomputed.grade,
+    recomputed.compliance,
+    recomputed.coverage,
+    currentFingerprint ?? '',
+    currentRevision ?? ''
+  ];
+  if (intended.mode === 'establish') {
+    // Empty -> claim; already equal -> idempotent; otherwise fail.
+    where.push(
+      `(COALESCE(user_inputs->>'intended_trigger_type', '') = '' OR user_inputs->>'intended_trigger_type' = $13)`
+    );
+    params.push(intended.value);
+  } else if (intended.mode === 'preserve') {
+    where.push(`COALESCE(user_inputs->>'intended_trigger_type', '') = $13`);
+    params.push(intended.value);
+  }
 
   const updated = await db.query(
     `
@@ -710,36 +816,52 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
         entry_compliance = $9,
         entry_coverage = $10,
         evaluated_at = CURRENT_TIMESTAMP
-      WHERE id = $1
-        AND user_id = $2
-        AND ${TERMINAL_STATUS_SQL}
-        AND COALESCE(detected_context->>'setup_dependency_fingerprint', '') = $11
+      WHERE ${where.join('\n        AND ')}
       RETURNING ${EVALUATION_COLUMNS}
     `,
-    [
-      evaluationId,
-      userId,
-      JSON.stringify(persistedResults),
-      data.evidenceSnapshot ?? null,
-      data.userInputs ?? null,
-      persistedDetectedContext,
-      recomputed.score,
-      recomputed.grade,
-      recomputed.compliance,
-      recomputed.coverage,
-      expectedFingerprint ?? ''
-    ]
+    params
   );
   if (updated.rows.length === 0) {
-    // The lookup confirmed a non-terminal row, so a zero-row UPDATE means the
-    // Setup-dependency predicate no longer holds: reject the stale write.
-    const staleError = new Error(
-      'Entry results were not saved because the Setup dependency changed during evaluation. Re-run Entry prepare/evaluate.'
+    // Classify the lost CAS so the caller gets an actionable error.
+    const recheck = await db.query(
+      `
+        SELECT e.detected_context, e.user_inputs
+        FROM trade_quality_evaluations e
+        WHERE e.id = $1 AND e.user_id = $2 AND ${TERMINAL_STATUS_SQL}
+      `,
+      [evaluationId, userId]
     );
-    staleError.code = 'STALE_DEPENDENCY';
-    throw staleError;
+    if (recheck.rows.length === 0) {
+      return null;
+    }
+    const latestDetected = parseJsonField(recheck.rows[0].detected_context) || {};
+    const latestInputs = parseJsonField(recheck.rows[0].user_inputs) || {};
+    const latestFingerprint = latestDetected[SETUP_DEPENDENCY_FINGERPRINT_KEY] ?? null;
+    if (expectedFingerprint !== null && latestFingerprint !== expectedFingerprint) {
+      throw entryStaleError('STALE_DEPENDENCY');
+    }
+    const latestTrigger =
+      typeof latestInputs.intended_trigger_type === 'string' && latestInputs.intended_trigger_type
+        ? latestInputs.intended_trigger_type
+        : null;
+    if (intended.mode !== 'none' && latestTrigger !== null && latestTrigger !== intended.value) {
+      throw entryStaleError('INTENDED_TRIGGER_IMMUTABLE');
+    }
+    throw entryStaleError('STALE_DEPENDENCY');
   }
   return updated.rows[0] || null;
+}
+
+function entryStaleError(code) {
+  const messages = {
+    STALE_DEPENDENCY:
+      'Entry results were not saved because the Setup dependency or revision changed during evaluation. Re-run Entry prepare/evaluate.',
+    INTENDED_TRIGGER_IMMUTABLE:
+      'intended_trigger_type is immutable for this evaluation; another request established a different value. Create a new evaluation to change it.'
+  };
+  const error = new Error(messages[code] || 'Entry results could not be saved.');
+  error.code = code;
+  return error;
 }
 
 // Evaluation history for a trade, newest first. Keeps every version's result

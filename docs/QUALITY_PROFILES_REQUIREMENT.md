@@ -1409,13 +1409,27 @@ result is UNKNOWN, never a blended entry price.
 
 An ORH trigger is formed in the persisted Phase-2 breakout session; its
 opening-range and trigger-cross evidence is read from that session's intraday
-bars, while entry-time pace/LOD use the actual entry session's bars. With
-1-minute OHLC evidence, `trigger_cross_number` is exposed only when an execution
-print establishes it; otherwise the number of bars above the threshold is
-retained as `bars_above_threshold` and a crossing inside an interval is recorded
-with `trigger_time_precision = '1min_interval'` (`first_cross_bar_open` /
-`first_cross_bar_close`), never a fabricated exact tick time. A sustained run of
-bars above the threshold is not counted as multiple crossings.
+bars, while entry-time pace/LOD use the actual entry session's bars.
+
+With 1-minute OHLC bars plus the trader's execution prints:
+
+- an execution print proves the trader's observed fill price/time, and may
+  establish Trigger Compliance when the fill is above the effective trigger;
+- an execution print does **NOT** prove the market's first above-trigger trade
+  (another trade may have crossed earlier inside an unobserved interval);
+- `trigger_time` is `null` unless the actual first market crossing is
+  established by suitable evidence;
+- `trigger_cross_number` is `null` unless suitable evidence actually establishes
+  it (1-minute OHLC cannot);
+- `minutes_after_first_trigger` is `null` when the first crossing is unknown;
+- 1-minute OHLC may retain the first observed above-threshold interval bounds
+  (`first_cross_bar_open` / `first_cross_bar_close`) with
+  `trigger_time_precision = '1min_interval'`, never a fabricated exact tick time;
+- the trader's entry execution observation (price/time) is stored separately
+  (`entry_observation_above_threshold`, `entry_execution_price`,
+  `entry_execution_time`);
+- the number of bars above the threshold is retained as `bars_above_threshold`;
+  a sustained run of above-threshold bars is not counted as multiple crossings.
 
 Canonical quality scoring for Trigger Compliance (binary; no partial credit):
 
