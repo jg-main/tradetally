@@ -1493,6 +1493,16 @@ Scoring:
 
 Not required for canonical Entry Compliance v1.
 
+**ExpectedHistoricalVolumeAtSameElapsedTime (v1 convention).** No prior averaging
+method was otherwise defined. For v1 the expected historical volume is the
+transparent deterministic **arithmetic mean** of the cumulative regular-session
+volume observed at the *identical elapsed time from the session open* across the
+configured reference sessions. A reference session contributes only when its
+same-time intraday evidence is usable; if fewer than `reference_sessions` usable
+sessions exist the criterion is UNKNOWN. This convention is code-transparent and
+recorded in the criterion evidence (`reference_values`, `usable_sessions`,
+`expected_historical_volume`).
+
 If sufficient intraday data are unavailable:
 
 ```text
@@ -1541,6 +1551,13 @@ Scoring:
 ```
 
 Not required for compliance.
+
+**ExpectedHistoricalRangeAtSameElapsedTime (v1 convention).** As with Volume
+Pace, and because no averaging method was otherwise defined, v1 uses the
+transparent deterministic **arithmetic mean** of the open-to-same-elapsed-time
+range across the configured reference sessions. A reference session contributes
+only when its same-time intraday evidence is usable; if fewer than
+`reference_sessions` usable sessions exist the criterion is UNKNOWN.
 
 Also retain:
 

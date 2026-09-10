@@ -177,6 +177,19 @@ function normalizeCriterionRows(dimension, dimensionConfig, dimResult) {
   return rows;
 }
 
+function parseJsonField(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'object') return value;
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch (error) {
+      return null;
+    }
+  }
+  return null;
+}
+
 function assertTerminalStatus(status) {
   if (status !== EVALUATION_STATUS.COMPLETED && status !== EVALUATION_STATUS.INSUFFICIENT_DATA) {
     throw new Error('saveResult only accepts terminal statuses completed or insufficient_data');
@@ -491,6 +504,118 @@ async function saveSetupProgress(evaluationId, userId, data = {}) {
   return updated.rows[0] || null;
 }
 
+// Persists NON-TERMINAL Entry evaluation progress on a still-mutable draft
+// (Phase 3 Entry Quality workflow).
+//
+// Contract (parallel to saveSetupProgress):
+//   - the evaluation must exist, belong to `userId`, link to a profile version
+//     owned by the same user, and be NON-TERMINAL. Terminal immutability is
+//     never weakened.
+//   - an EXISTING Setup result is REQUIRED: Entry Quality depends on the
+//     confirmed Pivot / breakout boundary, so Entry progress must never be able
+//     to silently erase Setup. It preserves results.setup untouched and
+//     replaces only results.entry (management stays null in Phase 3).
+//   - entryResults.criterionResults are normalized against the immutable
+//     entry configuration: PASS/FAIL scores are derived from/validated against
+//     the configured `scoring` envelopes and the authoritative Entry aggregate
+//     is recomputed. Caller-supplied scores/summaries are never trusted.
+//   - flat entry_* summary columns derive from the recomputed aggregate; the
+//     setup_* columns are untouched. The row stays non-terminal because
+//     Management is not implemented yet.
+async function saveEntryProgress(evaluationId, userId, data = {}) {
+  const lookup = await db.query(
+    `
+      SELECT e.id, e.status, e.results, v.configuration
+      FROM trade_quality_evaluations e
+      JOIN quality_profile_versions v ON v.id = e.profile_version_id
+      JOIN quality_profiles p ON p.id = v.profile_id
+      WHERE e.id = $1
+        AND e.user_id = $2
+        AND p.user_id = $2
+        AND ${TERMINAL_STATUS_SQL}
+    `,
+    [evaluationId, userId]
+  );
+
+  if (lookup.rows.length === 0) {
+    return null;
+  }
+  const configuration = lookup.rows[0].configuration;
+  if (
+    configuration === null ||
+    typeof configuration !== 'object' ||
+    !configuration.dimensions ||
+    !configuration.dimensions.entry
+  ) {
+    throw new Error('profile version configuration has no entry dimension');
+  }
+  const entryConfig = configuration.dimensions.entry;
+
+  const existingResults = parseJsonField(lookup.rows[0].results);
+  if (
+    !existingResults ||
+    typeof existingResults !== 'object' ||
+    !Object.prototype.hasOwnProperty.call(existingResults, 'setup') ||
+    existingResults.setup === null
+  ) {
+    throw new Error(
+      'Entry progress requires an existing Setup result; run Setup Quality before Entry Quality.'
+    );
+  }
+
+  const entryResults = data.entryResults;
+  if (entryResults === null || typeof entryResults !== 'object' || Array.isArray(entryResults)) {
+    throw new Error('entry progress requires an entryResults object with criterionResults');
+  }
+  const rows = normalizeCriterionRows('entry', entryConfig, {
+    criterionResults: entryResults.criterionResults || []
+  });
+  const recomputed = aggregateDimension(entryConfig, rows);
+
+  // Preserve Setup byte-for-byte; replace Entry; keep Management null/progress.
+  const persistedResults = {
+    ...existingResults,
+    setup: existingResults.setup,
+    entry: recomputed,
+    management: Object.prototype.hasOwnProperty.call(existingResults, 'management')
+      ? existingResults.management
+      : null
+  };
+
+  const updated = await db.query(
+    `
+      UPDATE trade_quality_evaluations
+      SET
+        results = $3,
+        evidence_snapshot = $4,
+        user_inputs = $5,
+        detected_context = $6,
+        entry_score = $7,
+        entry_grade = $8,
+        entry_compliance = $9,
+        entry_coverage = $10,
+        evaluated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+        AND user_id = $2
+        AND ${TERMINAL_STATUS_SQL}
+      RETURNING ${EVALUATION_COLUMNS}
+    `,
+    [
+      evaluationId,
+      userId,
+      JSON.stringify(persistedResults),
+      data.evidenceSnapshot ?? null,
+      data.userInputs ?? null,
+      data.detectedContext ?? null,
+      recomputed.score,
+      recomputed.grade,
+      recomputed.compliance,
+      recomputed.coverage
+    ]
+  );
+  return updated.rows[0] || null;
+}
+
 // Evaluation history for a trade, newest first. Keeps every version's result
 // so the UI can show "evaluated with v1 / re-evaluate with v3".
 async function listEvaluationsForTrade(userId, tradeId) {
@@ -514,6 +639,7 @@ module.exports = {
   createEvaluation,
   saveResult,
   saveSetupProgress,
+  saveEntryProgress,
   getEvaluation,
   listEvaluationsForTrade
 };

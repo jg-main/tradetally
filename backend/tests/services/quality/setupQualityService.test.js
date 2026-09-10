@@ -958,6 +958,45 @@ describe('integrity closure (Phase 2 final)', () => {
     // all three without erasing unrelated state.
     expect(SetupQualityService.invalidateResultDimensions(results, ['setup', 'entry', 'management'])).toBeNull();
   });
+
+  test('a Setup/Pivot context change atomically invalidates Setup, Entry and Management', async () => {
+    const first = await prepareDraft();
+    // Persist Setup + Entry results on that draft, as a completed Phase 3
+    // evaluation would have.
+    existingDraft = makeEvaluationRow({
+      id: first.evaluation.id,
+      results: { setup: { score: 96 }, entry: { score: 80 }, management: null },
+      evidence_snapshot: first.evaluation.evidence_snapshot,
+      detected_context: first.evaluation.detected_context,
+      user_inputs: {
+        leader_confirmed: true,
+        base_start: { date: first.detectedBaseStart.date, source: 'detected_confirmed' },
+        pivot: {
+          price: first.detectedPivot.price,
+          date: first.detectedPivot.date,
+          source: 'detected_confirmed'
+        }
+      }
+    });
+    db.query.mockClear();
+
+    // A structural Base Start change invalidates the old Entry grade (it was
+    // derived from the old Pivot/breakout boundary).
+    const reprepared = await prepareDraft({
+      confirmedBaseStart: { date: scenario.dateAt(71), source: 'user_adjusted' }
+    });
+    expect(reprepared.evaluation.results.setup).toBeUndefined();
+    expect(reprepared.evaluation.results.entry).toBeUndefined();
+
+    // The atomic UPDATE must clear Entry AND Management flat summaries too.
+    const invalidationUpdate = db.query.mock.calls
+      .map(([sql]) => sql)
+      .find((sql) => sql.includes('setup_score = NULL'));
+    expect(invalidationUpdate).toBeDefined();
+    expect(invalidationUpdate).toContain('entry_score = NULL');
+    expect(invalidationUpdate).toContain('entry_compliance = NULL');
+    expect(invalidationUpdate).toContain('management_score = NULL');
+  });
 });
 
 describe('executable-contract closure (Phase 2 final)', () => {

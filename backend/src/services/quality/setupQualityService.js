@@ -755,9 +755,12 @@ function toFrontendEvaluation(row) {
 // than silently preserving incompatible Entry/Management results. This
 // milestone only clears the Setup dimension; Entry/Management are not yet
 // evaluated (their persisted slots are null).
+const CLEARABLE_DIMENSIONS = Object.freeze(['setup', 'entry', 'management']);
+
 async function persistPrepareContext(evaluationId, userId, payload) {
   const db = require('../../config/database');
-  const clearSetup = payload.clearSetup === true;
+  const clearDimensions = (Array.isArray(payload.clearDimensions) ? payload.clearDimensions : [])
+    .filter((dimension) => CLEARABLE_DIMENSIONS.includes(dimension));
   const params = [
     evaluationId,
     userId,
@@ -769,13 +772,16 @@ async function persistPrepareContext(evaluationId, userId, payload) {
       evidence_snapshot = $3,
       detected_context = $4,
       user_inputs = $5`;
-  if (clearSetup) {
+  if (clearDimensions.length > 0) {
     setClause += `,
-      results = $6,
-      setup_score = NULL,
-      setup_grade = NULL,
-      setup_compliance = NULL,
-      setup_coverage = NULL`;
+      results = $6`;
+    for (const dimension of clearDimensions) {
+      setClause += `,
+      ${dimension}_score = NULL,
+      ${dimension}_grade = NULL,
+      ${dimension}_compliance = NULL,
+      ${dimension}_coverage = NULL`;
+    }
     params.push(payload.preservedResults ?? null);
   }
   const updated = await db.query(
@@ -806,6 +812,13 @@ function invalidateResultDimensions(results, dimensionsToClear) {
   if (!parsed || typeof parsed !== 'object') return null;
   const copy = { ...parsed };
   for (const dimension of dimensionsToClear || []) {
+    // A dimension already stored as null is already cleared: keep the stable
+    // envelope key (explicit null) rather than dropping it, so consumers keep
+    // seeing results.entry/results.management as null rather than undefined.
+    if (hasOwn(copy, dimension) && (copy[dimension] === null || copy[dimension] === undefined)) {
+      copy[dimension] = null;
+      continue;
+    }
     delete copy[dimension];
   }
   return Object.keys(copy).length > 0 ? copy : null;
@@ -1008,7 +1021,13 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
     stagedBaseStart,
     detections
   });
-  const clearSetup = hasSetupResult && contextChanged;
+  // Phase 3 dependency cascade: a Setup/Pivot semantic change invalidates
+  // Setup, Entry (breakout/effective trigger/Initial R), and Management
+  // (future Initial R consumers). The context write and the cascade clear are
+  // atomic (single UPDATE in persistPrepareContext).
+  const clearDimensions = hasSetupResult && contextChanged
+    ? ['setup', 'entry', 'management']
+    : [];
 
   // A STRUCTURAL Base Start date change invalidates any previously confirmed
   // Pivot: never leave an old pivot confirmation in the persisted user_inputs.
@@ -1022,9 +1041,9 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
     evidenceSnapshot,
     detectedContext,
     userInputs,
-    clearSetup,
-    preservedResults: clearSetup
-      ? preservedNonSetupResults(evaluation.results)
+    clearDimensions,
+    preservedResults: clearDimensions.length > 0
+      ? invalidateResultDimensions(evaluation.results, clearDimensions)
       : undefined
   });
 

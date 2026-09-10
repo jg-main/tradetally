@@ -918,6 +918,12 @@ router.post('/:id/quality/prepare', authenticate, qualitySetupController.prepare
 router.post('/:id/quality/evaluate', authenticate, qualitySetupController.evaluateQualitySetup);
 router.get('/:id/quality/evaluations', authenticate, qualitySetupController.listQualityEvaluations);
 
+// Quality Profiles — Entry Quality workflow (Phase 3). Extends the same
+// non-terminal evaluation; Setup must be evaluated first.
+const qualityEntryController = require('../controllers/qualityEntry.controller');
+router.post('/:id/quality/entry/prepare', authenticate, qualityEntryController.prepareEntryQuality);
+router.post('/:id/quality/entry/evaluate', authenticate, qualityEntryController.evaluateEntryQuality);
+
 // Health data integration routes
 router.put('/:id/health', authenticate, tradeController.updateTradeHealthData);
 router.put('/health/bulk', authenticate, tradeController.bulkUpdateHealthData);
