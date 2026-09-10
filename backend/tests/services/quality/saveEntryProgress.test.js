@@ -191,7 +191,17 @@ describe('evaluationService.saveEntryProgress (Setup CAS + intended-trigger CAS)
     ).rejects.toMatchObject({ code: 'INTENDED_TRIGGER_IMMUTABLE' });
   });
 
-  test('repeating the established value is allowed (idempotent establish)', async () => {
+  test('a true establish claimant claims only an EMPTY trigger', async () => {
+    installSuccessfulUpdate();
+    await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload({
+      intendedTrigger: { mode: 'establish', value: 'BO-PIVOT' }
+    }));
+    const sql = db.query.mock.calls[1][0];
+    expect(sql).toContain("COALESCE(user_inputs->>'intended_trigger_type', '') = ''");
+    expect(sql).not.toContain("user_inputs->>'intended_trigger_type' = $13");
+  });
+
+  test('repeating the established value is allowed (normalized to preserve)', async () => {
     db.query
       .mockResolvedValueOnce({
         rows: [lookupRow({ user_inputs: { leader_confirmed: true, intended_trigger_type: 'BO-PIVOT' } })]
@@ -203,7 +213,47 @@ describe('evaluationService.saveEntryProgress (Setup CAS + intended-trigger CAS)
     await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload({
       intendedTrigger: { mode: 'establish', value: 'BO-PIVOT' }
     }));
+    const sql = db.query.mock.calls[1][0];
+    expect(sql).toContain("COALESCE(user_inputs->>'intended_trigger_type', '') = $13");
     expect(updateParams[4].intended_trigger_type).toBe('BO-PIVOT');
+  });
+
+  test('a stale same-value second claimant adopts the FIRST asserted_at (never overwrites it)', async () => {
+    db.query
+      .mockResolvedValueOnce({
+        rows: [lookupRow({
+          user_inputs: {
+            leader_confirmed: true,
+            intended_trigger_type: 'BO-PIVOT',
+            immutable_semantic_context: {
+              intended_trigger: { value: 'BO-PIVOT', source: 'user_asserted', asserted_at: 'T1-WINNER' }
+            }
+          }
+        })]
+      })
+      .mockImplementationOnce((sql, params) => {
+        updateParams = params;
+        return { rows: [{ id: 'eval-1', status: 'draft', results: null }] };
+      });
+    // The second claimant proposed the same value but built its own (stale) T2.
+    await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload({
+      intendedTrigger: { mode: 'establish', value: 'BO-PIVOT', assertedAt: 'T2-STALE' }
+    }));
+    expect(updateParams[4].immutable_semantic_context.intended_trigger.asserted_at).toBe('T1-WINNER');
+  });
+
+  test('concurrent same-value establish claimants: the loser cannot overwrite provenance', async () => {
+    db.query
+      .mockResolvedValueOnce({ rows: [lookupRow()] }) // both saw empty
+      .mockResolvedValueOnce({ rows: [] }) // this claimant lost the empty claim
+      .mockResolvedValueOnce({
+        rows: [lookupRow({ user_inputs: { leader_confirmed: true, intended_trigger_type: 'BO-PIVOT' } })]
+      }); // winner established the SAME value
+    await expect(
+      evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload({
+        intendedTrigger: { mode: 'establish', value: 'BO-PIVOT', assertedAt: 'T2-STALE' }
+      }))
+    ).rejects.toMatchObject({ code: 'STALE_DEPENDENCY' });
   });
 
   test('the original asserted_at survives an Entry rerun (preserve mode)', async () => {
@@ -227,5 +277,15 @@ describe('evaluationService.saveEntryProgress (Setup CAS + intended-trigger CAS)
       intendedTrigger: { mode: 'preserve', value: 'BO-PIVOT' }
     }));
     expect(updateParams[4].immutable_semantic_context.intended_trigger.asserted_at).toBe('2026-03-10T14:00:00.000Z');
+  });
+});
+
+describe('evaluationService.saveEntryProgress — SQL construction (PostgreSQL validity)', () => {
+  test('progress UPDATE does not reference a non-existent table alias', async () => {
+    installSuccessfulUpdate();
+    await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload());
+    const sql = db.query.mock.calls[1][0];
+    expect(sql).toContain("status NOT IN ('completed', 'insufficient_data')");
+    expect(sql).not.toMatch(/\be\.status\b/);
   });
 });

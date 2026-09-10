@@ -495,3 +495,80 @@ describe('EntryQualityService — criterion-driven trigger policy (finding 4)', 
     );
   });
 });
+
+describe('resolveEntryDailyEvidence — exact prior-session requirement (finding 3)', () => {
+  function dailyBarsWithPrior(priorCount) {
+    const bars = [];
+    for (let i = priorCount; i >= 1; i -= 1) {
+      const date = new Date(`${ENTRY_SESSION}T00:00:00.000Z`);
+      date.setUTCDate(date.getUTCDate() - i);
+      const iso = date.toISOString().split('T')[0];
+      bars.push({ date: iso, time: Math.floor(date.getTime() / 1000), open: 1, high: 2, low: 0.5, close: 1.5, volume: 100 });
+    }
+    bars.push({
+      date: ENTRY_SESSION,
+      time: Math.floor(new Date(`${ENTRY_SESSION}T00:00:00.000Z`).getTime() / 1000),
+      open: 1, high: 2, low: 0.5, close: 1.5, volume: 100
+    });
+    return bars;
+  }
+  function evaluationWithSnapshot(priorCount, completeness = 'verified') {
+    return { evidence_snapshot: { entrySessionDate: ENTRY_SESSION, completeness, source: 'finnhub', bars: dailyBarsWithPrior(priorCount) } };
+  }
+
+  test('pace reference_sessions=20: exactly 20 prior verified sessions is sufficient', async () => {
+    const result = await EntryQualityService.resolveEntryDailyEvidence({
+      evaluation: evaluationWithSnapshot(20), trade: { symbol: 'TEST' }, userId: 'u',
+      entrySession: ENTRY_SESSION, requiredPriorSessions: 20
+    });
+    expect(result.index).toBe(20);
+    expect(result.authoritative).toBe(true);
+  });
+
+  test('pace reference_sessions=20: 19 prior sessions is insufficient', async () => {
+    loadDailyEvidence.mockResolvedValue({ bars: dailyBarsWithPrior(19), completeness: 'verified', source: 'finnhub', error: null });
+    const result = await EntryQualityService.resolveEntryDailyEvidence({
+      evaluation: evaluationWithSnapshot(19), trade: { symbol: 'TEST' }, userId: 'u',
+      entrySession: ENTRY_SESSION, requiredPriorSessions: 20
+    });
+    expect(result.authoritative).toBe(false);
+  });
+
+  test('ADR20/ATR20: exactly 21 prior bars is sufficient, 20 is not', async () => {
+    const sufficient = await EntryQualityService.resolveEntryDailyEvidence({
+      evaluation: evaluationWithSnapshot(21), trade: { symbol: 'TEST' }, userId: 'u',
+      entrySession: ENTRY_SESSION, requiredPriorSessions: 21
+    });
+    expect(sufficient.authoritative).toBe(true);
+
+    loadDailyEvidence.mockResolvedValue({ bars: dailyBarsWithPrior(20), completeness: 'verified', source: 'finnhub', error: null });
+    const insufficient = await EntryQualityService.resolveEntryDailyEvidence({
+      evaluation: evaluationWithSnapshot(20), trade: { symbol: 'TEST' }, userId: 'u',
+      entrySession: ENTRY_SESSION, requiredPriorSessions: 21
+    });
+    expect(insufficient.authoritative).toBe(false);
+  });
+
+  test('combined ADR20 + pace20: 21 prior bars is sufficient (exact max)', async () => {
+    const result = await EntryQualityService.resolveEntryDailyEvidence({
+      evaluation: evaluationWithSnapshot(21), trade: { symbol: 'TEST' }, userId: 'u',
+      entrySession: ENTRY_SESSION, requiredPriorSessions: 21
+    });
+    expect(result.authoritative).toBe(true);
+  });
+
+  test('larger configured counts retain exact semantics', async () => {
+    const sufficient = await EntryQualityService.resolveEntryDailyEvidence({
+      evaluation: evaluationWithSnapshot(31), trade: { symbol: 'TEST' }, userId: 'u',
+      entrySession: ENTRY_SESSION, requiredPriorSessions: 31
+    });
+    expect(sufficient.authoritative).toBe(true);
+
+    loadDailyEvidence.mockResolvedValue({ bars: dailyBarsWithPrior(30), completeness: 'verified', source: 'finnhub', error: null });
+    const insufficient = await EntryQualityService.resolveEntryDailyEvidence({
+      evaluation: evaluationWithSnapshot(30), trade: { symbol: 'TEST' }, userId: 'u',
+      entrySession: ENTRY_SESSION, requiredPriorSessions: 31
+    });
+    expect(insufficient.authoritative).toBe(false);
+  });
+});

@@ -412,13 +412,15 @@ function buildVolatilityByMethod({ methods, dailyBars, entryIndex, entryBasis, p
 // snapshot when it contains enough completed sessions before the entry session;
 // otherwise fetches Entry-specific daily evidence and appends it separately
 // (never replacing the Setup snapshot).
-async function resolveEntryDailyEvidence({ evaluation, trade, userId, entrySession, requiredHistory }) {
+async function resolveEntryDailyEvidence({ evaluation, trade, userId, entrySession, requiredPriorSessions }) {
   const snapshot = setupSnapshot(evaluation);
   const setupBars = normalizeDailyBars(Array.isArray(snapshot.bars) ? snapshot.bars : []);
   const setupIndexMap = indexByDate(setupBars);
   const setupIndex = entrySession && setupIndexMap.has(entrySession) ? setupIndexMap.get(entrySession) : -1;
   const setupCompleteness = snapshot.completeness || 'unverified';
-  const history = Number.isInteger(requiredHistory) && requiredHistory > 0 ? requiredHistory : 2;
+  // REQUIRED PRIOR COMPLETED SESSIONS (exact, no padding).
+  const history =
+    Number.isInteger(requiredPriorSessions) && requiredPriorSessions >= 0 ? requiredPriorSessions : 0;
 
   if (setupIndex >= history) {
     return {
@@ -925,14 +927,21 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     rangeCriterion ? rangeCriterion.parameters.reference_sessions : 0
   );
   const period = needs.needsVolatility ? volatilityPeriod(entryConfig) : null;
-  const requiredDailyHistory = Math.max(period || 0, referenceCount || 0) + 2;
+  // Exact prior-completed-session requirements (finding 3):
+  //   volatility (ADR/ATR period N): N measured sessions + 1 preceding close
+  //                                  for the earliest measured session = N + 1
+  //   pace:                          reference_sessions preceding sessions
+  // No hidden safety padding contributes to the evidence-sufficiency decision.
+  const volatilityHistory = needs.needsVolatility && period ? period + 1 : 0;
+  const paceHistory = needs.needsReferenceSessions ? referenceCount : 0;
+  const requiredPriorSessions = Math.max(volatilityHistory, paceHistory);
   const entryDaily = needs.needsDailyEvidence
     ? await resolveEntryDailyEvidence({
         evaluation,
         trade,
         userId,
         entrySession: entrySessionDate,
-        requiredHistory: requiredDailyHistory
+        requiredPriorSessions
       })
     : null;
   const dailyBars = entryDaily ? entryDaily.bars : [];
@@ -1244,6 +1253,7 @@ module.exports = {
   parseIntendedTriggerType,
   buildEntryCriterionRows,
   buildEntryEvidenceBlock,
+  resolveEntryDailyEvidence,
   referenceSessionDates,
   neededVolatilityMethods,
   volatilityPeriod,

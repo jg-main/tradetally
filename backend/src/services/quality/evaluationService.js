@@ -48,7 +48,14 @@ const EVALUATION_COLUMNS = `
 
 const DIMENSION_SUMMARY_KEYS = ['setup', 'entry', 'management'];
 
-const TERMINAL_STATUS_SQL = "e.status NOT IN ('completed', 'insufficient_data')";
+// Terminal-status predicate. There are two variants because the qualifier must
+// match the statement: SELECTs alias the table as `e`, while the progress
+// UPDATEs do NOT alias the target (PostgreSQL rejects `e.status` with no `e` in
+// scope). Never interpolate the SELECT variant into an UPDATE.
+const TERMINAL_STATUS_SELECT_SQL = "e.status NOT IN ('completed', 'insufficient_data')";
+const TERMINAL_STATUS_UPDATE_SQL = "status NOT IN ('completed', 'insufficient_data')";
+// Backward-compatible export name (SELECT-qualified).
+const TERMINAL_STATUS_SQL = TERMINAL_STATUS_SELECT_SQL;
 
 // Mirrors the dimension result summaries returned by the aggregation engine
 // into the flat queryable columns on trade_quality_evaluations.
@@ -269,7 +276,7 @@ async function saveResult(evaluationId, userId, data) {
       WHERE e.id = $1
         AND e.user_id = $2
         AND p.user_id = $2
-        AND ${TERMINAL_STATUS_SQL}
+        AND ${TERMINAL_STATUS_SELECT_SQL}
     `,
     [evaluationId, userId]
   );
@@ -438,7 +445,7 @@ async function saveSetupProgress(evaluationId, userId, data = {}) {
       WHERE e.id = $1
         AND e.user_id = $2
         AND p.user_id = $2
-        AND ${TERMINAL_STATUS_SQL}
+        AND ${TERMINAL_STATUS_SELECT_SQL}
     `,
     [evaluationId, userId]
   );
@@ -552,7 +559,7 @@ async function saveSetupProgress(evaluationId, userId, data = {}) {
         evaluated_at = CURRENT_TIMESTAMP
       WHERE id = $1
         AND user_id = $2
-        AND ${TERMINAL_STATUS_SQL}
+        AND ${TERMINAL_STATUS_UPDATE_SQL}
         AND COALESCE(detected_context->>'${SETUP_CONTEXT_REVISION_KEY}', '') = $19
       RETURNING ${EVALUATION_COLUMNS}
     `,
@@ -628,7 +635,7 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
       WHERE e.id = $1
         AND e.user_id = $2
         AND p.user_id = $2
-        AND ${TERMINAL_STATUS_SQL}
+        AND ${TERMINAL_STATUS_SELECT_SQL}
     `,
     [evaluationId, userId]
   );
@@ -676,6 +683,13 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
   ) {
     throw entryStaleError('INTENDED_TRIGGER_IMMUTABLE');
   }
+
+  // A stale second claimant that proposes the SAME value as an already
+  // established trigger is normalized to PRESERVE: it must adopt the winner's
+  // provenance rather than write its own (stale) asserted_at. Only a request
+  // that observed an EMPTY trigger is a true establish claimant (finding 2).
+  const intendedMode =
+    intended.mode === 'establish' && currentTrigger !== null ? 'preserve' : intended.mode;
 
   const configuration = lookup.rows[0].configuration;
   if (
@@ -731,7 +745,7 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
   };
 
   const persistedUserInputs = { ...currentInputs };
-  if (intended.mode === 'establish') {
+  if (intendedMode === 'establish') {
     const previousContext =
       currentInputs.immutable_semantic_context &&
       typeof currentInputs.immutable_semantic_context === 'object'
@@ -751,7 +765,7 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
         asserted_at: previousTrigger.asserted_at || intended.assertedAt || new Date().toISOString()
       }
     };
-  } else if (intended.mode === 'preserve' && currentTrigger) {
+  } else if (intendedMode === 'preserve' && currentTrigger) {
     persistedUserInputs.intended_trigger_type = currentTrigger;
     const hasProvenance =
       currentInputs.immutable_semantic_context &&
@@ -774,7 +788,7 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
   const where = [
     'id = $1',
     'user_id = $2',
-    TERMINAL_STATUS_SQL,
+    TERMINAL_STATUS_UPDATE_SQL,
     `COALESCE(detected_context->>'${SETUP_DEPENDENCY_FINGERPRINT_KEY}', '') = $11`,
     `COALESCE(detected_context->>'${SETUP_CONTEXT_REVISION_KEY}', '') = $12`
   ];
@@ -792,13 +806,14 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
     currentFingerprint ?? '',
     currentRevision ?? ''
   ];
-  if (intended.mode === 'establish') {
-    // Empty -> claim; already equal -> idempotent; otherwise fail.
-    where.push(
-      `(COALESCE(user_inputs->>'intended_trigger_type', '') = '' OR user_inputs->>'intended_trigger_type' = $13)`
-    );
+  if (intendedMode === 'establish') {
+    // A true establish claimant may only claim an EMPTY trigger. It must never
+    // match an already-established value, otherwise two concurrent same-value
+    // claims could both succeed and the second would overwrite the first
+    // asserted_at (immutable provenance violation).
+    where.push(`COALESCE(user_inputs->>'intended_trigger_type', '') = ''`);
     params.push(intended.value);
-  } else if (intended.mode === 'preserve') {
+  } else if (intendedMode === 'preserve') {
     where.push(`COALESCE(user_inputs->>'intended_trigger_type', '') = $13`);
     params.push(intended.value);
   }
@@ -827,7 +842,7 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
       `
         SELECT e.detected_context, e.user_inputs
         FROM trade_quality_evaluations e
-        WHERE e.id = $1 AND e.user_id = $2 AND ${TERMINAL_STATUS_SQL}
+        WHERE e.id = $1 AND e.user_id = $2 AND ${TERMINAL_STATUS_SELECT_SQL}
       `,
       [evaluationId, userId]
     );
@@ -844,9 +859,11 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
       typeof latestInputs.intended_trigger_type === 'string' && latestInputs.intended_trigger_type
         ? latestInputs.intended_trigger_type
         : null;
-    if (intended.mode !== 'none' && latestTrigger !== null && latestTrigger !== intended.value) {
+    if (intendedMode !== 'none' && latestTrigger !== null && latestTrigger !== intended.value) {
       throw entryStaleError('INTENDED_TRIGGER_IMMUTABLE');
     }
+    // Same value (idempotent race) or no trigger: the winner's provenance must
+    // be preserved, so the loser re-runs against the persisted state.
     throw entryStaleError('STALE_DEPENDENCY');
   }
   return updated.rows[0] || null;
@@ -884,6 +901,9 @@ module.exports = {
   DIMENSION_SUMMARY_KEYS,
   summariesFromResults,
   normalizeCriterionRows,
+  TERMINAL_STATUS_SELECT_SQL,
+  TERMINAL_STATUS_UPDATE_SQL,
+  TERMINAL_STATUS_SQL,
   createEvaluation,
   saveResult,
   saveSetupProgress,

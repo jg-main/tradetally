@@ -54,10 +54,12 @@ function lookupRow(overrides = {}) {
 }
 
 let updateParams;
+let updateSql;
 
 function installUpdate() {
   db.query.mockImplementationOnce((sql, params) => {
     updateParams = params;
+    updateSql = sql;
     return { rows: [{ id: 'eval-1', status: 'draft', results: null }] };
   });
 }
@@ -65,6 +67,7 @@ function installUpdate() {
 beforeEach(() => {
   jest.clearAllMocks();
   updateParams = null;
+  updateSql = null;
 });
 
 function setupInput() {
@@ -226,5 +229,16 @@ describe('Setup downstream-state coherence + compare-and-swap (Phase 3 follow-up
     });
     expect(updateParams[5].setup_context_revision).toBe('3');
     expect(updateParams[18]).toBe('2');
+  });
+});
+
+describe('evaluationService.saveSetupProgress — SQL construction (PostgreSQL validity)', () => {
+  test('progress UPDATE does not reference a non-existent table alias', async () => {
+    db.query.mockResolvedValueOnce({ rows: [lookupRow()] });
+    installUpdate();
+    await evaluationService.saveSetupProgress('eval-1', 'user-1', setupInput());
+    expect(updateSql).toContain("status NOT IN ('completed', 'insufficient_data')");
+    // The UPDATE target is not aliased, so `e.status` would be invalid SQL.
+    expect(updateSql).not.toMatch(/\be\.status\b/);
   });
 });
