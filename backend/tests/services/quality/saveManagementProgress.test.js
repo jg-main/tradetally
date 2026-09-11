@@ -244,6 +244,52 @@ describe('saveManagementProgress — trailing phase immutability (F6)', () => {
   });
 });
 
+describe('saveManagementProgress — trailing activation boundary immutability (F4a)', () => {
+  test('establishes the activation session once with post-trade provenance', async () => {
+    installSuccessfulUpdate();
+    await evaluationService.saveManagementProgress('eval-1', 'user-1', passingManagementPayload({
+      trailingActivation: { mode: 'establish', session: '2026-03-12' }
+    }));
+    expect(updateParams[4].trailing_activation_session).toBe('2026-03-12');
+    expect(updateParams[4].immutable_semantic_context.trailing_activation).toEqual(
+      expect.objectContaining({ session: '2026-03-12', source: 'user_asserted', timing: 'post_trade', asserted_at: expect.any(String) })
+    );
+    expect(updateSql).toContain("COALESCE(user_inputs->>'trailing_activation_session', '') = ''");
+  });
+
+  test('rejects a conflicting activation boundary (TRAILING_ACTIVATION_IMMUTABLE)', async () => {
+    db.query.mockResolvedValueOnce({
+      rows: [lookupRow({ user_inputs: { leader_confirmed: true, trailing_activation_session: '2026-03-12' } })]
+    });
+    await expect(
+      evaluationService.saveManagementProgress('eval-1', 'user-1', passingManagementPayload({
+        trailingActivation: { mode: 'establish', session: '2026-03-13' }
+      }))
+    ).rejects.toMatchObject({ code: 'TRAILING_ACTIVATION_IMMUTABLE' });
+    expect(db.query).toHaveBeenCalledTimes(1);
+  });
+
+  test('preserve binds the activation session and keeps the first asserted_at', async () => {
+    installSuccessfulUpdate({
+      row: lookupRow({
+        user_inputs: {
+          leader_confirmed: true,
+          trailing_activation_session: '2026-03-12',
+          immutable_semantic_context: { trailing_activation: { session: '2026-03-12', asserted_at: '2026-03-12T10:00:00.000Z' } }
+        }
+      })
+    });
+    await evaluationService.saveManagementProgress('eval-1', 'user-1', passingManagementPayload({
+      trailingActivation: { mode: 'preserve', session: '2026-03-12' }
+    }));
+    const persisted = updateParams[4];
+    expect(persisted.trailing_activation_session).toBe('2026-03-12');
+    expect(persisted.immutable_semantic_context.trailing_activation.asserted_at).toBe('2026-03-12T10:00:00.000Z');
+    expect(updateSql).toContain("user_inputs->>'trailing_activation_session', '') = $14");
+    expect(updateParams).toHaveLength(14);
+  });
+});
+
 describe('saveManagementProgress — SQL placeholder/parameter parity', () => {
   test('mode none: highest $N equals params.length', async () => {
     installSuccessfulUpdate();

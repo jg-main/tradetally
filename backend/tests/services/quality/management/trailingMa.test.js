@@ -131,3 +131,52 @@ describe('classifyTrailingExecution', () => {
     expect(result.reason).toBe('execution_window_unconfigured');
   });
 });
+
+describe('classifyTrailingExecution — one-session-late is bounded to the regular session (F3)', () => {
+  const nextSession = { date: '2026-03-07', openEpoch: 1_000_000, closeEpoch: 1_000_000 + 6.5 * 3600 };
+  const secondNextSession = { date: '2026-03-08', openEpoch: 1_000_000 + 86_400, closeEpoch: 1_000_000 + 86_400 + 6.5 * 3600 };
+  const secondOpen = secondNextSession.openEpoch;
+  const secondClose = secondNextSession.closeEpoch;
+
+  it('after-hours after the next session closes is NOT one_session_late', () => {
+    const result = classifyTrailingExecution({
+      nextSession, secondNextSession, actualExitEpoch: nextSession.closeEpoch + 600, executionWindowMinutes: 30
+    });
+    expect(result.outcome).toBe('later_or_ignored');
+  });
+
+  it('overnight between the two regular sessions is NOT one_session_late', () => {
+    const result = classifyTrailingExecution({
+      nextSession, secondNextSession, actualExitEpoch: secondOpen - 3600, executionWindowMinutes: 30
+    });
+    expect(result.outcome).toBe('later_or_ignored');
+  });
+
+  it('second-next-session premarket is NOT one_session_late', () => {
+    const result = classifyTrailingExecution({
+      nextSession, secondNextSession, actualExitEpoch: secondOpen - 60, executionWindowMinutes: 30
+    });
+    expect(result.outcome).toBe('later_or_ignored');
+  });
+
+  it('exactly at the second-next-session open IS one_session_late', () => {
+    const result = classifyTrailingExecution({
+      nextSession, secondNextSession, actualExitEpoch: secondOpen, executionWindowMinutes: 30
+    });
+    expect(result.outcome).toBe('one_session_late');
+  });
+
+  it('regular second-next-session intraday IS one_session_late', () => {
+    const result = classifyTrailingExecution({
+      nextSession, secondNextSession, actualExitEpoch: secondOpen + 3600, executionWindowMinutes: 30
+    });
+    expect(result.outcome).toBe('one_session_late');
+  });
+
+  it('exactly at the second-next-session close is NOT one_session_late [open, close)', () => {
+    const result = classifyTrailingExecution({
+      nextSession, secondNextSession, actualExitEpoch: secondClose, executionWindowMinutes: 30
+    });
+    expect(result.outcome).toBe('later_or_ignored');
+  });
+});

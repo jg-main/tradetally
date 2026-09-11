@@ -71,12 +71,12 @@ function findTrailingSignal({ bars, period, fromIndex, completedThroughIndex }) 
 /**
  * Classifies actual-exit execution timing relative to a trailing signal.
  *
- * Boundary semantics (inclusive where stated):
+ * Boundary convention: regular-session windows are half-open `[open, close)`.
  *   - exit before the next session open           -> later_or_ignored (0)
  *   - open <= exit <= open + windowMinutes         -> within_window (100)
  *   - windowClose < exit < next session close      -> later_same_next_session (70)
- *   - next session close <= exit < second close    -> one_session_late (40)
- *   - otherwise                                    -> later_or_ignored (0)
+ *   - second open <= exit < second session close   -> one_session_late (40)
+ *   - otherwise (overnight, premarket, after close) -> later_or_ignored (0)
  *
  * @returns {object}
  */
@@ -119,14 +119,19 @@ function classifyTrailingExecution({
   if (actualExitEpoch < nextSession.closeEpoch) {
     return { ...base, outcome: 'later_same_next_session', reason: null };
   }
+  // One session late ONLY when the exit is within the following regular
+  // session. Overnight (after the next close, before the second open) and
+  // second-day premarket are not the late regular session.
   if (
     secondNextSession &&
+    isFiniteNumber(secondNextSession.openEpoch) &&
     isFiniteNumber(secondNextSession.closeEpoch) &&
+    actualExitEpoch >= secondNextSession.openEpoch &&
     actualExitEpoch < secondNextSession.closeEpoch
   ) {
     return { ...base, outcome: 'one_session_late', reason: null };
   }
-  return { ...base, outcome: 'later_or_ignored', reason: 'exit_after_one_late_session' };
+  return { ...base, outcome: 'later_or_ignored', reason: 'exit_outside_second_regular_session' };
 }
 
 module.exports = {

@@ -345,8 +345,24 @@ function parseTrailingPhase(rawValue) {
   );
 }
 
-// Day 1 post-entry high. Never uses the whole daily bar when the entry is not
-// at/after the session open.
+// Validates an asserted activation session date (YYYY-MM-DD). Malformed values
+// are rejected rather than silently ignored.
+function parseActivationSession(rawValue) {
+  if (rawValue === undefined || rawValue === null || rawValue === '') return null;
+  const value = String(rawValue);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    throw new ManagementQualityInputError(
+      `trailing_activation_session must be a YYYY-MM-DD session date; got ${JSON.stringify(rawValue)}.`,
+      'INVALID_ACTIVATION_SESSION'
+    );
+  }
+  return value;
+}
+
+// Day 1 post-entry high. The whole daily bar is valid only when the actual
+// entry is at/before the regular-session open; otherwise only evidence
+// genuinely observable at/after the entry and within the Day-1 regular session
+// is used. Later-day scale-ins and pre-entry prints can never influence it.
 async function resolveDayOnePostEntryHigh({
   day1Bar,
   entryEpoch,
@@ -364,8 +380,9 @@ async function resolveDayOnePostEntryHigh({
   if (!day1Bar || !bounds) {
     return { available: false, high: null, precision: null, source: null, possibleX: false, reason: 'day1_session_unknown' };
   }
-  if (isFiniteNumber(entryEpoch) && entryEpoch <= bounds.openEpoch + 60) {
-    // The entire regular session is at/after the entry; the daily high is valid.
+  if (isFiniteNumber(entryEpoch) && entryEpoch <= bounds.openEpoch) {
+    // The actual entry is at/before the open, so the entire regular session is
+    // post-entry and the completed daily high is exact.
     return {
       available: true,
       high: day1Bar.high,
@@ -375,28 +392,50 @@ async function resolveDayOnePostEntryHigh({
       reason: null
     };
   }
+
+  // Entry after the open: bound every observation to the Day-1 regular session
+  // and at/after the entry.
+  const boundedObservations = (observations || []).filter((obs) =>
+    isFiniteNumber(obs.price) && obs.price > 0 &&
+    isFiniteNumber(obs.epoch) &&
+    obs.epoch >= bounds.openEpoch &&
+    obs.epoch < bounds.closeEpoch &&
+    (!isFiniteNumber(entryEpoch) || obs.epoch >= entryEpoch)
+  );
+
+  let high = -Infinity;
+  let precision = null;
+  let source = null;
   try {
     const intraday = await loadSessionIntradayBars(symbol, day1Bar.date, userId);
     if (intraday && intraday.available && intraday.bars.length > 0) {
-      const scoped = intraday.bars.filter((bar) => !isFiniteNumber(entryEpoch) || bar.time >= entryEpoch);
-      let high = -Infinity;
-      for (const bar of scoped) if (isFiniteNumber(bar.high)) high = Math.max(high, bar.high);
-      for (const obs of observations || []) {
-        if (isFiniteNumber(obs.price) && obs.price > 0) high = Math.max(high, obs.price);
+      let intradayHigh = -Infinity;
+      for (const bar of intraday.bars) {
+        if (!isFiniteNumber(bar.time) || !isFiniteNumber(bar.high)) continue;
+        if (bar.time < bounds.openEpoch || bar.time >= bounds.closeEpoch) continue;
+        if (isFiniteNumber(entryEpoch) && bar.time < entryEpoch) continue;
+        intradayHigh = Math.max(intradayHigh, bar.high);
       }
-      if (high !== -Infinity) {
-        return {
-          available: true,
-          high,
-          precision: '1min_bar',
-          source: intraday.source || 'intraday_cache',
-          possibleX: false,
-          reason: null
-        };
+      if (intradayHigh !== -Infinity) {
+        high = intradayHigh;
+        precision = '1min_bar';
+        source = intraday.source || 'intraday_cache';
       }
     }
   } catch (error) {
-    // Fall through to the unknown state; never fabricate.
+    // Fall through; bounded observations may still establish the high.
+  }
+  for (const obs of boundedObservations) {
+    if (obs.price > high) {
+      high = obs.price;
+      if (!precision) {
+        precision = 'execution_print';
+        source = 'executions_jsonb';
+      }
+    }
+  }
+  if (high !== -Infinity) {
+    return { available: true, high, precision: precision || 'execution_print', source: source || 'executions_jsonb', possibleX: false, reason: null };
   }
   return {
     available: false,
@@ -577,6 +616,16 @@ function buildManagementEvidenceBlock({
             : null,
           crossing_precision: partialTrigger.crossing ? partialTrigger.crossing.precision : null,
           crossing_source: partialTrigger.crossing ? partialTrigger.crossing.source : null,
+          boundary: partialTrigger.boundary
+            ? {
+                kind: partialTrigger.boundary.kind,
+                session: partialTrigger.boundary.sessionDate || null,
+                epoch: partialTrigger.boundary.epoch,
+                precision: partialTrigger.boundary.precision || null,
+                source: partialTrigger.boundary.source || null,
+                ordering_known: partialTrigger.boundary.orderingKnown === true
+              }
+            : null,
           reason: partialTrigger.reason || null,
           mfe_by_day: partialTrigger.mfeByDay || []
         }
@@ -590,6 +639,7 @@ function buildManagementEvidenceBlock({
           quantity_unit: partialCompletion.rounding ? partialCompletion.rounding.unit : null,
           rounding_resolved: partialCompletion.rounding ? partialCompletion.rounding.resolved : null,
           completion_session: partialCompletion.completionSessionDate || null,
+          completion_relation: partialCompletion.completionRelation || null,
           sessions_after_trigger: partialCompletion.sessionsAfterTrigger,
           timing_outcome: partialCompletion.timingOutcome || null
         }
@@ -611,6 +661,7 @@ function buildManagementEvidenceBlock({
           activation_source: trailing.activationSource,
           activation_resolved: trailing.activationResolved,
           active: trailing.active,
+          activation_session: trailing.activationSessionDate || null,
           activation_session_index: trailing.activationSessionIndex ?? null,
           inactive_reason: trailing.inactiveReason || null,
           signal_date: trailing.signal ? trailing.signal.date : null,
@@ -678,6 +729,52 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
       ? prepareInputs.trailing_phase
       : null);
 
+  // Resolve deterministic Management applicability so the workflow never asks
+  // for a trailing MA that is ultimately irrelevant (e.g. canonical
+  // after_partial with a never-triggered partial).
+  const nowEpoch = nowEpochSeconds();
+  const core = await resolveManagementCore({ trade, userId, entryContext, policy, nowEpoch });
+  const { partialTrigger, partialBoundary, fillsState, quantityUnit, sessionIndexForDate } = core;
+  const previewTargetPct = policy.partialTarget ? policy.partialTarget.target_pct : null;
+  let previewCompletion = { completed: false };
+  if (policy.partialTrigger && policy.partialTarget && partialTrigger && partialTrigger.status === 'triggered' && fillsState.available) {
+    previewCompletion = resolvePartialCompletion({
+      reductions: fillsState.reductions,
+      originalPositionQty: entryContext.originalPositionQty,
+      targetFraction: previewTargetPct !== null ? previewTargetPct / 100 : null,
+      targetPct: previewTargetPct,
+      quantityUnit,
+      triggerDueSessionIndex: partialTrigger.dueSessionIndex,
+      boundary: partialBoundary,
+      sessionIndexForDate
+    });
+  }
+  const previewExit = fillsState.available && partialTrigger && partialTrigger.status === 'triggered'
+    ? resolvePartialExitSupersession({
+        reductions: fillsState.reductions,
+        originalPositionQty: entryContext.originalPositionQty,
+        boundary: partialBoundary,
+        stopExecutionClassification: null
+      })
+    : { outcome: 'none' };
+  const establishedActivationSession =
+    (typeof prepareInputs.trailing_activation_session === 'string' && prepareInputs.trailing_activation_session) ||
+    (prepareInputs.immutable_semantic_context &&
+      prepareInputs.immutable_semantic_context.trailing_activation &&
+      prepareInputs.immutable_semantic_context.trailing_activation.session) ||
+    null;
+  const applicability = resolveTrailingApplicability({
+    policy,
+    partialTrigger,
+    partialCompletion: previewCompletion,
+    partialExit: previewExit,
+    trailingPhase: establishedPhase,
+    activationSessionEstablished: !!establishedActivationSession
+  });
+  const effectiveRequiredInputs = [];
+  if (applicability.smaRequired) effectiveRequiredInputs.push('trailing_ma_period');
+  if (applicability.activationSessionRequired) effectiveRequiredInputs.push('trailing_activation_session');
+
   return {
     evaluation: toFrontendEvaluation(evaluation),
     profileVersion: {
@@ -714,97 +811,84 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
         (prepareDetected.management &&
           prepareDetected.management.trailing_phase &&
           prepareDetected.management.trailing_phase.assertedAt) ||
-        null
+        null,
+      activationSession: establishedActivationSession,
+      activationSessionEstablished: !!establishedActivationSession,
+      smaRequired: applicability.smaRequired,
+      applicabilityReason: applicability.reason
     },
+    trailingApplicability: applicability,
     allowedTrailingPeriods: requiredInputs.includes('trailing_ma_period') ? allowedTrailingPeriodsFromConfig(managementConfig) : [],
-    requiredManagementUserInputs: requiredInputs,
+    requiredManagementUserInputs: effectiveRequiredInputs,
     managementCriterionKeys: enabledManagementCriteria(managementConfig).map((criterion) => criterion.key)
   };
 }
 
-async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInputs, trustedStopHistory, trustedStopExecutionClassification } = {}) {
-  if (!evaluationId) throw new ManagementQualityInputError('Run management prepare() first; evaluationId is required.', 'EVALUATION_REQUIRED');
-  const trade = await getTradeForUser(userId, tradeId);
-  if (!trade) throw new ManagementQualityInputError('Trade not found or not owned by this user.', 'TRADE_NOT_FOUND');
-  const evaluation = await resolveEvaluationForManagement(userId, tradeId, evaluationId);
-  const version = await loadVersionForEvaluation(evaluation, userId);
-  const managementConfig = getManagementDimensionConfig(version.configuration);
-  assertValidManagementConfiguration(managementConfig);
-
-  const entryContext = getEntryContext(evaluation);
-  const policy = resolveManagementPolicy(managementConfig);
-  const requiredInputs = requiredManagementUserInputsFromConfig(managementConfig);
-  const allowedPeriods = requiredInputs.includes('trailing_ma_period') ? allowedTrailingPeriodsFromConfig(managementConfig) : [];
-  const raw = rawUserInputs && typeof rawUserInputs === 'object' ? rawUserInputs : {};
-
-  // ---- Immutable semantic assertions (first assertion wins) ----------------
-  const storedInputs = parseJsonField(evaluation.user_inputs) || {};
-  const storedDetected = parseJsonField(evaluation.detected_context) || {};
-  const storedImmutableTrailing =
-    storedInputs.immutable_semantic_context &&
-    storedInputs.immutable_semantic_context.trailing_ma &&
-    typeof storedInputs.immutable_semantic_context.trailing_ma.value === 'number'
-      ? storedInputs.immutable_semantic_context.trailing_ma
-      : null;
-  const persistedTrailing =
-    (storedImmutableTrailing && storedImmutableTrailing.value) ||
-    (Number.isFinite(Number(storedInputs.trailing_ma_period)) ? Number(storedInputs.trailing_ma_period) : null);
-  const storedImmutablePhase =
-    storedInputs.immutable_semantic_context &&
-    storedInputs.immutable_semantic_context.trailing_phase &&
-    typeof storedInputs.immutable_semantic_context.trailing_phase.value === 'string'
-      ? storedInputs.immutable_semantic_context.trailing_phase
-      : null;
-  const persistedPhase =
-    (storedImmutablePhase && storedImmutablePhase.value) ||
-    (storedInputs.trailing_phase === 'activated' || storedInputs.trailing_phase === 'not_activated'
-      ? storedInputs.trailing_phase
-      : null);
-  const requestedPhase = parseTrailingPhase(raw.trailing_phase);
-  let trailingPhase = persistedPhase || null;
-  let phaseMode = 'none';
-  let phaseAssertedAt = null;
-  if (persistedPhase) {
-    if (requestedPhase !== null && requestedPhase !== persistedPhase) {
-      throw new ManagementQualityInputError(
-        `trailing_phase is immutable for this evaluation (already asserted as ${persistedPhase}).`,
-        'TRAILING_PHASE_IMMUTABLE'
-      );
-    }
-    phaseMode = 'preserve';
-    phaseAssertedAt = (storedImmutablePhase && storedImmutablePhase.asserted_at) || null;
-  } else if (policy.trailingActivation === 'explicit' && requestedPhase !== null) {
-    trailingPhase = requestedPhase;
-    phaseMode = 'establish';
+// Maps an asserted activation session date to a daily-bar index: exact session
+// when present, otherwise the first session at/after the date.
+function resolveActivationSessionIndex(daily, date) {
+  if (!date || !daily || !Array.isArray(daily.bars)) return null;
+  if (daily.indexMap && daily.indexMap.has(date)) {
+    const exact = daily.indexMap.get(date);
+    if (Number.isInteger(exact)) return exact;
   }
-
-  const requestedTrailing = raw.trailing_ma_period;
-  let trailingPeriod = null;
-  let trailingMode = 'none';
-  let trailingSelectedAt = null;
-  // A not_activated explicit phase makes the trailing MA criterion N/A, so no
-  // MA selection is required.
-  const periodRequired = requiredInputs.includes('trailing_ma_period') && trailingPhase !== 'not_activated';
-  if (persistedTrailing) {
-    if (requestedTrailing === undefined || requestedTrailing === null || requestedTrailing === '' || Number(requestedTrailing) === persistedTrailing) {
-      trailingPeriod = persistedTrailing;
-    } else {
-      throw new ManagementQualityInputError(
-        `trailing_ma_period is immutable for this evaluation (already asserted as ${persistedTrailing}). Create a new evaluation to use a different trailing MA.`,
-        'TRAILING_MA_IMMUTABLE',
-        { persisted: persistedTrailing, requested: requestedTrailing, allowedPeriods }
-      );
-    }
-    trailingMode = 'preserve';
-    trailingSelectedAt = (storedImmutableTrailing && storedImmutableTrailing.selected_at) || null;
-  } else if (periodRequired) {
-    trailingPeriod = parseTrailingPeriod(requestedTrailing, { required: true, allowedPeriods });
-    trailingMode = trailingPeriod !== null ? 'establish' : 'none';
+  for (let i = 0; i < daily.bars.length; i += 1) {
+    if (daily.bars[i] && daily.bars[i].date >= date) return i;
   }
+  return null;
+}
 
+// Deterministic trailing-phase applicability used by prepare() (and mirrored by
+// evaluate()). Returns whether an SMA selection is actually required and
+// whether an explicit activation boundary is still needed.
+function resolveTrailingApplicability({ policy, partialTrigger, partialCompletion, partialExit, trailingPhase, activationSessionEstablished }) {
+  const activation = policy.trailingActivation || null;
+  const result = { activation, smaRequired: false, activationSessionRequired: false, reason: null };
+  if (!activation) return { ...result, reason: 'trailing_not_configured' };
+
+  if (activation === 'immediate') {
+    return { ...result, smaRequired: true, reason: 'immediate_activation' };
+  }
+  if (activation === 'explicit') {
+    if (trailingPhase === 'not_activated') {
+      return { ...result, smaRequired: false, reason: 'explicit_not_activated' };
+    }
+    if (trailingPhase === 'activated') {
+      return {
+        ...result,
+        smaRequired: true,
+        activationSessionRequired: !activationSessionEstablished,
+        reason: activationSessionEstablished ? 'explicit_activated' : 'explicit_activation_boundary_required'
+      };
+    }
+    return { ...result, smaRequired: true, reason: 'activation_not_asserted' };
+  }
+  // after_partial (canonical): trailing only activates after a completed partial.
+  if (partialExit && partialExit.outcome === 'superseded_protective') {
+    return { ...result, smaRequired: false, reason: 'protected_exit_before_partial' };
+  }
+  if (!partialTrigger || partialTrigger.status === 'pending' || partialTrigger.status === 'insufficient_evidence') {
+    return { ...result, smaRequired: true, reason: 'partial_trigger_pending' };
+  }
+  if (partialTrigger.status === 'never_reached') {
+    return { ...result, smaRequired: false, reason: 'partial_never_triggered' };
+  }
+  if (!partialCompletion || completedFalse(partialCompletion)) {
+    return { ...result, smaRequired: false, reason: 'partial_not_completed' };
+  }
+  return { ...result, smaRequired: true, reason: 'partial_completed' };
+}
+
+function completedFalse(partialCompletion) {
+  return partialCompletion.completed !== true;
+}
+
+async function resolveManagementCore({
+  trade, userId, entryContext, policy, nowEpoch,
+  trustedStopHistory = null, trustedStopExecutionClassification = null
+}) {
   const symbol = String(trade.symbol || '').trim().toUpperCase();
   const entrySession = entryContext.actualEntrySession || null;
-  const nowEpoch = nowEpochSeconds();
   const fillsResult = reconstructManagementFills(trade);
   const reductions = fillsResult
     ? reconstructReductions({
@@ -847,7 +931,8 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       bars: daily.bars,
       entryIndex: daily.entryIndex,
       latestDay: policy.partialTrigger.latest_day,
-      isSessionCompleted: (date) => isSessionCompleted(date, nowEpoch)
+      isSessionCompleted: (date) => isSessionCompleted(date, nowEpoch),
+      sessionBoundsForDate: regularSessionBounds
     });
     const day1 = dayEvidence.find((day) => day.day === 1);
     if (day1) {
@@ -922,7 +1007,20 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
           source: daily.source || 'daily_bar'
         };
       }
-      partialTrigger = { ...partialTrigger, crossing };
+      // The crossing instant also establishes the authoritative boundary when
+      // the first reach is on/after earliest_day. For the early case the
+      // boundary is deterministically the earliest_day regular-session open.
+      let boundary = partialTrigger.boundary;
+      if (boundary && boundary.kind === 'crossing') {
+        boundary = {
+          ...boundary,
+          epoch: isFiniteNumber(crossing.epoch) ? crossing.epoch : null,
+          precision: crossing.precision || 'session',
+          source: crossing.source || null,
+          orderingKnown: isFiniteNumber(crossing.epoch)
+        };
+      }
+      partialTrigger = { ...partialTrigger, crossing, boundary };
     }
   } else if (policy.partialTrigger) {
     partialTrigger = {
@@ -936,6 +1034,165 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       day1Uncertain: false
     };
   }
+
+  // ---- Authoritative partial trigger boundary -----------------------------
+  // A triggered evaluation uses an instant-level boundary (earliest_day open,
+  // or the first crossing instant). Non-trigger evaluation uses a
+  // session-granularity window-end boundary so only reductions strictly before
+  // the window are candidates.
+  const partialBoundary = (() => {
+    if (partialTrigger && partialTrigger.status === 'triggered' && partialTrigger.boundary) {
+      return { ...partialTrigger.boundary, mode: 'instant' };
+    }
+    let day = null;
+    if (partialTrigger && partialTrigger.status === 'never_reached') {
+      day = dayEvidence.length > 0 ? dayEvidence[dayEvidence.length - 1] : null;
+    } else if (daily.authoritative) {
+      day = [...dayEvidence].reverse().find((entry) => entry.sessionCompleted) || null;
+    }
+    if (!day) return null;
+    return {
+      mode: 'session',
+      kind: 'window_end',
+      day: day.day,
+      sessionIndex: day.sessionIndex,
+      sessionDate: day.sessionDate,
+      sessionOpenEpoch: day.sessionOpenEpoch,
+      sessionCloseEpoch: day.sessionCloseEpoch,
+      epoch: null,
+      precision: null,
+      source: null,
+      orderingKnown: false
+    };
+  })();
+  return {
+    symbol, entrySession, fillsResult, fillsState, daily, sessionIndexForDate,
+    quantityUnit, tickSize, stopHistory, stopExecutionClassification, initialR,
+    partialTrigger, dayEvidence, partialBoundary
+  };
+}
+
+async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInputs, trustedStopHistory, trustedStopExecutionClassification } = {}) {
+  if (!evaluationId) throw new ManagementQualityInputError('Run management prepare() first; evaluationId is required.', 'EVALUATION_REQUIRED');
+  const trade = await getTradeForUser(userId, tradeId);
+  if (!trade) throw new ManagementQualityInputError('Trade not found or not owned by this user.', 'TRADE_NOT_FOUND');
+  const evaluation = await resolveEvaluationForManagement(userId, tradeId, evaluationId);
+  const version = await loadVersionForEvaluation(evaluation, userId);
+  const managementConfig = getManagementDimensionConfig(version.configuration);
+  assertValidManagementConfiguration(managementConfig);
+
+  const entryContext = getEntryContext(evaluation);
+  const policy = resolveManagementPolicy(managementConfig);
+  const requiredInputs = requiredManagementUserInputsFromConfig(managementConfig);
+  const allowedPeriods = requiredInputs.includes('trailing_ma_period') ? allowedTrailingPeriodsFromConfig(managementConfig) : [];
+  const raw = rawUserInputs && typeof rawUserInputs === 'object' ? rawUserInputs : {};
+
+  // ---- Immutable semantic assertions (first assertion wins) ----------------
+  const storedInputs = parseJsonField(evaluation.user_inputs) || {};
+  const storedDetected = parseJsonField(evaluation.detected_context) || {};
+  const storedImmutableTrailing =
+    storedInputs.immutable_semantic_context &&
+    storedInputs.immutable_semantic_context.trailing_ma &&
+    typeof storedInputs.immutable_semantic_context.trailing_ma.value === 'number'
+      ? storedInputs.immutable_semantic_context.trailing_ma
+      : null;
+  const persistedTrailing =
+    (storedImmutableTrailing && storedImmutableTrailing.value) ||
+    (Number.isFinite(Number(storedInputs.trailing_ma_period)) ? Number(storedInputs.trailing_ma_period) : null);
+  const storedImmutablePhase =
+    storedInputs.immutable_semantic_context &&
+    storedInputs.immutable_semantic_context.trailing_phase &&
+    typeof storedInputs.immutable_semantic_context.trailing_phase.value === 'string'
+      ? storedInputs.immutable_semantic_context.trailing_phase
+      : null;
+  const persistedPhase =
+    (storedImmutablePhase && storedImmutablePhase.value) ||
+    (storedInputs.trailing_phase === 'activated' || storedInputs.trailing_phase === 'not_activated'
+      ? storedInputs.trailing_phase
+      : null);
+  const requestedPhase = parseTrailingPhase(raw.trailing_phase);
+  let trailingPhase = persistedPhase || null;
+  let phaseMode = 'none';
+  let phaseAssertedAt = null;
+  if (persistedPhase) {
+    if (requestedPhase !== null && requestedPhase !== persistedPhase) {
+      throw new ManagementQualityInputError(
+        `trailing_phase is immutable for this evaluation (already asserted as ${persistedPhase}).`,
+        'TRAILING_PHASE_IMMUTABLE'
+      );
+    }
+    phaseMode = 'preserve';
+    phaseAssertedAt = (storedImmutablePhase && storedImmutablePhase.asserted_at) || null;
+  } else if (policy.trailingActivation === 'explicit' && requestedPhase !== null) {
+    trailingPhase = requestedPhase;
+    phaseMode = 'establish';
+  }
+
+  // ---- Explicit activation boundary (first assertion wins) ----------------
+  const storedImmutableActivation =
+    storedInputs.immutable_semantic_context &&
+    storedInputs.immutable_semantic_context.trailing_activation &&
+    typeof storedInputs.immutable_semantic_context.trailing_activation.session === 'string'
+      ? storedInputs.immutable_semantic_context.trailing_activation
+      : null;
+  const persistedActivationSession =
+    (typeof storedInputs.trailing_activation_session === 'string' && storedInputs.trailing_activation_session) ||
+    (storedImmutableActivation && storedImmutableActivation.session) ||
+    null;
+  const requestedActivationSession = parseActivationSession(raw.trailing_activation_session);
+  let trailingActivationSession = persistedActivationSession || null;
+  let activationMode = 'none';
+  let activationAssertedAt = null;
+  if (persistedActivationSession) {
+    if (requestedActivationSession !== null && requestedActivationSession !== persistedActivationSession) {
+      throw new ManagementQualityInputError(
+        `trailing_activation_session is immutable for this evaluation (already asserted as ${persistedActivationSession}).`,
+        'TRAILING_ACTIVATION_IMMUTABLE'
+      );
+    }
+    activationMode = 'preserve';
+    activationAssertedAt = (storedImmutableActivation && storedImmutableActivation.asserted_at) || null;
+  } else if (requestedActivationSession !== null) {
+    trailingActivationSession = requestedActivationSession;
+    activationMode = 'establish';
+  }
+
+  const requestedTrailing = raw.trailing_ma_period;
+  let trailingPeriod = null;
+  let trailingMode = 'none';
+  let trailingSelectedAt = null;
+  // Canonical after_partial resolves activation deterministically after the
+  // partial; the SMA is parsed if supplied but only *required* once the
+  // trailing phase is proven active. explicit/immediate require it up front.
+  const maInputEnabled = requiredInputs.includes('trailing_ma_period') && trailingPhase !== 'not_activated';
+  const maRequiredUpFront = maInputEnabled && policy.trailingActivation !== 'after_partial';
+  if (persistedTrailing) {
+    if (requestedTrailing === undefined || requestedTrailing === null || requestedTrailing === '' || Number(requestedTrailing) === persistedTrailing) {
+      trailingPeriod = persistedTrailing;
+    } else {
+      throw new ManagementQualityInputError(
+        `trailing_ma_period is immutable for this evaluation (already asserted as ${persistedTrailing}). Create a new evaluation to use a different trailing MA.`,
+        'TRAILING_MA_IMMUTABLE',
+        { persisted: persistedTrailing, requested: requestedTrailing, allowedPeriods }
+      );
+    }
+    trailingMode = 'preserve';
+    trailingSelectedAt = (storedImmutableTrailing && storedImmutableTrailing.selected_at) || null;
+  } else if (maInputEnabled) {
+    trailingPeriod = parseTrailingPeriod(requestedTrailing, { required: maRequiredUpFront, allowedPeriods });
+    trailingMode = trailingPeriod !== null ? 'establish' : 'none';
+  }
+
+  const nowEpoch = nowEpochSeconds();
+  const core = await resolveManagementCore({
+    trade, userId, entryContext, policy, nowEpoch,
+    trustedStopHistory, trustedStopExecutionClassification
+  });
+  const {
+    symbol, entrySession, fillsResult, fillsState, daily, sessionIndexForDate,
+    quantityUnit, tickSize, stopHistory, stopExecutionClassification, initialR,
+    partialTrigger, dayEvidence, partialBoundary
+  } = core;
 
   // ---- Partial completion / sizing-at-event -------------------------------
   const targetPct = policy.partialTarget ? policy.partialTarget.target_pct : null;
@@ -951,6 +1208,7 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     completionSessionDate: null,
     completionSessionIndex: null,
     sessionsAfterTrigger: null,
+    completionRelation: null,
     timingOutcome: 'later_or_not_completed',
     rounding: { resolved: false, requiredQty: null, unit: null, reason: 'policy_unavailable' }
   };
@@ -968,6 +1226,7 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       targetPct,
       quantityUnit,
       triggerDueSessionIndex: partialTrigger.dueSessionIndex,
+      boundary: partialBoundary,
       sessionIndexForDate
     });
   } else if (policy.partialTrigger && policy.partialTarget && partialTrigger && partialTrigger.status === 'triggered' && !fillsState.available) {
@@ -978,35 +1237,35 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   }
 
   // ---- Partial exit supersession / premature reduction --------------------
-  const partialExit = fillsState.available
+  // Supersession only applies when a trigger actually became due; a
+  // never_reached/pending partial has no due boundary to be superseded.
+  const partialExit = fillsState.available && partialTrigger && partialTrigger.status === 'triggered'
     ? resolvePartialExitSupersession({
         reductions: fillsState.reductions,
         originalPositionQty: entryContext.originalPositionQty,
-        dueSessionDate: partialTrigger ? partialTrigger.dueSessionDate : null,
+        boundary: partialBoundary,
         stopExecutionClassification
       })
     : { closedBeforeDue: false, outcome: 'none', closeSessionDate: null, closeTimeEpoch: null };
 
-  let boundarySessionDate = null;
-  if (partialTrigger && partialTrigger.status === 'triggered') {
-    boundarySessionDate = partialTrigger.dueSessionDate || null;
-  } else if (partialTrigger && partialTrigger.status === 'never_reached') {
-    const lastDay = dayEvidence.length > 0 ? dayEvidence[dayEvidence.length - 1] : null;
-    boundarySessionDate = lastDay ? lastDay.sessionDate : null;
-  } else if (daily.authoritative) {
-    const lastCompletedDay = [...dayEvidence].reverse().find((day) => day.sessionCompleted);
-    boundarySessionDate = lastCompletedDay ? lastCompletedDay.sessionDate : null;
-  }
   const prematureBase = fillsState.available
     ? resolvePrematureReduction({
         reductions: fillsState.reductions,
         originalPositionQty: entryContext.originalPositionQty,
-        boundarySessionDate,
+        boundary: partialBoundary,
         stopExecutionClassification
       })
-    : { outcome: 'not_evaluated', prematureQty: null, prematureFraction: null, excludedQty: 0, ambiguousQty: 0, boundarySessionDate };
+    : {
+        outcome: 'not_evaluated',
+        prematureQty: null,
+        prematureFraction: null,
+        excludedQty: 0,
+        ambiguousQty: 0,
+        boundarySessionDate: partialBoundary ? partialBoundary.sessionDate : null
+      };
   const prematureReduction = {
     ...prematureBase,
+    boundary: partialBoundary,
     classificationAvailable: !!(stopExecutionClassification && stopExecutionClassification.available),
     classificationComplete: !!(stopExecutionClassification && stopExecutionClassification.complete)
   };
@@ -1024,8 +1283,29 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
     sessionIndexForDate,
     executionWindowMinutes: policy.executionWindowMinutes,
     stopExecutionClassification,
-    userInputs: { ...storedInputs, ...raw }
+    userInputs: {
+      ...storedInputs,
+      ...raw,
+      trailing_activation_session: trailingActivationSession
+    }
   });
+
+  // Explicit activation without an authoritative boundary needs semantic input;
+  // never scan from entry. Likewise an active phase needs its SMA.
+  if (policy.trailingActivation === 'explicit' && trailingPhase === 'activated' && !trailingActivationSession) {
+    throw new ManagementQualityInputError(
+      'trailing_activation_session is required when the trailing phase is asserted activated.',
+      'INPUT_REQUIRED',
+      { field: 'trailing_activation_session' }
+    );
+  }
+  if (trailing.active === true && !trailingPeriod) {
+    throw new ManagementQualityInputError(
+      'trailing_ma_period is required because the trailing phase is active.',
+      'INPUT_REQUIRED',
+      { field: 'trailing_ma_period' }
+    );
+  }
 
   // ---- BE deadline context ------------------------------------------------
   const be = { deadlineEpoch: null, nextSessionCloseEpoch: null };
@@ -1081,6 +1361,9 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       : null,
     trailing_phase: trailingPhase
       ? { value: trailingPhase, source: 'user_asserted', assertedAt: phaseAssertedAt || new Date().toISOString(), timing: 'post_trade' }
+      : null,
+    trailing_activation: trailingActivationSession
+      ? { session: trailingActivationSession, source: 'user_asserted', assertedAt: activationAssertedAt || new Date().toISOString(), timing: 'post_trade' }
       : null
   };
 
@@ -1096,7 +1379,8 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       dependencyFingerprint,
       entryDependencyFingerprint: entryDependencyFingerprintValue,
       trailingMa: { mode: trailingMode, value: trailingPeriod, selectedAt: trailingSelectedAt },
-      trailingPhase: { mode: phaseMode, value: trailingPhase, assertedAt: phaseAssertedAt }
+      trailingPhase: { mode: phaseMode, value: trailingPhase, assertedAt: phaseAssertedAt },
+      trailingActivation: { mode: activationMode, session: trailingActivationSession, assertedAt: activationAssertedAt }
     });
   } catch (error) {
     if (
@@ -1104,7 +1388,8 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       (error.code === 'STALE_DEPENDENCY' ||
         error.code === 'STALE_ENTRY_DEPENDENCY' ||
         error.code === 'TRAILING_MA_IMMUTABLE' ||
-        error.code === 'TRAILING_PHASE_IMMUTABLE')
+        error.code === 'TRAILING_PHASE_IMMUTABLE' ||
+        error.code === 'TRAILING_ACTIVATION_IMMUTABLE')
     ) {
       throw new ManagementQualityInputError(error.message, error.code);
     }
@@ -1143,6 +1428,8 @@ function resolveTrailingState({
     activationSource,
     active: false,
     activationResolved: false,
+    activationSession: null,
+    activationSessionDate: null,
     activationSessionIndex: null,
     inactiveReason: null,
     signal: null,
@@ -1185,13 +1472,18 @@ function resolveTrailingState({
     if (trailingPhase === 'not_activated') {
       return { ...base, activationResolved: true, inactiveReason: 'user_asserted_not_activated' };
     }
+    // An activated explicit phase MUST have an authoritative activation
+    // boundary; never fall back to the partial completion or entry.
+    const assertedSession = userInputs && userInputs.trailing_activation_session;
+    const activationIndex = resolveActivationSessionIndex(daily, assertedSession);
+    if (!Number.isInteger(activationIndex)) {
+      return { ...base, activationResolved: false, inactiveReason: 'activation_boundary_missing' };
+    }
     base.active = true;
     base.activationResolved = true;
-    const assertedSession = userInputs && userInputs.trailing_activation_session;
-    base.activationSessionIndex =
-      (assertedSession && sessionIndexForDate(assertedSession)) ??
-      (partialCompletion && partialCompletion.completionSessionIndex) ??
-      daily.entryIndex;
+    base.activationSession = assertedSession || null;
+    base.activationSessionDate = daily.bars[activationIndex] ? daily.bars[activationIndex].date : (assertedSession || null);
+    base.activationSessionIndex = activationIndex;
   }
 
   if (!base.active) return base;
@@ -1325,6 +1617,7 @@ module.exports = {
   resolveManagementDailyEvidence,
   resolveDayOnePostEntryHigh,
   resolveTrailingState,
+  resolveTrailingApplicability,
   computeManagementDependencyFingerprint,
   computeManagementEntryDependencyFingerprint,
   toFrontendEvaluation

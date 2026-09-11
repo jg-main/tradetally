@@ -995,6 +995,18 @@ async function saveManagementProgress(evaluationId, userId, data = {}) {
     ? data.trailingPhase
     : { mode: 'none' };
 
+  const currentActivationSession =
+    (typeof currentInputs.trailing_activation_session === 'string' && currentInputs.trailing_activation_session)
+      ? currentInputs.trailing_activation_session
+      : (currentInputs.immutable_semantic_context &&
+          currentInputs.immutable_semantic_context.trailing_activation &&
+          typeof currentInputs.immutable_semantic_context.trailing_activation.session === 'string')
+        ? currentInputs.immutable_semantic_context.trailing_activation.session
+        : null;
+  const activation = data.trailingActivation && typeof data.trailingActivation === 'object'
+    ? data.trailingActivation
+    : { mode: 'none' };
+
   // In-memory pre-checks (the authoritative race protection is the SQL CAS).
   if (expectedFingerprint !== null && currentFingerprint !== expectedFingerprint) {
     throw managementStaleError('STALE_DEPENDENCY');
@@ -1034,6 +1046,23 @@ async function saveManagementProgress(evaluationId, userId, data = {}) {
     throw managementStaleError('TRAILING_PHASE_IMMUTABLE');
   }
   const phaseMode = phase.mode === 'establish' && currentPhase !== null ? 'preserve' : phase.mode;
+
+  if (
+    activation.mode === 'establish' &&
+    currentActivationSession !== null &&
+    currentActivationSession !== activation.session
+  ) {
+    throw managementStaleError('TRAILING_ACTIVATION_IMMUTABLE');
+  }
+  if (
+    activation.mode === 'preserve' &&
+    currentActivationSession !== null &&
+    currentActivationSession !== activation.session
+  ) {
+    throw managementStaleError('TRAILING_ACTIVATION_IMMUTABLE');
+  }
+  const activationMode =
+    activation.mode === 'establish' && currentActivationSession !== null ? 'preserve' : activation.mode;
 
   const configuration = lookup.rows[0].configuration;
   if (
@@ -1168,6 +1197,46 @@ async function saveManagementProgress(evaluationId, userId, data = {}) {
     }
   }
 
+  if (activationMode === 'establish') {
+    const previousContext =
+      persistedUserInputs.immutable_semantic_context &&
+      typeof persistedUserInputs.immutable_semantic_context === 'object'
+        ? persistedUserInputs.immutable_semantic_context
+        : {};
+    const previousActivation =
+      previousContext.trailing_activation && typeof previousContext.trailing_activation === 'object'
+        ? previousContext.trailing_activation
+        : {};
+    persistedUserInputs.trailing_activation_session = activation.session;
+    persistedUserInputs.immutable_semantic_context = {
+      ...previousContext,
+      trailing_activation: {
+        session: activation.session,
+        source: 'user_asserted',
+        asserted_at: previousActivation.asserted_at || activation.assertedAt || new Date().toISOString(),
+        timing: 'post_trade'
+      }
+    };
+  } else if (activationMode === 'preserve' && currentActivationSession !== null) {
+    persistedUserInputs.trailing_activation_session = currentActivationSession;
+    const previousContext =
+      persistedUserInputs.immutable_semantic_context &&
+      typeof persistedUserInputs.immutable_semantic_context === 'object'
+        ? persistedUserInputs.immutable_semantic_context
+        : {};
+    if (!(previousContext.trailing_activation && previousContext.trailing_activation.asserted_at)) {
+      persistedUserInputs.immutable_semantic_context = {
+        ...previousContext,
+        trailing_activation: {
+          session: currentActivationSession,
+          source: 'user_asserted',
+          asserted_at: activation.assertedAt || new Date().toISOString(),
+          timing: 'post_trade'
+        }
+      };
+    }
+  }
+
   const where = [
     'id = $1',
     'user_id = $2',
@@ -1204,6 +1273,13 @@ async function saveManagementProgress(evaluationId, userId, data = {}) {
   } else if (phaseMode === 'preserve') {
     where.push(`COALESCE(user_inputs->>'trailing_phase', '') = $${paramIndex}`);
     params.push(String(phase.value));
+    paramIndex += 1;
+  }
+  if (activationMode === 'establish') {
+    where.push(`COALESCE(user_inputs->>'trailing_activation_session', '') = ''`);
+  } else if (activationMode === 'preserve') {
+    where.push(`COALESCE(user_inputs->>'trailing_activation_session', '') = $${paramIndex}`);
+    params.push(String(activation.session));
     paramIndex += 1;
   }
 
@@ -1267,6 +1343,21 @@ async function saveManagementProgress(evaluationId, userId, data = {}) {
     if (phaseMode !== 'none' && latestPhase !== null && latestPhase !== phase.value) {
       throw managementStaleError('TRAILING_PHASE_IMMUTABLE');
     }
+    const latestActivationSession =
+      (typeof latestInputs.trailing_activation_session === 'string' && latestInputs.trailing_activation_session)
+        ? latestInputs.trailing_activation_session
+        : (latestInputs.immutable_semantic_context &&
+            latestInputs.immutable_semantic_context.trailing_activation &&
+            typeof latestInputs.immutable_semantic_context.trailing_activation.session === 'string')
+          ? latestInputs.immutable_semantic_context.trailing_activation.session
+          : null;
+    if (
+      activationMode !== 'none' &&
+      latestActivationSession !== null &&
+      latestActivationSession !== activation.session
+    ) {
+      throw managementStaleError('TRAILING_ACTIVATION_IMMUTABLE');
+    }
     throw managementStaleError('STALE_DEPENDENCY');
   }
   return updated.rows[0] || null;
@@ -1281,7 +1372,9 @@ function managementStaleError(code) {
     TRAILING_MA_IMMUTABLE:
       'trailing_ma_period is immutable for this evaluation; another request established a different value. Create a new evaluation to change it.',
     TRAILING_PHASE_IMMUTABLE:
-      'trailing_phase is immutable for this evaluation; another request established a different value. Create a new evaluation to change it.'
+      'trailing_phase is immutable for this evaluation; another request established a different value. Create a new evaluation to change it.',
+    TRAILING_ACTIVATION_IMMUTABLE:
+      'trailing_activation_session is immutable for this evaluation; another request established a different activation boundary. Create a new evaluation to change it.'
   };
   const error = new Error(messages[code] || 'Management results could not be saved.');
   error.code = code;

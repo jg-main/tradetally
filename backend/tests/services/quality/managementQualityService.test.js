@@ -168,7 +168,15 @@ beforeEach(() => {
     results: data.results
   }));
   loadDailyEvidence.mockResolvedValue({ bars: DAILY_BARS, source: 'finnhub', completeness: 'verified', error: null });
-  loadSessionIntradayBars.mockResolvedValue({ available: false, bars: [], source: null, reason: 'no intraday in tests' });
+  // Provide intraday crossing evidence for the Day-3 crossing session so
+  // same-session ordering can be confirmed; other sessions have no intraday.
+  loadSessionIntradayBars.mockImplementation(async (symbol, date) => {
+    if (date === addDays(ENTRY_SESSION, 2)) {
+      const open = Math.floor(Date.parse(`${date}T13:30:00.000Z`) / 1000);
+      return { available: true, bars: [{ time: open, high: 106, low: 100, close: 105 }], source: 'test_intraday' };
+    }
+    return { available: false, bars: [], source: null, reason: 'no intraday in tests' };
+  });
 });
 
 describe('ManagementQualityService.evaluate', () => {
@@ -422,6 +430,124 @@ describe('resolveTrailingState — activation gating (F6)', () => {
     });
     expect(notActivated.activationResolved).toBe(true);
     expect(notActivated.active).toBe(false);
+  });
+
+  test('explicit activated without an activation boundary does NOT scan from entry', () => {
+    const explicitPolicy = { ...policy, trailingActivation: 'explicit' };
+    const state = ManagementQualityService.resolveTrailingState({
+      policy: explicitPolicy,
+      partialTrigger: { status: 'never_reached' },
+      partialCompletion: { completed: false },
+      partialExit: { outcome: 'none' },
+      fillsState: { available: true, positionClosed: false },
+      daily,
+      nowEpoch: 0,
+      trailingPhase: 'activated',
+      sessionIndexForDate: () => null,
+      executionWindowMinutes: 30,
+      stopExecutionClassification: { available: false },
+      userInputs: { trailing_phase: 'activated' }
+    });
+    expect(state.active).toBe(false);
+    expect(state.activationResolved).toBe(false);
+    expect(state.inactiveReason).toBe('activation_boundary_missing');
+    expect(state.activationSessionIndex).toBeNull();
+  });
+
+  test('explicit activated with an authoritative session scans from that session', () => {
+    const explicitPolicy = { ...policy, trailingActivation: 'explicit' };
+    const state = ManagementQualityService.resolveTrailingState({
+      policy: explicitPolicy,
+      partialTrigger: { status: 'never_reached' },
+      partialCompletion: { completed: false },
+      partialExit: { outcome: 'none' },
+      fillsState: { available: true, positionClosed: false },
+      daily,
+      nowEpoch: 0,
+      trailingPhase: 'activated',
+      sessionIndexForDate: () => null,
+      executionWindowMinutes: 30,
+      stopExecutionClassification: { available: false },
+      userInputs: { trailing_phase: 'activated', trailing_activation_session: '2026-03-12', trailing_ma_period: 20 }
+    });
+    expect(state.active).toBe(true);
+    expect(state.activationResolved).toBe(true);
+    expect(state.activationSessionIndex).toBe(2);
+    expect(state.activationSession).toBe('2026-03-12');
+  });
+});
+
+describe('resolveTrailingApplicability (F4b)', () => {
+  const afterPartial = { trailingActivation: 'after_partial' };
+  const explicit = { trailingActivation: 'explicit' };
+
+  test('after_partial + never-triggered partial => no SMA required', () => {
+    const r = ManagementQualityService.resolveTrailingApplicability({
+      policy: afterPartial, partialTrigger: { status: 'never_reached' }, partialCompletion: { completed: false },
+      partialExit: { outcome: 'none' }, trailingPhase: null, activationSessionEstablished: false
+    });
+    expect(r.smaRequired).toBe(false);
+  });
+
+  test('after_partial + completed partial => SMA required', () => {
+    const r = ManagementQualityService.resolveTrailingApplicability({
+      policy: afterPartial, partialTrigger: { status: 'triggered' }, partialCompletion: { completed: true },
+      partialExit: { outcome: 'none' }, trailingPhase: null, activationSessionEstablished: false
+    });
+    expect(r.smaRequired).toBe(true);
+  });
+
+  test('after_partial + proven protective supersession => no SMA required', () => {
+    const r = ManagementQualityService.resolveTrailingApplicability({
+      policy: afterPartial, partialTrigger: { status: 'triggered' }, partialCompletion: { completed: false },
+      partialExit: { outcome: 'superseded_protective' }, trailingPhase: null, activationSessionEstablished: false
+    });
+    expect(r.smaRequired).toBe(false);
+  });
+
+  test('explicit not_activated => no SMA required', () => {
+    const r = ManagementQualityService.resolveTrailingApplicability({
+      policy: explicit, partialTrigger: { status: 'never_reached' }, partialCompletion: { completed: false },
+      partialExit: { outcome: 'none' }, trailingPhase: 'not_activated', activationSessionEstablished: false
+    });
+    expect(r.smaRequired).toBe(false);
+  });
+
+  test('explicit activated without boundary => SMA + activation boundary required', () => {
+    const r = ManagementQualityService.resolveTrailingApplicability({
+      policy: explicit, partialTrigger: { status: 'never_reached' }, partialCompletion: { completed: false },
+      partialExit: { outcome: 'none' }, trailingPhase: 'activated', activationSessionEstablished: false
+    });
+    expect(r.smaRequired).toBe(true);
+    expect(r.activationSessionRequired).toBe(true);
+  });
+});
+
+describe('Trailing applicability workflow (F4b)', () => {
+  function neverReachedBars() {
+    return DAILY_BARS.map((bar) => ({ ...bar, high: 101, close: 101 }));
+  }
+
+  test('prepare reports no SMA required for a never-triggered canonical after_partial phase', async () => {
+    loadDailyEvidence.mockResolvedValue({ bars: neverReachedBars(), source: 'finnhub', completeness: 'verified', error: null });
+    const payload = await ManagementQualityService.prepare(USER_ID, TRADE_ID, { evaluationId: EVAL_ID });
+    expect(payload.trailingMa.smaRequired).toBe(false);
+    expect(payload.requiredManagementUserInputs).not.toContain('trailing_ma_period');
+  });
+
+  test('canonical after_partial with a never-triggered partial evaluates without an SMA (trailing N/A)', async () => {
+    loadDailyEvidence.mockResolvedValue({ bars: neverReachedBars(), source: 'finnhub', completeness: 'verified', error: null });
+    await ManagementQualityService.evaluate(USER_ID, TRADE_ID, { evaluationId: EVAL_ID });
+    const data = evaluationService.saveManagementProgress.mock.calls[0][2];
+    const byKey = new Map(data.managementResults.criterionResults.map((r) => [r.key, r]));
+    expect(byKey.get('trailing_ma').status).toBe('NOT_APPLICABLE');
+    expect(data.managementEvidence.partial_trigger.status).toBe('never_reached');
+  });
+
+  test('a completed partial makes the SMA required (evaluate throws INPUT_REQUIRED without it)', async () => {
+    await expect(
+      ManagementQualityService.evaluate(USER_ID, TRADE_ID, { evaluationId: EVAL_ID })
+    ).rejects.toMatchObject({ code: 'INPUT_REQUIRED' });
   });
 });
 

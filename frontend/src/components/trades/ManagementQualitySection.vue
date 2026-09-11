@@ -103,6 +103,28 @@
           <option value="activated">Activated</option>
           <option value="not_activated">Not activated</option>
         </select>
+        <div v-if="activationSessionNeeded" class="mt-2" data-testid="mgmt-activation-session-block">
+          <label class="text-[11px] text-gray-500 dark:text-gray-400">Activation session (YYYY-MM-DD)</label>
+          <input
+            v-model="trailingActivationSession"
+            type="date"
+            class="mt-1 block rounded-md border border-gray-300 bg-white px-2 py-1 text-xs text-gray-800 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200"
+            data-testid="mgmt-activation-session"
+          />
+          <p class="mt-1 text-[10px] text-gray-400">
+            The authoritative session at which the trailing rule became active. Signals before this
+            session are not evaluated.
+          </p>
+        </div>
+        <div
+          v-else-if="activationSessionLocked && trailingPhase === 'activated'"
+          class="mt-2"
+          data-testid="mgmt-activation-session-locked"
+        >
+          <span class="rounded-md border border-gray-300 bg-gray-100 px-2 py-1 text-xs font-semibold text-gray-800 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200">
+            Active from {{ trailingActivationSession || 'asserted session' }}
+          </span>
+        </div>
         <p class="mt-1 text-[10px] text-gray-400">
           The trailing phase is applicable only if it activated. If it never activated, the trailing MA
           exit is NOT_APPLICABLE and no MA selection is required.
@@ -118,7 +140,7 @@
       </p>
 
       <!-- Trailing MA selection -->
-      <div v-if="requiresTrailingMa" class="mb-3 rounded-md bg-gray-50 px-3 py-2 dark:bg-gray-800">
+      <div v-if="smaRequired" class="mb-3 rounded-md bg-gray-50 px-3 py-2 dark:bg-gray-800">
         <div class="flex items-center justify-between">
           <span class="text-xs font-medium text-gray-700 dark:text-gray-300">Trailing MA (exit signal)</span>
           <span class="px-2 inline-flex text-xs font-semibold rounded-full bg-purple-100 text-purple-800 dark:bg-purple-900/20 dark:text-purple-400">
@@ -167,7 +189,9 @@
           {{ store.finalizing ? 'Completing…' : 'Complete Evaluation' }}
         </button>
         <span v-if="!canEvaluate" class="text-xs text-amber-600 dark:text-amber-400">
-          {{ requiresTrailingMa && !trailingPeriod ? 'Select a trailing MA first.' : '' }}
+          {{ activationSessionNeeded && !trailingActivationSession
+            ? 'Enter the activation session first.'
+            : (smaRequired && !trailingPeriod ? 'Select a trailing MA first.' : '') }}
         </span>
       </div>
     </template>
@@ -241,6 +265,7 @@ const prepared = ref(null)
 const evaluation = ref(null)
 const trailingPeriod = ref('')
 const trailingPhase = ref('')
+const trailingActivationSession = ref('')
 
 const CRITERION_LABELS = {
   partial_timing: 'Partial Timing',
@@ -336,17 +361,37 @@ const phaseLocked = computed(() => {
 
 const phaseNotActivated = computed(() => trailingPhase.value === 'not_activated')
 
+// Whether the SMA selection is actually required. prepare() resolves
+// deterministic applicability (e.g. canonical after_partial with a
+// never-triggered partial needs no SMA), falling back to the config-level
+// requirement for older payloads.
+const smaRequired = computed(() => {
+  const prep = prepared.value && prepared.value.trailingMa
+  if (prep && typeof prep.smaRequired === 'boolean') return prep.smaRequired
+  if (prepared.value && Array.isArray(prepared.value.requiredManagementUserInputs)) {
+    return prepared.value.requiredManagementUserInputs.includes('trailing_ma_period')
+  }
+  return requiresTrailingMa.value
+})
+
+const activationSessionLocked = computed(() => {
+  const prep = prepared.value && prepared.value.trailingMa
+  if (prep && prep.activationSessionEstablished) return true
+  const inputs = evaluation.value && evaluation.value.user_inputs
+  if (inputs && typeof inputs.trailing_activation_session === 'string' && inputs.trailing_activation_session) return true
+  const detected = evaluation.value && evaluation.value.detected_context
+  return !!(detected && detected.management && detected.management.trailing_activation && detected.management.trailing_activation.session)
+})
+
+const activationSessionNeeded = computed(
+  () => requiresActivationAssertion.value && trailingPhase.value === 'activated' && !activationSessionLocked.value
+)
+
 const canEvaluate = computed(() => {
   if (!entryReady.value) return false
   if (requiresActivationAssertion.value && !phaseLocked.value && !trailingPhase.value) return false
-  if (
-    requiresTrailingMa.value &&
-    !trailingLocked.value &&
-    !trailingPeriod.value &&
-    !phaseNotActivated.value
-  ) {
-    return false
-  }
+  if (activationSessionNeeded.value && !trailingActivationSession.value) return false
+  if (smaRequired.value && !trailingLocked.value && !trailingPeriod.value && !phaseNotActivated.value) return false
   return true
 })
 
@@ -409,12 +454,18 @@ function hydrateFromEvaluation(value) {
   if (inputs.trailing_phase === 'activated' || inputs.trailing_phase === 'not_activated') {
     trailingPhase.value = inputs.trailing_phase
   }
+  if (typeof inputs.trailing_activation_session === 'string' && inputs.trailing_activation_session) {
+    trailingActivationSession.value = inputs.trailing_activation_session
+  }
   const detected = value.detected_context
   if (!trailingPeriod.value && detected && detected.management && detected.management.trailing_ma) {
     trailingPeriod.value = detected.management.trailing_ma.value
   }
   if (!trailingPhase.value && detected && detected.management && detected.management.trailing_phase) {
     trailingPhase.value = detected.management.trailing_phase.value
+  }
+  if (!trailingActivationSession.value && detected && detected.management && detected.management.trailing_activation) {
+    trailingActivationSession.value = detected.management.trailing_activation.session
   }
 }
 
@@ -425,12 +476,18 @@ function hydrateFromPrepared(value) {
   if (value.trailingMa && value.trailingMa.phase) {
     trailingPhase.value = value.trailingMa.phase
   }
+  if (value.trailingMa && value.trailingMa.activationSession) {
+    trailingActivationSession.value = value.trailingMa.activationSession
+  }
   const inputs = value.evaluation && value.evaluation.user_inputs
   if (!trailingPeriod.value && inputs && typeof inputs.trailing_ma_period === 'number') {
     trailingPeriod.value = inputs.trailing_ma_period
   }
   if (!trailingPhase.value && inputs && (inputs.trailing_phase === 'activated' || inputs.trailing_phase === 'not_activated')) {
     trailingPhase.value = inputs.trailing_phase
+  }
+  if (!trailingActivationSession.value && inputs && typeof inputs.trailing_activation_session === 'string') {
+    trailingActivationSession.value = inputs.trailing_activation_session
   }
 }
 
@@ -455,7 +512,10 @@ async function runEvaluate() {
   }
   const userInputs = {}
   if (requiresActivationAssertion.value && trailingPhase.value) userInputs.trailing_phase = trailingPhase.value
-  if (requiresTrailingMa.value && trailingPeriod.value && !phaseNotActivated.value) {
+  if (trailingPhase.value === 'activated' && trailingActivationSession.value && !activationSessionLocked.value) {
+    userInputs.trailing_activation_session = trailingActivationSession.value
+  }
+  if (smaRequired.value && trailingPeriod.value && !phaseNotActivated.value) {
     userInputs.trailing_ma_period = trailingPeriod.value
   }
   try {

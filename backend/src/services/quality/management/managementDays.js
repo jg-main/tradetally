@@ -1,7 +1,7 @@
 'use strict';
 
 // Management day count, cumulative MFE-in-R, and partial-trigger maturity
-// (docs/QUALITY_PROFILES_REQUIREMENT.md sections 34, 35, 36).
+// (docs/QUALITY_PROFILES_REQUIREMENT.md sections 34, 35, 36, 40).
 //
 // Pure functions; no database access. Session sequencing is EXACT: management
 // days are derived from adjacent daily bars, never calendar arithmetic.
@@ -12,13 +12,16 @@
 // Point-in-time discipline (hardening):
 //   - Day 1's high must only include price evidence observable AFTER the actual
 //     initial-entry timestamp. The orchestrator supplies the post-entry Day-1
-//     high (intraday-derived or, when the entry is at/after the open, the
-//     completed daily bar). Day 1 is never assumed to equal the daily high.
+//     high; Day 1 is never assumed to equal the daily high.
 //   - Days 2..latest are fully after the entry session, so their daily high is
 //     valid for "highest since entry".
 //   - Trigger maturity is explicit: `never_reached` is only valid once every
-//     required regular session through latest_day has completed; before that
-//     the trigger is `pending`.
+//     required regular session through latest_day has completed.
+//   - The trigger exposes an authoritative BOUNDARY (section 36/40):
+//       * +1R reached before earliest_day -> due at earliest_day's regular
+//         session OPEN (no second touch required);
+//       * first reach on earliest_day..latest_day -> due at the first
+//         trustworthy crossing instant.
 
 function isFiniteNumber(value) {
   return typeof value === 'number' && Number.isFinite(value);
@@ -33,19 +36,17 @@ function managementDayForSession(entryIndex, sessionIndex) {
 }
 
 /**
- * Builds raw per-day evidence from normalized daily bars. Day 1 is flagged
- * `requiresEntryAdjustment` because its daily high includes pre-entry action;
- * the orchestrator must replace it with post-entry evidence before trigger
- * resolution.
+ * Builds per-day evidence from normalized daily bars, including the regular
+ * session bounds so the trigger can expose an instant-level boundary.
  *
  * @param {object} params
- * @param {Array} params.bars - normalized daily bars (ascending).
- * @param {number} params.entryIndex - entry session bar index.
- * @param {number} params.latestDay - inclusive upper management day.
+ * @param {Array} params.bars
+ * @param {number} params.entryIndex
+ * @param {number} params.latestDay
  * @param {Function} params.isSessionCompleted - sessionDate -> boolean.
- * @returns {Array<object>}
+ * @param {Function} [params.sessionBoundsForDate] - sessionDate -> { openEpoch, closeEpoch }.
  */
-function buildDayEvidence({ bars, entryIndex, latestDay, isSessionCompleted }) {
+function buildDayEvidence({ bars, entryIndex, latestDay, isSessionCompleted, sessionBoundsForDate }) {
   const days = [];
   if (!Array.isArray(bars) || !Number.isInteger(entryIndex) || entryIndex < 0) return days;
   for (let day = 1; day <= latestDay; day += 1) {
@@ -55,40 +56,45 @@ function buildDayEvidence({ bars, entryIndex, latestDay, isSessionCompleted }) {
     const completed = typeof isSessionCompleted === 'function'
       ? isSessionCompleted(bar.date) === true
       : false;
+    const bounds = typeof sessionBoundsForDate === 'function' ? sessionBoundsForDate(bar.date) : null;
     days.push({
       day,
       sessionIndex,
       sessionDate: bar.date,
-      // Whole-session high; valid for "highest since entry" only for day >= 2.
+      sessionOpenEpoch: bounds && isFiniteNumber(bounds.openEpoch) ? bounds.openEpoch : null,
+      sessionCloseEpoch: bounds && isFiniteNumber(bounds.closeEpoch) ? bounds.closeEpoch : null,
       high: isFiniteNumber(bar.high) ? bar.high : null,
       highKnown: isFiniteNumber(bar.high),
       source: 'daily_bar',
       precision: 'daily_bar',
       sessionCompleted: completed,
       requiresEntryAdjustment: day === 1,
-      // Set by the orchestrator for day 1 when post-entry evidence is missing
-      // but the daily upper bound already proves/denies a possible crossing.
       possibleX: false
     });
   }
   return days;
 }
 
+function buildBoundary(day, { kind, epoch, precision, source, orderingKnown }) {
+  return {
+    kind,
+    day: day ? day.day : null,
+    sessionIndex: day ? day.sessionIndex : null,
+    sessionDate: day ? day.sessionDate : null,
+    sessionOpenEpoch: day ? day.sessionOpenEpoch : null,
+    sessionCloseEpoch: day ? day.sessionCloseEpoch : null,
+    epoch: isFiniteNumber(epoch) ? epoch : null,
+    precision: precision || null,
+    source: source || null,
+    orderingKnown: orderingKnown === true
+  };
+}
+
 /**
- * Resolves the canonical partial trigger with point-in-time precision and
- * explicit observation maturity.
+ * Resolves the canonical partial trigger with point-in-time precision, an
+ * authoritative boundary, and explicit observation maturity.
  *
- * @param {object} params
- * @param {Array} params.dayEvidence - day 1..latest_day with adjusted high.
- * @param {number} params.entryBasis
- * @param {number} params.rPerShare
- * @param {object} params.parameters - { earliest_day, latest_day, minimum_mfe_r }.
- * @returns {object} trigger state:
- *   { status: 'triggered'|'never_reached'|'pending'|'insufficient_evidence',
- *     crossed, triggered, dueDay, dueSessionIndex, dueSessionDate,
- *     dueSessionCompleted, firstReachDay, firstReachSessionIndex,
- *     firstReachSessionDate, reachedEarly, horizonComplete, observedDays,
- *     day1Uncertain, reason, mfeByDay }
+ * @returns {object} trigger state including `boundary`.
  */
 function resolvePartialTrigger({ dayEvidence, entryBasis, rPerShare, parameters }) {
   const earliestDay = parameters ? parameters.earliest_day : null;
@@ -109,6 +115,7 @@ function resolvePartialTrigger({ dayEvidence, entryBasis, rPerShare, parameters 
     horizonComplete: false,
     observedDays: 0,
     day1Uncertain: false,
+    boundary: null,
     reason: null,
     mfeByDay: []
   };
@@ -124,7 +131,6 @@ function resolvePartialTrigger({ dayEvidence, entryBasis, rPerShare, parameters 
   }
 
   const thresholdPrice = entryBasis + minimumMfeR * rPerShare;
-  // Only sessions within the configured partial window participate.
   const scoped = dayEvidence.filter((day) => Number.isInteger(day.day) && day.day <= latestDay);
   const mfeByDay = [];
   let highest = -Infinity;
@@ -158,17 +164,33 @@ function resolvePartialTrigger({ dayEvidence, entryBasis, rPerShare, parameters 
   const horizonComplete = observedDays >= latestDay;
 
   const day1 = scoped.find((day) => day.day === 1);
-  const day1Uncertain =
-    !!day1 && day1.highKnown !== true && day1.possibleX === true;
-  const anyUnknownHigh = scoped.some(
-    (day) => day.highKnown !== true && day.possibleX !== true
-  );
+  const day1Uncertain = !!day1 && day1.highKnown !== true && day1.possibleX === true;
+  const anyUnknownHigh = scoped.some((day) => day.highKnown !== true && day.possibleX !== true);
 
   if (firstReachDay !== null) {
     const firstDay = scoped.find((day) => day.day === firstReachDay);
     const reachedEarly = firstReachDay < earliestDay;
     const dueDay = reachedEarly ? earliestDay : firstReachDay;
     const dueEntry = scoped.find((day) => day.day === dueDay);
+
+    // Boundary: early +1R is due at earliest_day's regular-session OPEN; a
+    // same-or-later first reach is due at the first crossing instant (the
+    // orchestrator fills the epoch when intraday evidence establishes it).
+    const boundary = reachedEarly
+      ? buildBoundary(dueEntry, {
+          kind: 'session_open',
+          epoch: dueEntry ? dueEntry.sessionOpenEpoch : null,
+          precision: 'session_open',
+          source: 'session_calendar',
+          orderingKnown: !!(dueEntry && isFiniteNumber(dueEntry.sessionOpenEpoch))
+        })
+      : buildBoundary(firstDay, {
+          kind: 'crossing',
+          epoch: null,
+          precision: null,
+          source: null,
+          orderingKnown: false
+        });
 
     const result = {
       ...base,
@@ -184,18 +206,14 @@ function resolvePartialTrigger({ dayEvidence, entryBasis, rPerShare, parameters 
       horizonComplete,
       observedDays,
       day1Uncertain,
+      boundary,
       mfeByDay
     };
 
     if (day1Uncertain && firstReachDay > earliestDay) {
-      // The true first crossing could be Day 1 (unknown) or firstReachDay, so
-      // the due session cannot be established honestly. When firstReachDay is
-      // at or before earliest_day the due session is earliest_day either way,
-      // so no ambiguity exists.
       return { ...result, status: 'insufficient_evidence', reason: 'day1_post_entry_evidence_unavailable' };
     }
     if (!dueEntry || !dueEntry.sessionCompleted) {
-      // The partial is due on a session that has not completed yet.
       return { ...result, status: 'pending', reason: 'due_session_not_observed' };
     }
     return { ...result, status: 'triggered', triggered: true, reason: null };
@@ -211,16 +229,6 @@ function resolvePartialTrigger({ dayEvidence, entryBasis, rPerShare, parameters 
   return { ...common, status: 'never_reached', reason: 'never_reached_minimum_mfe' };
 }
 
-/**
- * Finds the first moment within a session's intraday bars at which the
- * cumulative highest-since-entry reaches `thresholdPrice`. Only bars whose
- * interval OPEN is at/after the entry (for the entry session) and within the
- * regular session are considered; an observed execution print may also
- * establish the crossing.
- *
- * @returns {{crossed:boolean, epoch:(number|null), price:(number|null),
- *   precision:(string|null), source:(string|null), reason:(string|null)}}
- */
 function findCrossingInSession({
   bars,
   priorHighest,
@@ -240,9 +248,6 @@ function findCrossingInSession({
 
   const obs = (observations || [])
     .filter((o) => isFiniteNumber(o.epoch) && isFiniteNumber(o.price) && o.price > 0)
-    // Point-in-time: an execution print may only establish a crossing when it
-    // is observable within this regular session and (for Day 1) at/after the
-    // actual entry. Entry-day prints must never establish a later-day crossing.
     .filter((o) => !isFiniteNumber(sessionOpenEpoch) || o.epoch >= sessionOpenEpoch)
     .filter((o) => !isFiniteNumber(sessionCloseEpoch) || o.epoch < sessionCloseEpoch)
     .filter((o) => !isFiniteNumber(entryEpoch) || o.epoch >= entryEpoch)

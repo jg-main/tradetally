@@ -242,6 +242,43 @@ describe('Management persistence — real PostgreSQL', () => {
     ).rejects.toMatchObject({ code: 'TRAILING_MA_IMMUTABLE' });
   });
 
+  test('trailing activation boundary first assertion executes the establish bind path', async () => {
+    const managementCriteria = [{ key: 'stop_ratchet', status: 'UNKNOWN', score: null, scoring_value: null }];
+    const updated = await evaluationService.saveManagementProgress(fixture.evaluationId, fixture.userId, {
+      managementResults: { criterionResults: managementCriteria },
+      dependencyFingerprint: fixture.setupFingerprint,
+      entryDependencyFingerprint: fixture.entryFingerprint,
+      trailingActivation: { mode: 'establish', session: '2026-03-12' }
+    });
+    expect(updated).not.toBeNull();
+    const row = await readEvaluation(fixture.evaluationId);
+    expect(row.user_inputs.trailing_activation_session).toBe('2026-03-12');
+    expect(row.user_inputs.immutable_semantic_context.trailing_activation.session).toBe('2026-03-12');
+    const assertedAt = row.user_inputs.immutable_semantic_context.trailing_activation.asserted_at;
+    expect(typeof assertedAt).toBe('string');
+
+    // Same-value rerun preserves the first asserted_at (immutable authority).
+    await evaluationService.saveManagementProgress(fixture.evaluationId, fixture.userId, {
+      managementResults: { criterionResults: managementCriteria },
+      dependencyFingerprint: fixture.setupFingerprint,
+      entryDependencyFingerprint: fixture.entryFingerprint,
+      trailingActivation: { mode: 'establish', session: '2026-03-12' }
+    });
+    const row2 = await readEvaluation(fixture.evaluationId);
+    expect(row2.user_inputs.immutable_semantic_context.trailing_activation.asserted_at).toBe(assertedAt);
+  });
+
+  test('a competing activation boundary cannot win (TRAILING_ACTIVATION_IMMUTABLE)', async () => {
+    await expect(
+      evaluationService.saveManagementProgress(fixture.evaluationId, fixture.userId, {
+        managementResults: { criterionResults: [{ key: 'stop_ratchet', status: 'UNKNOWN', score: null, scoring_value: null }] },
+        dependencyFingerprint: fixture.setupFingerprint,
+        entryDependencyFingerprint: fixture.entryFingerprint,
+        trailingActivation: { mode: 'establish', session: '2026-03-13' }
+      })
+    ).rejects.toMatchObject({ code: 'TRAILING_ACTIVATION_IMMUTABLE' });
+  });
+
   test('Setup fingerprint / revision CAS rejects a stale Management write', async () => {
     await expect(
       evaluationService.saveManagementProgress(fixture.evaluationId, fixture.userId, {

@@ -7,15 +7,14 @@
 //   - Partial Sizing is measured from the quantity at the PARTIAL EVENT (the
 //     first fill whose cumulative reduction crosses the required quantity),
 //     never from lifetime liquidation. Later exits cannot change it.
-//   - A direct full liquidation crosses at 100% and is therefore not a
-//     compliant 50% partial.
-//   - Early reductions count toward the position already reduced (no extra 50%
-//     sale is required after an early reduction).
+//   - Premature reduction and same-session timing are evaluated against the
+//     authoritative trigger BOUNDARY (session + instant when knowable), not
+//     merely the session date.
 //   - A pre-trigger reduction is only excluded as protective when trustworthy
-//     evidence classifies it; otherwise the criterion is UNKNOWN, never a
-//     fabricated FAIL.
-//   - Required quantity uses valid tradable-unit rounding so rounding can never
-//     create a false Timing/Sizing failure.
+//     evidence classifies it; otherwise the criterion is UNKNOWN.
+//   - Required quantity uses valid tradable-unit rounding.
+//   - A pre-trigger completion never counts as an on-time post-trigger
+//     completion, but its quantity may still count toward Partial Sizing.
 
 const { resolveRequiredQuantity } = require('./quantityUnit');
 
@@ -25,19 +24,46 @@ function isFiniteNumber(value) {
 
 const EPSILON = 1e-9;
 
+function boundaryMode(boundary) {
+  if (!boundary) return null;
+  if (boundary.mode) return boundary.mode;
+  return (boundary.kind === 'session_open' || boundary.kind === 'crossing') ? 'instant' : 'session';
+}
+
 /**
- * Resolves partial completion and sizing-at-event.
- *
- * @param {object} params
- * @param {Array} params.reductions - [{ timeEpoch, quantity, sessionDate, cumulativeQty }].
- * @param {number} params.originalPositionQty
- * @param {number} params.targetFraction - e.g. 0.5
- * @param {number} params.targetPct - configured target percentage.
- * @param {object} params.quantityUnit - result of resolveQuantityUnit.
- * @param {number|null} params.triggerDueSessionIndex - index of the due session.
- * @param {Function} params.sessionIndexForDate - sessionDate -> index|null.
- * @returns {object}
+ * Classifies a reduction relative to the trigger boundary.
+ * @returns {'before_session'|'same_before'|'same_after'|'same_unknown'|'after_hours'|'after'|'unknown'}
  */
+function relationToBoundary(reduction, boundary) {
+  if (!boundary || !boundary.sessionDate || !reduction || !reduction.sessionDate) return 'unknown';
+  const session = reduction.sessionDate;
+  if (session < boundary.sessionDate) return 'before_session';
+  if (session > boundary.sessionDate) return 'after';
+  const epoch = reduction.timeEpoch;
+  const mode = boundaryMode(boundary);
+  if (mode !== 'instant') {
+    // Session-granularity boundary (window expiry / no trigger instant): an
+    // after-hours reduction on the boundary session is still after the regular
+    // session; otherwise the intra-session ordering is unknown, not "after".
+    if (isFiniteNumber(boundary.sessionCloseEpoch) && isFiniteNumber(epoch) && epoch >= boundary.sessionCloseEpoch) {
+      return 'after_hours';
+    }
+    return 'same_unknown';
+  }
+  if (!boundary.orderingKnown || !isFiniteNumber(boundary.epoch) || !isFiniteNumber(epoch)) {
+    // A reduction on the boundary session whose intra-session ordering cannot
+    // be proven is not "after" and is not definitively premature.
+    if (isFiniteNumber(boundary.sessionCloseEpoch) && isFiniteNumber(epoch) && epoch >= boundary.sessionCloseEpoch) {
+      return 'after_hours';
+    }
+    return 'same_unknown';
+  }
+  if (isFiniteNumber(boundary.sessionCloseEpoch) && epoch >= boundary.sessionCloseEpoch) {
+    return 'after_hours';
+  }
+  return epoch < boundary.epoch ? 'same_before' : 'same_after';
+}
+
 function resolvePartialCompletion({
   reductions,
   originalPositionQty,
@@ -45,6 +71,7 @@ function resolvePartialCompletion({
   targetPct,
   quantityUnit,
   triggerDueSessionIndex,
+  boundary = null,
   sessionIndexForDate
 }) {
   const target = resolveRequiredQuantity({ originalPositionQty, targetFraction, quantityUnit });
@@ -68,9 +95,6 @@ function resolvePartialCompletion({
   const achievedFractionFromTotal = Math.min(1, total / originalPositionQty);
 
   if (!target.resolved) {
-    // Target cannot be resolved (unknown unit with a non-integer target):
-    // completion is UNKNOWN, but the observed cumulative reduction is still
-    // reported for evidence.
     return {
       completed: false,
       rounding,
@@ -85,7 +109,6 @@ function resolvePartialCompletion({
     };
   }
 
-  // Half a tradable unit absorbs ROUNDING error only, never a whole shortfall.
   const completionTolerance = target.unit ? target.unit / 2 + EPSILON : EPSILON;
   const completionThreshold = target.rawQty - completionTolerance;
 
@@ -99,9 +122,6 @@ function resolvePartialCompletion({
   }
 
   if (!crossing) {
-    // Never reached the required partial quantity. Sizing reflects the
-    // cumulative reduced by the partial deadline (the whole observed total,
-    // which is below target, so no later exit beyond target can exist).
     return {
       completed: false,
       rounding,
@@ -114,6 +134,7 @@ function resolvePartialCompletion({
       completionSessionDate: null,
       completionSessionIndex: null,
       sessionsAfterTrigger: null,
+      completionRelation: null,
       timedOut: true,
       timingOutcome: 'later_or_not_completed',
       reason: null
@@ -132,10 +153,28 @@ function resolvePartialCompletion({
       ? completionSessionIndex - triggerDueSessionIndex
       : null;
 
+  const completionRelation = boundary ? relationToBoundary(crossing, boundary) : null;
+
   let timingOutcome;
-  if (sessionsAfterTrigger === 0) timingOutcome = 'same_trigger_session';
-  else if (sessionsAfterTrigger === 1) timingOutcome = 'next_session';
-  else timingOutcome = 'later_or_not_completed';
+  if (
+    completionRelation === 'before_session' ||
+    completionRelation === 'same_before' ||
+    (sessionsAfterTrigger !== null && sessionsAfterTrigger < 0)
+  ) {
+    // Target attained entirely before the trigger: it counts for Sizing but is
+    // never an on-time post-trigger completion.
+    timingOutcome = 'pre_trigger';
+  } else if (completionRelation === 'same_unknown') {
+    timingOutcome = 'unknown_ordering';
+  } else if (completionRelation === 'after_hours') {
+    timingOutcome = 'later_or_not_completed';
+  } else if (sessionsAfterTrigger === 0) {
+    timingOutcome = 'same_trigger_session';
+  } else if (sessionsAfterTrigger === 1) {
+    timingOutcome = 'next_session';
+  } else {
+    timingOutcome = 'later_or_not_completed';
+  }
 
   return {
     completed: true,
@@ -149,6 +188,7 @@ function resolvePartialCompletion({
     completionSessionDate,
     completionSessionIndex,
     sessionsAfterTrigger,
+    completionRelation,
     timedOut: false,
     timingOutcome,
     reason: null
@@ -161,71 +201,53 @@ function classifyReduction(reduction, classification) {
   const verdict = byEpoch[reduction.timeEpoch];
   if (verdict === 'protective') return 'protective';
   if (verdict === 'discretionary') return 'discretionary';
-  // A complete classification that does not mark this reduction protective
-  // means it is discretionary; an incomplete one is ambiguous.
   return classification.complete === true ? 'discretionary' : 'ambiguous';
 }
 
 /**
- * Resolves the premature-reduction outcome with evidence discipline.
+ * Resolves the premature-reduction outcome against the trigger boundary.
  *
- * @param {object} params
- * @param {Array} params.reductions
- * @param {number} params.originalPositionQty
- * @param {string|null} params.boundarySessionDate - reductions strictly before
- *   this session are candidates for premature reduction.
- * @param {object|null} params.stopExecutionClassification - { available, complete, byEpoch }.
- * @returns {object}
+ * Reductions strictly before the boundary session, or on the boundary session
+ * before the boundary instant, are candidates. A same-session reduction whose
+ * intra-session ordering cannot be proven is ambiguous.
  */
 function resolvePrematureReduction({
   reductions,
   originalPositionQty,
-  boundarySessionDate,
+  boundary = null,
   stopExecutionClassification = null
 }) {
+  const boundarySessionDate = boundary ? boundary.sessionDate || null : null;
   if (!isFiniteNumber(originalPositionQty) || originalPositionQty <= 0) {
     return { outcome: 'not_evaluated', prematureQty: null, prematureFraction: null, excludedQty: 0, ambiguousQty: 0, boundarySessionDate };
-  }
-
-  const candidates = (reductions || []).filter((reduction) =>
-    boundarySessionDate !== null && boundarySessionDate !== undefined && reduction.sessionDate !== null
-      ? reduction.sessionDate < boundarySessionDate
-      : false
-  );
-
-  if (candidates.length === 0) {
-    return {
-      outcome: 'none',
-      prematureQty: 0,
-      prematureFraction: 0,
-      excludedQty: 0,
-      ambiguousQty: 0,
-      boundarySessionDate
-    };
   }
 
   let prematureQty = 0;
   let excludedQty = 0;
   let ambiguousQty = 0;
-  for (const reduction of candidates) {
+  let candidateCount = 0;
+
+  for (const reduction of reductions || []) {
+    const relation = relationToBoundary(reduction, boundary);
     const quantity = isFiniteNumber(reduction.quantity) ? reduction.quantity : 0;
-    const verdict = classifyReduction(reduction, stopExecutionClassification);
-    if (verdict === 'protective') excludedQty += quantity;
-    else if (verdict === 'discretionary') prematureQty += quantity;
-    else ambiguousQty += quantity;
+    if (relation === 'before_session' || relation === 'same_before') {
+      candidateCount += 1;
+      const verdict = classifyReduction(reduction, stopExecutionClassification);
+      if (verdict === 'protective') excludedQty += quantity;
+      else if (verdict === 'discretionary') prematureQty += quantity;
+      else ambiguousQty += quantity;
+    } else if (relation === 'same_unknown') {
+      candidateCount += 1;
+      ambiguousQty += quantity;
+    }
   }
 
-  if (ambiguousQty > 0 && prematureQty === 0) {
-    return {
-      outcome: 'ambiguous',
-      prematureQty: null,
-      prematureFraction: null,
-      excludedQty,
-      ambiguousQty,
-      boundarySessionDate
-    };
+  if (candidateCount === 0) {
+    return { outcome: 'none', prematureQty: 0, prematureFraction: 0, excludedQty: 0, ambiguousQty: 0, boundarySessionDate };
   }
-
+  if (prematureQty === 0 && ambiguousQty > 0) {
+    return { outcome: 'ambiguous', prematureQty: null, prematureFraction: null, excludedQty, ambiguousQty, boundarySessionDate };
+  }
   const fraction = Math.min(1, prematureQty / originalPositionQty);
   return {
     outcome: prematureQty > 0 ? 'discretionary' : 'none',
@@ -238,20 +260,16 @@ function resolvePrematureReduction({
 }
 
 /**
- * Classifies whether the position was fully closed BEFORE the partial became
- * due. Only a trustworthy protective classification makes the partial
- * superseded (NOT_APPLICABLE); an unclassified early exit is ambiguous.
- *
- * @returns {{closedBeforeDue:boolean, outcome:'none'|'superseded_protective'|'superseded_discretionary'|'superseded_ambiguous', closeSessionDate:(string|null), closeTimeEpoch:(number|null)}}
+ * Classifies whether the position was fully closed BEFORE the trigger boundary.
  */
 function resolvePartialExitSupersession({
   reductions,
   originalPositionQty,
-  dueSessionDate,
+  boundary = null,
   stopExecutionClassification = null
 }) {
   const none = { closedBeforeDue: false, outcome: 'none', closeSessionDate: null, closeTimeEpoch: null };
-  if (!isFiniteNumber(originalPositionQty) || originalPositionQty <= 0 || !dueSessionDate) {
+  if (!isFiniteNumber(originalPositionQty) || originalPositionQty <= 0 || !boundary || !boundary.sessionDate) {
     return none;
   }
   let close = null;
@@ -261,18 +279,22 @@ function resolvePartialExitSupersession({
       break;
     }
   }
-  if (!close || !close.sessionDate || close.sessionDate >= dueSessionDate) {
+  if (!close) return none;
+
+  const relation = relationToBoundary(close, boundary);
+  if (relation !== 'before_session' && relation !== 'same_before' && relation !== 'same_unknown') {
     return none;
   }
   const verdict = classifyReduction(close, stopExecutionClassification);
   const outcome =
-    verdict === 'protective' ? 'superseded_protective'
-      : verdict === 'discretionary' ? 'superseded_discretionary'
-        : 'superseded_ambiguous';
+    relation === 'same_unknown' || verdict === 'ambiguous'
+      ? 'superseded_ambiguous'
+      : verdict === 'protective' ? 'superseded_protective'
+        : 'superseded_discretionary';
   return {
     closedBeforeDue: true,
     outcome,
-    closeSessionDate: close.sessionDate,
+    closeSessionDate: close.sessionDate || null,
     closeTimeEpoch: close.timeEpoch ?? null
   };
 }
@@ -281,5 +303,6 @@ module.exports = {
   resolvePartialCompletion,
   resolvePrematureReduction,
   resolvePartialExitSupersession,
+  relationToBoundary,
   classifyReduction
 };

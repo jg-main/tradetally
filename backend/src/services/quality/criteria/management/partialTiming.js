@@ -94,8 +94,35 @@ function evaluate({ managementState = {} }) {
   const windowSessions = policy.completionWindow.sessions;
   const completed = partialCompletion.completed === true;
   const sessionsLate = partialCompletion.sessionsAfterTrigger;
-  const withinWindow = completed && Number.isInteger(sessionsLate) && sessionsLate <= windowSessions;
-  const outcome = partialCompletion.timingOutcome || 'later_or_not_completed';
+  const relation = partialCompletion.completionRelation ?? null;
+
+  // A same-session completion must be proven to occur at/after the trigger
+  // boundary instant and within the regular session; otherwise ordering is
+  // unknowable and the criterion is UNKNOWN (never an invented PASS).
+  const unknownOrdering =
+    partialCompletion.timingOutcome === 'unknown_ordering' || (sessionsLate === 0 && relation === 'same_unknown');
+  if (unknownOrdering) {
+    return unknownResult(
+      'The same-session ordering of the partial relative to the trigger instant could not be established from trustworthy evidence; Partial Timing is UNKNOWN.',
+      {
+        partial_trigger_due_session: partialTrigger.dueSessionDate || null,
+        completion_session: partialCompletion.completionSessionDate || null,
+        completion_relation: relation
+      }
+    );
+  }
+
+  const sameSessionConfirmed = sessionsLate === 0 && relation === 'same_after';
+  const laterSessionWithinWindow =
+    Number.isInteger(sessionsLate) && sessionsLate > 0 && sessionsLate <= windowSessions;
+  const withinWindow = completed && (sameSessionConfirmed || laterSessionWithinWindow);
+
+  // A pre-trigger (or after-hours) attainment is never an on-time completion.
+  const preTrigger = relation === 'before_session' || relation === 'same_before' ||
+    (Number.isInteger(sessionsLate) && sessionsLate < 0);
+  const outcome = preTrigger
+    ? 'later_or_not_completed'
+    : (partialCompletion.timingOutcome || 'later_or_not_completed');
 
   return {
     status: withinWindow ? CRITERION_STATUS.PASS : CRITERION_STATUS.FAIL,
@@ -105,11 +132,17 @@ function evaluate({ managementState = {} }) {
       partial_trigger_due_session: partialTrigger.dueSessionDate || null,
       partial_trigger_due_day: partialTrigger.dueDay || null,
       first_reach_day: partialTrigger.firstReachDay || null,
+      trigger_boundary_kind: partialTrigger.boundary ? partialTrigger.boundary.kind : null,
+      trigger_boundary_time: partialTrigger.boundary && partialTrigger.boundary.epoch
+        ? new Date(partialTrigger.boundary.epoch * 1000).toISOString()
+        : null,
+      trigger_boundary_precision: partialTrigger.boundary ? partialTrigger.boundary.precision : null,
       trigger_crossing_time: partialTrigger.crossing && partialTrigger.crossing.epoch
         ? new Date(partialTrigger.crossing.epoch * 1000).toISOString()
         : null,
       trigger_crossing_precision: partialTrigger.crossing ? partialTrigger.crossing.precision : null,
       completion_session: partialCompletion.completionSessionDate || null,
+      completion_relation: relation,
       sessions_after_trigger: sessionsLate,
       completion_window_sessions: windowSessions,
       timing_outcome: outcome

@@ -32,7 +32,16 @@ function baseState(overrides = {}) {
     tickSize: { known: false, tickSize: null },
     stopHistory: { available: false, reason: 'no stop-order lifecycle' },
     stopExecutionClassification: { available: false },
-    partialTrigger: { status: 'triggered', triggered: true, dueDay: 3, dueSessionDate: '2026-03-12', dueSessionIndex: 2, dueSessionCompleted: true, firstReachDay: 1 },
+    partialTrigger: {
+      status: 'triggered',
+      triggered: true,
+      dueDay: 3,
+      dueSessionDate: '2026-03-12',
+      dueSessionIndex: 2,
+      dueSessionCompleted: true,
+      firstReachDay: 1,
+      boundary: { kind: 'session_open', sessionDate: '2026-03-12', epoch: 100, precision: 'session_open', source: 'session_calendar', orderingKnown: true }
+    },
     partialCompletion: {
       completed: true,
       achievedQty: 100,
@@ -41,6 +50,7 @@ function baseState(overrides = {}) {
       observedQty: 100,
       observedFraction: 0.5,
       sessionsAfterTrigger: 0,
+      completionRelation: 'same_after',
       timingOutcome: 'same_trigger_session',
       rounding: { resolved: true, requiredQty: 100, unit: 1, rounded: false }
     },
@@ -69,6 +79,33 @@ describe('partial timing (F3/F7/F9)', () => {
     expect(partialTiming.evaluate({ managementState: baseState() }).status).toBe(CRITERION_STATUS.PASS);
     const later = baseState({ partialCompletion: { ...baseState().partialCompletion, completed: false, sessionsAfterTrigger: 5, timingOutcome: 'later_or_not_completed' } });
     expect(partialTiming.evaluate({ managementState: later }).status).toBe(CRITERION_STATUS.FAIL);
+  });
+  it('never PASSes when the target was reached completely before the trigger (F1)', () => {
+    const pre = baseState({
+      partialCompletion: {
+        ...baseState().partialCompletion,
+        achievedQty: 200,
+        achievedPct: 100,
+        sessionsAfterTrigger: 0,
+        completionRelation: 'same_before',
+        timingOutcome: 'pre_trigger'
+      }
+    });
+    const result = partialTiming.evaluate({ managementState: pre });
+    expect(result.status).toBe(CRITERION_STATUS.FAIL);
+    expect(result.scoring_value).toBe('later_or_not_completed');
+  });
+  it('never PASSes on a negative sessionsAfterTrigger', () => {
+    const negative = baseState({
+      partialCompletion: { ...baseState().partialCompletion, sessionsAfterTrigger: -1, completionRelation: 'before_session', timingOutcome: 'pre_trigger' }
+    });
+    expect(partialTiming.evaluate({ managementState: negative }).status).toBe(CRITERION_STATUS.FAIL);
+  });
+  it('is UNKNOWN when same-session ordering relative to the crossing cannot be established', () => {
+    const unknown = baseState({
+      partialCompletion: { ...baseState().partialCompletion, sessionsAfterTrigger: 0, completionRelation: 'same_unknown', timingOutcome: 'unknown_ordering' }
+    });
+    expect(partialTiming.evaluate({ managementState: unknown }).status).toBe(CRITERION_STATUS.UNKNOWN);
   });
   it('honours a next-session completion window', () => {
     const s = baseState({

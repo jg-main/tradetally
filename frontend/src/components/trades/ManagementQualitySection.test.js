@@ -203,4 +203,53 @@ describe('ManagementQualitySection', () => {
 
     expect(wrapper.find('[data-testid="mgmt-activation-after-partial"]').exists()).toBe(true)
   })
+
+  it('collects the activation session for an explicit activated phase', async () => {
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([{ id: 'eval-1', status: 'draft', results: { setup: setupResult(), entry: entryResult(), management: null } }])
+    mockStoreInstance.prepare.mockResolvedValue(preparedPayload({
+      policy: { trailingActivation: 'explicit', available: { trailing: true } },
+      requiredManagementUserInputs: ['trailing_ma_period', 'trailing_phase', 'trailing_activation_session'],
+      trailingMa: { value: null, established: false, phase: null, phaseEstablished: false, activationSession: null, activationSessionEstablished: false, smaRequired: true }
+    }))
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-management"]').trigger('click')
+    await flushPromises()
+
+    await wrapper.get('[data-testid="mgmt-phase-select"]').setValue('activated')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="mgmt-activation-session"]').exists()).toBe(true)
+
+    await wrapper.get('[data-testid="mgmt-activation-session"]').setValue('2026-03-12')
+    await wrapper.get('[data-testid="mgmt-trailing-select"]').setValue('20')
+    await wrapper.get('[data-testid="run-management"]').trigger('click')
+    await flushPromises()
+
+    expect(mockStoreInstance.evaluate).toHaveBeenCalledWith('trade-1', {
+      evaluationId: 'eval-1',
+      userInputs: { trailing_phase: 'activated', trailing_activation_session: '2026-03-12', trailing_ma_period: 20 }
+    })
+  })
+
+  it('does not require an SMA when prepare reports the canonical phase is not applicable', async () => {
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([{ id: 'eval-1', status: 'draft', results: { setup: setupResult(), entry: entryResult(), management: null } }])
+    mockStoreInstance.prepare.mockResolvedValue(preparedPayload({
+      policy: { trailingActivation: 'after_partial', available: { trailing: true } },
+      requiredManagementUserInputs: [],
+      trailingMa: { value: null, established: false, smaRequired: false, applicabilityReason: 'partial_never_triggered' }
+    }))
+    mockStoreInstance.evaluate.mockResolvedValue({ evaluation: persistedEvaluation() })
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-management"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="mgmt-trailing-select"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="run-management"]').trigger('click')
+    await flushPromises()
+    expect(mockStoreInstance.evaluate).toHaveBeenCalledWith('trade-1', {
+      evaluationId: 'eval-1',
+      userInputs: {}
+    })
+  })
 })

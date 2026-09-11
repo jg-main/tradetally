@@ -13,19 +13,26 @@ const R_PER_SHARE = 5; // +1R => high >= 105
 
 // Day evidence with Day 1..N highs. Day 1 is already post-entry-adjusted.
 function days(highs, { completedThrough = highs.length, day1Known = true, day1PossibleX = false } = {}) {
-  return highs.map((high, i) => ({
-    day: i + 1,
-    sessionIndex: 10 + i,
-    sessionDate: `2026-03-${String(10 + i).padStart(2, '0')}`,
-    high: i === 0 && !day1Known ? null : high,
-    highKnown: i === 0 ? day1Known : true,
-    source: 'daily_bar',
-    precision: 'daily_bar',
-    sessionCompleted: i < completedThrough,
-    requiresEntryAdjustment: false,
-    possibleX: i === 0 ? day1PossibleX : false
-  }));
+  return highs.map((high, i) => {
+    const openEpoch = 1_000_000 + i * 86_400;
+    return {
+      day: i + 1,
+      sessionIndex: 10 + i,
+      sessionDate: `2026-03-${String(10 + i).padStart(2, '0')}`,
+      sessionOpenEpoch: openEpoch,
+      sessionCloseEpoch: openEpoch + 6.5 * 3600,
+      high: i === 0 && !day1Known ? null : high,
+      highKnown: i === 0 ? day1Known : true,
+      source: 'daily_bar',
+      precision: 'daily_bar',
+      sessionCompleted: i < completedThrough,
+      requiresEntryAdjustment: false,
+      possibleX: i === 0 ? day1PossibleX : false
+    };
+  });
 }
+
+const SESSION_BOUNDS = (date) => ({ date, openEpoch: 1_000_000, closeEpoch: 1_000_000 + 6.5 * 3600 });
 
 describe('managementDayForSession', () => {
   it('counts Day 1 as the actual entry session', () => {
@@ -53,12 +60,15 @@ describe('buildDayEvidence', () => {
       bars,
       entryIndex: 1,
       latestDay: 3,
-      isSessionCompleted: () => true
+      isSessionCompleted: () => true,
+      sessionBoundsForDate: SESSION_BOUNDS
     });
     expect(evidence.map((d) => d.day)).toEqual([1, 2, 3]);
     expect(evidence.map((d) => d.sessionDate)).toEqual(['2026-03-06', '2026-03-09', '2026-03-10']);
     expect(evidence[0].requiresEntryAdjustment).toBe(true);
     expect(evidence[1].requiresEntryAdjustment).toBe(false);
+    expect(evidence[0].sessionOpenEpoch).toBe(1_000_000);
+    expect(evidence[0].sessionCloseEpoch).toBe(1_000_000 + 6.5 * 3600);
   });
 });
 
@@ -269,5 +279,38 @@ describe('findCrossingInSession', () => {
       observations: []
     });
     expect(result.crossed).toBe(false);
+  });
+});
+
+describe('resolvePartialTrigger — authoritative boundary (F1)', () => {
+  it('+1R before Day 3 sets the boundary to the Day-3 regular-session OPEN', () => {
+    const evidence = days([106, 104, 103, 103, 103]);
+    const result = resolvePartialTrigger({
+      dayEvidence: evidence,
+      entryBasis: ENTRY_BASIS,
+      rPerShare: R_PER_SHARE,
+      parameters: PARAMS
+    });
+    expect(result.reachedEarly).toBe(true);
+    expect(result.boundary.kind).toBe('session_open');
+    expect(result.boundary.sessionDate).toBe(evidence[2].sessionDate);
+    expect(result.boundary.epoch).toBe(evidence[2].sessionOpenEpoch);
+    expect(result.boundary.precision).toBe('session_open');
+    expect(result.boundary.orderingKnown).toBe(true);
+  });
+
+  it('a same-or-later first reach sets an ordering-unknown crossing boundary until resolved', () => {
+    const evidence = days([101, 101, 101, 106, 106]);
+    const result = resolvePartialTrigger({
+      dayEvidence: evidence,
+      entryBasis: ENTRY_BASIS,
+      rPerShare: R_PER_SHARE,
+      parameters: PARAMS
+    });
+    expect(result.firstReachDay).toBe(4);
+    expect(result.boundary.kind).toBe('crossing');
+    expect(result.boundary.sessionDate).toBe(evidence[3].sessionDate);
+    expect(result.boundary.epoch).toBeNull();
+    expect(result.boundary.orderingKnown).toBe(false);
   });
 });
