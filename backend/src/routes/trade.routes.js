@@ -932,6 +932,19 @@ router.post('/:id/quality/management/prepare', authenticate, qualityManagementCo
 router.post('/:id/quality/management/evaluate', authenticate, qualityManagementController.evaluateManagementQuality);
 router.post('/:id/quality/finalize', authenticate, qualityManagementController.finalizeEvaluation);
 
+// Quality Profiles — Version / Evaluation History (Phase 5). Read-only history,
+// version-pinned re-evaluation (creates a NEW draft; never mutates history),
+// explicit primary selection, and pairwise comparison from persisted snapshots.
+const qualityHistoryController = require('../controllers/qualityHistory.controller');
+router.get('/:id/quality/evaluations/compare', authenticate, qualityHistoryController.compareEvaluations);
+router.post('/:id/quality/evaluations', authenticate, qualityHistoryController.startEvaluation);
+router.put(
+  '/:id/quality/evaluations/:evaluationId/primary',
+  authenticate,
+  qualityHistoryController.selectPrimary
+);
+router.delete('/:id/quality/evaluations/primary', authenticate, qualityHistoryController.clearPrimary);
+
 // Health data integration routes
 router.put('/:id/health', authenticate, tradeController.updateTradeHealthData);
 router.put('/health/bulk', authenticate, tradeController.bulkUpdateHealthData);

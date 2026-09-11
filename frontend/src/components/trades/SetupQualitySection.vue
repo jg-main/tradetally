@@ -467,7 +467,7 @@ function hydrateFromEvaluation(value) {
 async function runPrepare() {
   prepared.value = null
   try {
-    const payload = await store.prepare(props.trade.id)
+    const payload = await store.prepare(props.trade.id, prepareOptions())
     prepared.value = payload
     // Keep the displayed evaluation in sync with the returned row: a
     // re-prepare that invalidated stale Setup results must not keep showing
@@ -476,6 +476,20 @@ async function runPrepare() {
   } catch (err) {
     // store.error is already surfaced in the template
   }
+}
+
+// Phase 5: once the workflow is working on a specific non-terminal evaluation,
+// re-prepare stays pinned to that exact evaluation (and therefore to its
+// immutable profile version). Terminal snapshots are never pinned; a new draft
+// is started instead.
+const TERMINAL_STATUSES = ['completed', 'insufficient_data']
+
+function prepareOptions(extra = {}) {
+  const current = evaluation.value
+  if (current && current.id && !TERMINAL_STATUSES.includes(current.status)) {
+    return { ...extra, evaluationId: current.id }
+  }
+  return { ...extra }
 }
 
 function confirmBaseStart() {
@@ -518,12 +532,15 @@ function realignPivotToBase() {
 async function detectPivotForConfirmedBase() {
   if (!baseStartInput.value || !baseStartInput.value.date) return
   try {
-    const payload = await store.prepare(props.trade.id, {
-      confirmedBaseStart: {
-        date: baseStartInput.value.date,
-        source: baseStartInput.value.source
-      }
-    })
+    const payload = await store.prepare(
+      props.trade.id,
+      prepareOptions({
+        confirmedBaseStart: {
+          date: baseStartInput.value.date,
+          source: baseStartInput.value.source
+        }
+      })
+    )
     prepared.value = payload
     // Sync the displayed evaluation: the server may have invalidated stale
     // Setup results when the Base Start context changed.

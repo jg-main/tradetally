@@ -470,12 +470,5 @@ describe('evaluationService', () => {
       expect(evaluation).toEqual({ id: 'eval-1' });
       expect(db.query.mock.calls[0][1]).toEqual(['eval-1', 'user-1']);
     });
-
-    it('lists evaluation history for a trade newest first', async () => {
-      db.query.mockResolvedValue({ rows: [{ id: 'eval-2' }, { id: 'eval-1' }] });
-      const rows = await evaluationService.listEvaluationsForTrade('user-1', 'trade-1');
-      expect(rows).toHaveLength(2);
-      expect(db.query.mock.calls[0][1]).toEqual(['user-1', 'trade-1']);
-    });
   });
 });

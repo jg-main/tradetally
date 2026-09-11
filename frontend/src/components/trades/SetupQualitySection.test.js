@@ -313,7 +313,9 @@ describe('SetupQualitySection', () => {
     await flushPromises()
 
     expect(mockStoreInstance.prepare).toHaveBeenLastCalledWith('trade-1', {
-      confirmedBaseStart: { date: '2026-03-10', source: 'user_adjusted' }
+      confirmedBaseStart: { date: '2026-03-10', source: 'user_adjusted' },
+      // Phase 5: a re-prepare on a non-terminal evaluation stays pinned to it.
+      evaluationId: 'eval-1'
     })
     expect(wrapper.text()).toContain('103.5')
     expect(wrapper.get('[data-testid="confirm-pivot"]').exists()).toBe(true)

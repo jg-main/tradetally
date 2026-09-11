@@ -35,6 +35,7 @@ const qualitySetupController = {
       const { id: tradeId } = req.params;
       const body = req.body || {};
       const profileId = body.profileId ? String(body.profileId) : undefined;
+      const evaluationId = body.evaluationId ? String(body.evaluationId) : undefined;
       // Forward confirmedBaseStart untouched; SetupQualityService validation is
       // authoritative (date/session/source checks happen server-side).
       const confirmedBaseStart =
@@ -44,10 +45,13 @@ const qualitySetupController = {
               source: body.confirmedBaseStart.source
             }
           : undefined;
-      const payload = await SetupQualityService.prepare(req.user.id, tradeId, {
-        profileId,
-        confirmedBaseStart
-      });
+      const options = { profileId, confirmedBaseStart };
+      // Phase 5: only include evaluationId when supplied so existing callers
+      // (and their exact-call assertions) are unchanged.
+      if (evaluationId) {
+        options.evaluationId = evaluationId;
+      }
+      const payload = await SetupQualityService.prepare(req.user.id, tradeId, options);
       return res.json({ ...payload });
     } catch (error) {
       if (error instanceof SetupQualityService.SetupQualityInputError) {

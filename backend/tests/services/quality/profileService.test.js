@@ -262,5 +262,30 @@ describe('profileService', () => {
       expect(version.version_number).toBe(9);
       expect(db.query.mock.calls[0][1]).toEqual(['profile-1', 'user-1']);
     });
+
+    it('lists immutable versions by number with a current-version marker (Phase 5)', async () => {
+      db.query.mockResolvedValue({
+        rows: [
+          { id: 'v1', version_number: 1, is_current_version: false },
+          { id: 'v3', version_number: 3, is_current_version: true }
+        ]
+      });
+      const versions = await profileService.listVersions('profile-1', 'user-1');
+      expect(versions.map((version) => version.version_number)).toEqual([1, 3]);
+      const [sql, params] = db.query.mock.calls[0];
+      expect(sql).toMatch(/ORDER BY v\.version_number ASC/);
+      expect(sql).toMatch(/p\.user_id = \$2/);
+      expect(params).toEqual(['profile-1', 'user-1']);
+    });
+
+    it('loads one version by id scoped to its owning user (Phase 5 pinning)', async () => {
+      db.query.mockResolvedValue({ rows: [{ id: 'v3', profile_id: 'p1', version_number: 3 }] });
+      const version = await profileService.findVersionById('v3', 'user-1');
+      expect(version.version_number).toBe(3);
+      const [sql, params] = db.query.mock.calls[0];
+      expect(sql).toMatch(/WHERE v\.id = \$1/);
+      expect(sql).toMatch(/p\.user_id = \$2/);
+      expect(params).toEqual(['v3', 'user-1']);
+    });
   });
 });

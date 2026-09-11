@@ -1381,20 +1381,11 @@ function managementStaleError(code) {
   return error;
 }
 
-// Evaluation history for a trade, newest first. Keeps every version's result
-// so the UI can show "evaluated with v1 / re-evaluate with v3".
-async function listEvaluationsForTrade(userId, tradeId) {
-  const result = await db.query(
-    `
-      SELECT ${EVALUATION_COLUMNS}
-      FROM trade_quality_evaluations
-      WHERE user_id = $1 AND trade_id = $2
-      ORDER BY created_at DESC, id DESC
-    `,
-    [userId, tradeId]
-  );
-  return result.rows;
-}
+// Evaluation history for a trade is owned by the Phase 5 generic history
+// service (./historyService), which adds immutable profile/version metadata,
+// the current-version marker, the primary marker, and the deterministic
+// evaluated_at ordering. This service intentionally does not expose a second,
+// differently-ordered history query.
 
 module.exports = {
   EVALUATION_COLUMNS,
@@ -1409,6 +1400,5 @@ module.exports = {
   saveSetupProgress,
   saveEntryProgress,
   saveManagementProgress,
-  getEvaluation,
-  listEvaluationsForTrade
+  getEvaluation
 };

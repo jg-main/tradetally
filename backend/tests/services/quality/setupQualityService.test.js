@@ -1248,3 +1248,93 @@ describe('Setup downstream-state coherence + CAS (Phase 3 follow-up)', () => {
     ).rejects.toMatchObject({ code: 'STALE_SETUP_CONTEXT' });
   });
 });
+
+describe('findEvaluationForPrepare (Phase 5 version pinning)', () => {
+  function pinnedEvaluation(overrides = {}) {
+    return {
+      id: 'pinned-1',
+      profile_version_id: 'v2',
+      status: 'draft',
+      evidence_snapshot: {
+        symbol: 'TEST',
+        entrySessionDate: tradeRow.trade_date,
+        completeness: 'verified',
+        bars: scenario.bars
+      },
+      results: null,
+      ...overrides
+    };
+  }
+
+  test('uses the pinned evaluation directly without resolving another draft', async () => {
+    db.query.mockClear();
+    const pinned = pinnedEvaluation();
+
+    const result = await SetupQualityService.findEvaluationForPrepare(
+      USER_ID,
+      TRADE_ID,
+      'v2',
+      'TEST',
+      tradeRow.trade_date,
+      pinned
+    );
+
+    expect(result).toBe(pinned);
+    expect(db.query).not.toHaveBeenCalled();
+  });
+
+  test('creates a fresh evaluation for the SAME pinned version when the snapshot is unusable and results exist', async () => {
+    const pinned = pinnedEvaluation({
+      evidence_snapshot: {
+        symbol: 'TEST',
+        entrySessionDate: tradeRow.trade_date,
+        completeness: 'unverified',
+        bars: scenario.bars
+      },
+      results: { setup: { score: 90 } }
+    });
+    db.query.mockReset();
+    db.query.mockResolvedValue({ rows: [{ id: 'new-eval', profile_version_id: 'v2', status: 'draft' }] });
+
+    const result = await SetupQualityService.findEvaluationForPrepare(
+      USER_ID,
+      TRADE_ID,
+      'v2',
+      'TEST',
+      tradeRow.trade_date,
+      pinned
+    );
+
+    expect(result.id).toBe('new-eval');
+    const insert = db.query.mock.calls.find(([sql]) =>
+      String(sql).includes('INSERT INTO trade_quality_evaluations')
+    );
+    // The fresh draft stays on the pinned version (never the current version).
+    expect(insert[1][2]).toBe('v2');
+  });
+
+  test('reuses the pinned draft when the snapshot is unusable but no results exist yet', async () => {
+    const pinned = pinnedEvaluation({
+      evidence_snapshot: {
+        symbol: 'TEST',
+        entrySessionDate: tradeRow.trade_date,
+        completeness: 'unverified',
+        bars: scenario.bars
+      },
+      results: null
+    });
+    db.query.mockReset();
+
+    const result = await SetupQualityService.findEvaluationForPrepare(
+      USER_ID,
+      TRADE_ID,
+      'v2',
+      'TEST',
+      tradeRow.trade_date,
+      pinned
+    );
+
+    expect(result).toBe(pinned);
+    expect(db.query).not.toHaveBeenCalled();
+  });
+});

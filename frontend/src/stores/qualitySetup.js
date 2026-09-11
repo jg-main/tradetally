@@ -23,15 +23,21 @@ export const useQualitySetupStore = defineStore('qualitySetup', () => {
     error.value = err?.response?.data?.error || err?.message || 'Setup Quality request failed'
   }
 
-  async function prepare(tradeId, { profileId, confirmedBaseStart } = {}) {
+  async function prepare(tradeId, { profileId, confirmedBaseStart, evaluationId } = {}) {
     preparing.value = true
     error.value = null
     try {
       const response = await api.post(`/trades/${tradeId}/quality/prepare`, {
         profileId: profileId || undefined,
-        confirmedBaseStart: confirmedBaseStart || undefined
+        confirmedBaseStart: confirmedBaseStart || undefined,
+        // Phase 5: pins the workflow to an exact non-terminal evaluation so the
+        // profile version can never drift to a newer one mid-flight.
+        evaluationId: evaluationId || undefined
       })
       prepared.value = response.data
+      if (response.data && response.data.evaluation) {
+        evaluation.value = response.data.evaluation
+      }
       return response.data
     } catch (err) {
       setError(err)

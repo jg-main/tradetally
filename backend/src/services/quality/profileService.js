@@ -87,6 +87,50 @@ async function getCurrentVersion(profileId, userId) {
   return result.rows[0] || null;
 }
 
+// Lists every immutable version of one profile owned by `userId`, oldest
+// first, with the profile name and a marker for the profile's current version.
+// Version history metadata (Phase 5, spec sections 52/53). Read-only.
+async function listVersions(profileId, userId) {
+  const result = await db.query(
+    `
+      SELECT
+        ${VERSION_COLUMNS_QUALIFIED},
+        p.name AS profile_name,
+        p.current_version_id,
+        (v.id = p.current_version_id) AS is_current_version
+      FROM quality_profile_versions v
+      JOIN quality_profiles p ON p.id = v.profile_id
+      WHERE v.profile_id = $1
+        AND p.user_id = $2
+      ORDER BY v.version_number ASC, v.id ASC
+    `,
+    [profileId, userId]
+  );
+  return result.rows;
+}
+
+// Loads one immutable version by id, scoped to its owning user. Returns the
+// version columns plus profile name and current-version marker. Used by the
+// Phase 5 re-evaluation and comparison paths to read the exact configuration
+// that produced an evaluation without ever resolving "current version" again.
+async function findVersionById(versionId, userId) {
+  const result = await db.query(
+    `
+      SELECT
+        ${VERSION_COLUMNS_QUALIFIED},
+        p.name AS profile_name,
+        p.current_version_id,
+        (v.id = p.current_version_id) AS is_current_version
+      FROM quality_profile_versions v
+      JOIN quality_profiles p ON p.id = v.profile_id
+      WHERE v.id = $1
+        AND p.user_id = $2
+    `,
+    [versionId, userId]
+  );
+  return result.rows[0] || null;
+}
+
 // Creates a quality profile with its first immutable version (version 1).
 //
 // Generic profile creation REQUIRES an explicit valid configuration. Only
@@ -256,6 +300,8 @@ module.exports = {
   findById,
   findByName,
   getCurrentVersion,
+  listVersions,
+  findVersionById,
   createProfile,
   createVersion,
   ensureCanonicalBO

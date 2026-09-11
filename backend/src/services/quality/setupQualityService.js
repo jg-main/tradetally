@@ -700,25 +700,40 @@ function buildEvidenceSnapshot({ trade, evidence, entryDate, bars, fromDate, toD
 //   - When the existing draft has a result-bearing snapshot that is NOT
 //     reusable (missing/entry-changed/unverified-with-results), fresh evidence
 //     must not be attached to it: a NEW draft is created (model B).
-async function findEvaluationForPrepare(userId, tradeId, profileVersionId, symbolUpper, entryDate) {
+async function findEvaluationForPrepare(
+  userId,
+  tradeId,
+  profileVersionId,
+  symbolUpper,
+  entryDate,
+  pinnedEvaluation = null
+) {
   const db = require('../../config/database');
-  const existing = await db.query(
-    `
-      SELECT ${EVALUATION_COLUMNS}
-      FROM trade_quality_evaluations
-      WHERE user_id = $1
-        AND trade_id = $2
-        AND profile_version_id = $3
-        AND status NOT IN ('completed', 'insufficient_data')
-      ORDER BY created_at DESC, id DESC
-      LIMIT 1
-    `,
-    [userId, tradeId, profileVersionId]
-  );
-  if (existing.rows.length === 0) {
-    return createEvaluation(userId, tradeId, profileVersionId);
+  // Phase 5: a caller may pin an exact evaluation (e.g. the draft created by
+  // "Evaluate with newer version"). The pinned row is used as the candidate
+  // directly, so the profile version can never drift to a newer one mid-flight.
+  // When not pinned, the latest non-terminal draft for this exact version is
+  // selected (existing behavior).
+  let candidate = pinnedEvaluation;
+  if (!candidate) {
+    const existing = await db.query(
+      `
+        SELECT ${EVALUATION_COLUMNS}
+        FROM trade_quality_evaluations
+        WHERE user_id = $1
+          AND trade_id = $2
+          AND profile_version_id = $3
+          AND status NOT IN ('completed', 'insufficient_data')
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      `,
+      [userId, tradeId, profileVersionId]
+    );
+    if (existing.rows.length === 0) {
+      return createEvaluation(userId, tradeId, profileVersionId);
+    }
+    candidate = existing.rows[0];
   }
-  const candidate = existing.rows[0];
   const stored = parseJsonField(candidate.evidence_snapshot, 'evidence_snapshot');
   if (snapshotIsUsable(stored, symbolUpper, entryDate)) {
     return candidate;
@@ -894,6 +909,13 @@ function preservedNonSetupResults(results) {
  *
  * POST body may carry:
  *   profileId          - optional; defaults to the user's Canonical BO profile
+ *   evaluationId       - optional; pins the workflow to an exact NON-TERMINAL
+ *                        evaluation (created by the generic history service's
+ *                        "Evaluate with newer version"). The pinned
+ *                        evaluation's profile_version_id is authoritative and
+ *                        the profile's CURRENT version is never consulted, so a
+ *                        profile that advances while this evaluation is in
+ *                        progress cannot move it to a newer version.
  *   confirmedBaseStart - optional { date, source }; once the user has
  *                        confirmed/adjusted the Base Start, pass it back so
  *                        the Pivot is (re-)detected from THAT Base Start on the
@@ -906,7 +928,7 @@ function preservedNonSetupResults(results) {
  * stored snapshot exists, and then only on a NEW evaluation if the existing
  * draft already holds persisted Setup results.
  */
-async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) {
+async function prepare(userId, tradeId, { profileId, confirmedBaseStart, evaluationId } = {}) {
   const trade = await getTradeForUser(userId, tradeId);
   if (!trade) {
     throw new SetupQualityInputError('Trade not found or not owned by this user.', 'TRADE_NOT_FOUND');
@@ -920,7 +942,40 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
     throw new SetupQualityInputError('Trade has no symbol; Setup Quality cannot be prepared.', 'TRADE_NO_SYMBOL');
   }
 
-  const { profile, version } = await resolveProfileAndVersion(userId, { profileId });
+  let profile;
+  let version;
+  let pinnedEvaluation = null;
+  if (evaluationId !== undefined && evaluationId !== null) {
+    // Phase 5 pinning: use the exact evaluation and its immutable version.
+    pinnedEvaluation = await getEvaluation(String(evaluationId), userId);
+    if (!pinnedEvaluation || pinnedEvaluation.trade_id !== tradeId) {
+      throw new SetupQualityInputError(
+        'Evaluation not found for this trade or not owned by this user.',
+        'EVALUATION_NOT_FOUND'
+      );
+    }
+    const loadedPinnedVersionId = pinnedEvaluation.profile_version_id;
+    if (TERMINAL_STATUSES.includes(pinnedEvaluation.status)) {
+      // The pinned evaluation is an immutable terminal snapshot. Never mutate
+      // it (spec sections 6/10): fall through to a FRESH draft of the SAME
+      // pinned version instead of erroring, so a re-detect after finalize
+      // starts a new evaluation rather than rewriting history.
+      pinnedEvaluation = null;
+    }
+    version = await profileService.findVersionById(loadedPinnedVersionId, userId);
+    if (!version) {
+      throw new SetupQualityInputError(
+        'Evaluation profile version not found or not owned by this user.',
+        'VERSION_NOT_FOUND'
+      );
+    }
+    profile = { id: version.profile_id, name: version.profile_name };
+  } else {
+    const resolved = await resolveProfileAndVersion(userId, { profileId });
+    profile = resolved.profile;
+    version = resolved.version;
+  }
+
   const setupConfig = getSetupDimensionConfig(version.configuration);
   assertValidSetupConfiguration(setupConfig);
 
@@ -934,7 +989,8 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart } = {}) 
     tradeId,
     version.id,
     symbolUpper,
-    entryDate
+    entryDate,
+    pinnedEvaluation
   );
   const stored = parseJsonField(evaluation.evidence_snapshot, 'evidence_snapshot');
   const reuseStored = snapshotIsUsable(stored, symbolUpper, entryDate);
@@ -1741,26 +1797,13 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
 
 /**
  * Lists evaluations for a trade (newest first), including the profile name and
- * version number for display.
+ * version number for display. Phase 5 moved the generic history query into the
+ * historyService (single source of truth) and this delegates to it so the
+ * Setup workflow never duplicates history logic.
  */
 async function listEvaluations(userId, tradeId) {
-  const db = require('../../config/database');
-  const result = await db.query(
-    `
-      SELECT ${EVALUATION_COLUMNS
-        .split(',')
-        .map((column) => `e.${column.trim()}`)
-        .join(', ')},
-        v.version_number, v.schema_version, p.name AS profile_name
-      FROM trade_quality_evaluations e
-      JOIN quality_profile_versions v ON v.id = e.profile_version_id
-      JOIN quality_profiles p ON p.id = v.profile_id
-      WHERE e.user_id = $1 AND e.trade_id = $2
-      ORDER BY e.created_at DESC, e.id DESC
-    `,
-    [userId, tradeId]
-  );
-  return result.rows.map(toFrontendEvaluation);
+  const historyService = require('./historyService');
+  return historyService.listEvaluationsForTrade(userId, tradeId);
 }
 
 module.exports = {
