@@ -1584,6 +1584,9 @@
           <!-- Quality Profiles — Entry Quality (Phase 3) -->
           <EntryQualitySection v-if="isOwner" :trade="trade" />
 
+          <!-- Quality Profiles — Management Quality (Phase 4) -->
+          <ManagementQualitySection v-if="isOwner" :trade="trade" />
+
           <!-- News Section -->
           <div v-if="trade.has_news && trade.news_events && trade.news_events.length > 0" class="card">
             <div class="card-body">
@@ -1683,6 +1686,7 @@ import TradeImages from '@/components/trades/TradeImages.vue'
 import TradeCharts from '@/components/trades/TradeCharts.vue'
 import SetupQualitySection from '@/components/trades/SetupQualitySection.vue'
 import EntryQualitySection from '@/components/trades/EntryQualitySection.vue'
+import ManagementQualitySection from '@/components/trades/ManagementQualitySection.vue'
 import ProUpgradePrompt from '@/components/ProUpgradePrompt.vue'
 import BaseSelect from '@/components/common/BaseSelect.vue'
 import { useAIStore } from '@/stores/ai'

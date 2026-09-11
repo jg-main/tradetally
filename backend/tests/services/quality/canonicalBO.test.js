@@ -165,6 +165,7 @@ describe('Canonical BO seed configuration', () => {
     expect(byKey.partial_timing.parameters.minimum_mfe_r).toBe(1.0);
     expect(byKey.partial_timing.parameters.completion_window).toBe('same_session');
     expect(byKey.partial_sizing.parameters.target_pct).toBe(50);
+    expect(byKey.partial_sizing.parameters.target_tolerance_pct).toBe(2);
     expect(byKey.stop_ratchet.parameters.downward_tolerance_ticks).toBe(0);
     expect(byKey.post_partial_breakeven.parameters.minimum_stop).toBe('original_entry_basis');
     expect(byKey.post_partial_breakeven.parameters.deadline).toBe('same_session');

@@ -924,6 +924,14 @@ const qualityEntryController = require('../controllers/qualityEntry.controller')
 router.post('/:id/quality/entry/prepare', authenticate, qualityEntryController.prepareEntryQuality);
 router.post('/:id/quality/entry/evaluate', authenticate, qualityEntryController.evaluateEntryQuality);
 
+// Quality Profiles — Management Quality workflow (Phase 4). Extends the same
+// non-terminal evaluation; Setup and Entry must be evaluated first. finalize
+// marks a complete Setup + Entry + Management evaluation terminal.
+const qualityManagementController = require('../controllers/qualityManagement.controller');
+router.post('/:id/quality/management/prepare', authenticate, qualityManagementController.prepareManagementQuality);
+router.post('/:id/quality/management/evaluate', authenticate, qualityManagementController.evaluateManagementQuality);
+router.post('/:id/quality/finalize', authenticate, qualityManagementController.finalizeEvaluation);
+
 // Health data integration routes
 router.put('/:id/health', authenticate, tradeController.updateTradeHealthData);
 router.put('/health/bulk', authenticate, tradeController.bulkUpdateHealthData);

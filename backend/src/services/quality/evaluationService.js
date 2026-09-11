@@ -29,7 +29,7 @@ const db = require('../../config/database');
 const { CRITERION_STATUS, EVALUATION_STATUS } = require('./constants');
 const { aggregateDimension } = require('./aggregation');
 const { deriveScoreForCriterion } = require('./scoring');
-const { setupDependencyFingerprint } = require('./dependencyFingerprint');
+const { setupDependencyFingerprint, entryDependencyFingerprint } = require('./dependencyFingerprint');
 const {
   applyDownstreamState,
   nextContextRevision,
@@ -628,7 +628,7 @@ async function saveSetupProgress(evaluationId, userId, data = {}) {
 async function saveEntryProgress(evaluationId, userId, data = {}) {
   const lookup = await db.query(
     `
-      SELECT e.id, e.status, e.results, e.detected_context, e.evidence_snapshot, e.user_inputs, v.configuration
+      SELECT e.id, e.status, e.profile_version_id, e.results, e.detected_context, e.evidence_snapshot, e.user_inputs, v.configuration
       FROM trade_quality_evaluations e
       JOIN quality_profile_versions v ON v.id = e.profile_version_id
       JOIN quality_profiles p ON p.id = v.profile_id
@@ -723,26 +723,56 @@ async function saveEntryProgress(evaluationId, userId, data = {}) {
   const recomputed = aggregateDimension(entryConfig, rows);
 
   // ----- merge FROM CURRENT DB STATE (never from the caller's stale copy) ---
+  // Entry dependency fingerprint (server-derived): Management depends on the
+  // Entry-owned state this write persists, so a re-run Entry with a different
+  // result must invalidate any prior Management result rather than silently
+  // leaving it attached to incompatible Entry evidence.
+  const entryFingerprint = entryDependencyFingerprint({
+    profileVersionId: lookup.rows[0].profile_version_id,
+    entryEvidence: data.entryEvidence ?? null
+  });
+  const previousEntryFingerprint =
+    currentDetected.entry && typeof currentDetected.entry === 'object'
+      ? currentDetected.entry.entry_dependency_fingerprint ?? null
+      : null;
+  const entryChanged =
+    previousEntryFingerprint !== null && previousEntryFingerprint !== entryFingerprint;
+
+  const entryContext = {
+    ...(data.entryDetectedContext && typeof data.entryDetectedContext === 'object'
+      ? data.entryDetectedContext
+      : {}),
+    entry_dependency_fingerprint: entryFingerprint
+  };
+
   const persistedResults = {
     ...currentResults,
     setup: currentResults.setup,
     entry: recomputed,
-    management: Object.prototype.hasOwnProperty.call(currentResults, 'management')
-      ? currentResults.management
-      : null
+    management: entryChanged
+      ? null
+      : (Object.prototype.hasOwnProperty.call(currentResults, 'management')
+          ? currentResults.management
+          : null)
   };
 
   const persistedEvidenceSnapshot = {
     ...currentEvidence,
     entry: data.entryEvidence ?? null
   };
+  if (entryChanged) {
+    delete persistedEvidenceSnapshot.management;
+  }
 
   const persistedDetectedContext = {
     ...currentDetected,
-    entry: data.entryDetectedContext ?? null,
+    entry: entryContext,
     [SETUP_DEPENDENCY_FINGERPRINT_KEY]: currentFingerprint,
     [SETUP_CONTEXT_REVISION_KEY]: currentRevision
   };
+  if (entryChanged) {
+    delete persistedDetectedContext.management;
+  }
 
   const persistedUserInputs = { ...currentInputs };
   if (intendedMode === 'establish') {
@@ -881,6 +911,293 @@ function entryStaleError(code) {
   return error;
 }
 
+// Persists NON-TERMINAL Management evaluation progress on a still-mutable draft
+// (Phase 4 Management Quality workflow).
+//
+// Contract (parallel to saveEntryProgress):
+//   - the evaluation must exist, belong to `userId`, link to a profile version
+//     owned by the same user, and be NON-TERMINAL.
+//   - EXISTING Setup AND Entry results are REQUIRED: Management depends on the
+//     immutable Initial R / Entry Basis / original position, so Management
+//     progress must never erase Setup or Entry. It replaces only results.management
+//     and the management evidence/context blocks.
+//   - managementResults.criterionResults are normalized against the immutable
+//     management configuration and the authoritative Management aggregate is
+//     recomputed.
+//   - flat management_* summary columns derive from the recomputed aggregate;
+//     setup_* and entry_* columns are untouched.
+//
+// Compare-and-swap guards THREE upstream tokens read by saveManagementProgress:
+//   - the Setup dependency fingerprint;
+//   - the Setup context revision;
+//   - the Entry dependency fingerprint (stored in detected_context.entry by
+//     saveEntryProgress), so a stale Management task cannot attach to a newer
+//     Entry result.
+// The trailing MA selection is additionally CAS-guarded (first assertion wins),
+// mirroring the intended-trigger contract.
+async function saveManagementProgress(evaluationId, userId, data = {}) {
+  const lookup = await db.query(
+    `
+      SELECT e.id, e.status, e.profile_version_id, e.results, e.detected_context, e.evidence_snapshot, e.user_inputs, v.configuration
+      FROM trade_quality_evaluations e
+      JOIN quality_profile_versions v ON v.id = e.profile_version_id
+      JOIN quality_profiles p ON p.id = v.profile_id
+      WHERE e.id = $1
+        AND e.user_id = $2
+        AND p.user_id = $2
+        AND ${TERMINAL_STATUS_SELECT_SQL}
+    `,
+    [evaluationId, userId]
+  );
+
+  if (lookup.rows.length === 0) {
+    return null;
+  }
+
+  const currentResults = parseJsonField(lookup.rows[0].results) || {};
+  const currentDetected = parseJsonField(lookup.rows[0].detected_context) || {};
+  const currentEvidence = parseJsonField(lookup.rows[0].evidence_snapshot) || {};
+  const currentInputs = parseJsonField(lookup.rows[0].user_inputs) || {};
+
+  const currentFingerprint = currentDetected[SETUP_DEPENDENCY_FINGERPRINT_KEY] ?? null;
+  const currentRevision = currentDetected[SETUP_CONTEXT_REVISION_KEY] ?? null;
+  const currentEntryFingerprint =
+    currentDetected.entry && typeof currentDetected.entry === 'object'
+      ? currentDetected.entry.entry_dependency_fingerprint ?? null
+      : null;
+
+  const expectedFingerprint =
+    data.dependencyFingerprint === undefined || data.dependencyFingerprint === null
+      ? null
+      : String(data.dependencyFingerprint);
+  const expectedEntryFingerprint =
+    data.entryDependencyFingerprint === undefined || data.entryDependencyFingerprint === null
+      ? null
+      : String(data.entryDependencyFingerprint);
+
+  const currentTrailing =
+    Number.isFinite(Number(currentInputs.trailing_ma_period))
+      ? Number(currentInputs.trailing_ma_period)
+      : null;
+  const trailing = data.trailingMa && typeof data.trailingMa === 'object'
+    ? data.trailingMa
+    : { mode: 'none' };
+
+  // In-memory pre-checks (the authoritative race protection is the SQL CAS).
+  if (expectedFingerprint !== null && currentFingerprint !== expectedFingerprint) {
+    throw managementStaleError('STALE_DEPENDENCY');
+  }
+  if (expectedEntryFingerprint !== null && currentEntryFingerprint !== expectedEntryFingerprint) {
+    throw managementStaleError('STALE_ENTRY_DEPENDENCY');
+  }
+  if (
+    trailing.mode === 'establish' &&
+    currentTrailing !== null &&
+    currentTrailing !== trailing.value
+  ) {
+    throw managementStaleError('TRAILING_MA_IMMUTABLE');
+  }
+  if (
+    trailing.mode === 'preserve' &&
+    currentTrailing !== null &&
+    currentTrailing !== trailing.value
+  ) {
+    throw managementStaleError('TRAILING_MA_IMMUTABLE');
+  }
+  const trailingMode =
+    trailing.mode === 'establish' && currentTrailing !== null ? 'preserve' : trailing.mode;
+
+  const configuration = lookup.rows[0].configuration;
+  if (
+    configuration === null ||
+    typeof configuration !== 'object' ||
+    !configuration.dimensions ||
+    !configuration.dimensions.management
+  ) {
+    throw new Error('profile version configuration has no management dimension');
+  }
+  const managementConfig = configuration.dimensions.management;
+
+  if (
+    !currentResults ||
+    typeof currentResults !== 'object' ||
+    !Object.prototype.hasOwnProperty.call(currentResults, 'setup') ||
+    currentResults.setup === null ||
+    !Object.prototype.hasOwnProperty.call(currentResults, 'entry') ||
+    currentResults.entry === null
+  ) {
+    throw new Error(
+      'Management progress requires existing Setup and Entry results; run Setup and Entry Quality before Management Quality.'
+    );
+  }
+
+  const managementResults = data.managementResults;
+  if (managementResults === null || typeof managementResults !== 'object' || Array.isArray(managementResults)) {
+    throw new Error('management progress requires a managementResults object with criterionResults');
+  }
+  const rows = normalizeCriterionRows('management', managementConfig, {
+    criterionResults: managementResults.criterionResults || []
+  });
+  const recomputed = aggregateDimension(managementConfig, rows);
+
+  const persistedResults = {
+    ...currentResults,
+    setup: currentResults.setup,
+    entry: currentResults.entry,
+    management: recomputed
+  };
+
+  const persistedEvidenceSnapshot = {
+    ...currentEvidence,
+    management: data.managementEvidence ?? null
+  };
+
+  const persistedDetectedContext = {
+    ...currentDetected,
+    management: data.managementDetectedContext ?? null,
+    [SETUP_DEPENDENCY_FINGERPRINT_KEY]: currentFingerprint,
+    [SETUP_CONTEXT_REVISION_KEY]: currentRevision
+  };
+
+  const persistedUserInputs = { ...currentInputs };
+  if (trailingMode === 'establish') {
+    const previousContext =
+      currentInputs.immutable_semantic_context &&
+      typeof currentInputs.immutable_semantic_context === 'object'
+        ? currentInputs.immutable_semantic_context
+        : {};
+    const previousTrailing =
+      previousContext.trailing_ma && typeof previousContext.trailing_ma === 'object'
+        ? previousContext.trailing_ma
+        : {};
+    persistedUserInputs.trailing_ma_period = trailing.value;
+    persistedUserInputs.immutable_semantic_context = {
+      ...previousContext,
+      trailing_ma: {
+        value: trailing.value,
+        source: 'user_asserted',
+        selected_at: previousTrailing.selected_at || trailing.selectedAt || new Date().toISOString(),
+        timing: 'post_trade'
+      }
+    };
+  } else if (trailingMode === 'preserve' && currentTrailing !== null) {
+    persistedUserInputs.trailing_ma_period = currentTrailing;
+    const previousContext =
+      currentInputs.immutable_semantic_context &&
+      typeof currentInputs.immutable_semantic_context === 'object'
+        ? currentInputs.immutable_semantic_context
+        : {};
+    if (!(previousContext.trailing_ma && previousContext.trailing_ma.selected_at)) {
+      persistedUserInputs.immutable_semantic_context = {
+        ...previousContext,
+        trailing_ma: {
+          value: currentTrailing,
+          source: 'user_asserted',
+          selected_at: trailing.selectedAt || new Date().toISOString(),
+          timing: 'post_trade'
+        }
+      };
+    }
+  }
+
+  const where = [
+    'id = $1',
+    'user_id = $2',
+    TERMINAL_STATUS_UPDATE_SQL,
+    `COALESCE(detected_context->>'${SETUP_DEPENDENCY_FINGERPRINT_KEY}', '') = $11`,
+    `COALESCE(detected_context->>'${SETUP_CONTEXT_REVISION_KEY}', '') = $12`,
+    `COALESCE(detected_context->'entry'->>'entry_dependency_fingerprint', '') = $13`
+  ];
+  const params = [
+    evaluationId,
+    userId,
+    JSON.stringify(persistedResults),
+    persistedEvidenceSnapshot,
+    persistedUserInputs,
+    persistedDetectedContext,
+    recomputed.score,
+    recomputed.grade,
+    recomputed.compliance,
+    recomputed.coverage,
+    currentFingerprint ?? '',
+    currentRevision ?? '',
+    currentEntryFingerprint ?? ''
+  ];
+  if (trailingMode === 'establish') {
+    where.push(`COALESCE(user_inputs->>'trailing_ma_period', '') = ''`);
+  } else if (trailingMode === 'preserve') {
+    where.push(`COALESCE(user_inputs->>'trailing_ma_period', '') = $14`);
+    params.push(String(trailing.value));
+  }
+
+  const updated = await db.query(
+    `
+      UPDATE trade_quality_evaluations
+      SET
+        results = $3,
+        evidence_snapshot = $4,
+        user_inputs = $5,
+        detected_context = $6,
+        management_score = $7,
+        management_grade = $8,
+        management_compliance = $9,
+        management_coverage = $10,
+        evaluated_at = CURRENT_TIMESTAMP
+      WHERE ${where.join('\n        AND ')}
+      RETURNING ${EVALUATION_COLUMNS}
+    `,
+    params
+  );
+  if (updated.rows.length === 0) {
+    const recheck = await db.query(
+      `
+        SELECT e.detected_context, e.user_inputs
+        FROM trade_quality_evaluations e
+        WHERE e.id = $1 AND e.user_id = $2 AND ${TERMINAL_STATUS_SELECT_SQL}
+      `,
+      [evaluationId, userId]
+    );
+    if (recheck.rows.length === 0) {
+      return null;
+    }
+    const latestDetected = parseJsonField(recheck.rows[0].detected_context) || {};
+    const latestInputs = parseJsonField(recheck.rows[0].user_inputs) || {};
+    const latestFingerprint = latestDetected[SETUP_DEPENDENCY_FINGERPRINT_KEY] ?? null;
+    const latestEntryFingerprint =
+      latestDetected.entry && typeof latestDetected.entry === 'object'
+        ? latestDetected.entry.entry_dependency_fingerprint ?? null
+        : null;
+    if (expectedFingerprint !== null && latestFingerprint !== expectedFingerprint) {
+      throw managementStaleError('STALE_DEPENDENCY');
+    }
+    if (expectedEntryFingerprint !== null && latestEntryFingerprint !== expectedEntryFingerprint) {
+      throw managementStaleError('STALE_ENTRY_DEPENDENCY');
+    }
+    const latestTrailing = Number.isFinite(Number(latestInputs.trailing_ma_period))
+      ? Number(latestInputs.trailing_ma_period)
+      : null;
+    if (trailingMode !== 'none' && latestTrailing !== null && latestTrailing !== trailing.value) {
+      throw managementStaleError('TRAILING_MA_IMMUTABLE');
+    }
+    throw managementStaleError('STALE_DEPENDENCY');
+  }
+  return updated.rows[0] || null;
+}
+
+function managementStaleError(code) {
+  const messages = {
+    STALE_DEPENDENCY:
+      'Management results were not saved because the Setup dependency or revision changed during evaluation. Re-run Management prepare/evaluate.',
+    STALE_ENTRY_DEPENDENCY:
+      'Management results were not saved because the Entry dependency changed during evaluation. Re-run Management prepare/evaluate.',
+    TRAILING_MA_IMMUTABLE:
+      'trailing_ma_period is immutable for this evaluation; another request established a different value. Create a new evaluation to change it.'
+  };
+  const error = new Error(messages[code] || 'Management results could not be saved.');
+  error.code = code;
+  return error;
+}
+
 // Evaluation history for a trade, newest first. Keeps every version's result
 // so the UI can show "evaluated with v1 / re-evaluate with v3".
 async function listEvaluationsForTrade(userId, tradeId) {
@@ -908,6 +1225,7 @@ module.exports = {
   saveResult,
   saveSetupProgress,
   saveEntryProgress,
+  saveManagementProgress,
   getEvaluation,
   listEvaluationsForTrade
 };

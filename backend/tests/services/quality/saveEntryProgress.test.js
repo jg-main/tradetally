@@ -31,6 +31,7 @@ function lookupRow(overrides = {}) {
   return {
     id: 'eval-1',
     status: 'draft',
+    profile_version_id: 'version-1',
     results: { setup: SETUP_RESULT, entry: null, management: null },
     detected_context: { boundary: { pivotPrice: 100 }, setup_dependency_fingerprint: 'F', setup_context_revision: '5' },
     evidence_snapshot: { bars: [{ date: '2026-03-10' }], setupBoundary: { resolutionDate: '2026-03-10' }, entry: { old: true } },
@@ -102,7 +103,9 @@ describe('evaluationService.saveEntryProgress (Entry-owned state merge)', () => 
     expect(updateParams[5].boundary).toEqual({ pivotPrice: 100 });
     expect(updateParams[5].setup_dependency_fingerprint).toBe('F');
     expect(updateParams[5].setup_context_revision).toBe('5');
-    expect(updateParams[5].entry).toEqual({ new_entry_ctx: true });
+    expect(updateParams[5].entry).toEqual(
+      expect.objectContaining({ new_entry_ctx: true, entry_dependency_fingerprint: expect.any(String) })
+    );
 
     // entry_* flat columns set.
     expect(updateParams[6]).toBe(100);
@@ -296,6 +299,51 @@ describe('evaluationService.saveEntryProgress — SQL construction (PostgreSQL v
     const sql = db.query.mock.calls[1][0];
     expect(sql).toContain("status NOT IN ('completed', 'insufficient_data')");
     expect(sql).not.toMatch(/\be\.status\b/);
+  });
+});
+
+describe('saveEntryProgress — Entry change invalidates Management', () => {
+  const { entryDependencyFingerprint } = require('../../../src/services/quality/dependencyFingerprint');
+
+  const MANAGEMENT_RESULT = { score: 87, grade: 'B', compliance: 'PASS', coverage: 100, criterionResults: [] };
+
+  function installWithManagementEntryState({ entryEvidence, entryDetected, management }) {
+    const fp = entryDependencyFingerprint({ profileVersionId: 'version-1', entryEvidence });
+    db.query
+      .mockResolvedValueOnce({
+        rows: [lookupRow({
+          results: { setup: SETUP_RESULT, entry: { score: 95 }, management },
+          detected_context: {
+            boundary: { pivotPrice: 100 },
+            setup_dependency_fingerprint: 'F',
+            setup_context_revision: '5',
+            entry: { entry_dependency_fingerprint: fp }
+          },
+          evidence_snapshot: { entry: entryEvidence }
+        })]
+      })
+      .mockImplementationOnce((sql, params) => {
+        updateSql = sql;
+        updateParams = params;
+        return { rows: [{ id: 'eval-1', status: 'draft', results: null }] };
+      });
+  }
+
+  test('preserves Management when the Entry dependency is unchanged', async () => {
+    const entryEvidence = { execution: { entry_basis: 100, original_position_qty: 200 } };
+    installWithManagementEntryState({ entryEvidence, entryDetected: {}, management: MANAGEMENT_RESULT });
+    await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload({ entryEvidence }));
+    expect(JSON.parse(updateParams[2]).management).toEqual(MANAGEMENT_RESULT);
+  });
+
+  test('invalidates Management when the Entry dependency changes', async () => {
+    const oldEntryEvidence = { execution: { entry_basis: 100, original_position_qty: 200 } };
+    const newEntryEvidence = { execution: { entry_basis: 101, original_position_qty: 200 } };
+    installWithManagementEntryState({ entryEvidence: oldEntryEvidence, entryDetected: {}, management: MANAGEMENT_RESULT });
+    await evaluationService.saveEntryProgress('eval-1', 'user-1', passingEntryPayload({ entryEvidence: newEntryEvidence }));
+    expect(JSON.parse(updateParams[2]).management).toBeNull();
+    expect(updateParams[3].management).toBeUndefined();
+    expect(updateParams[5].management).toBeUndefined();
   });
 });
 

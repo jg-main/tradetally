@@ -72,8 +72,47 @@ function setupDependencyFingerprint({ profileVersionId, boundary, evidenceSnapsh
   return sha256Hex(JSON.stringify(payload));
 }
 
+// Management depends on immutable Entry-owned state: the original position /
+// entry basis, the actual entry session, the first reduction boundary, and the
+// frozen Initial R. These are all persisted in the Entry evidence block; this
+// fingerprint lets a Management write CAS-guard against a newer Entry result
+// (re-run Entry with a different trigger, a position edit, or an Initial R
+// establishment change) without trusting client input.
+function entryDependencyIdentity(entryEvidence) {
+  if (!entryEvidence || typeof entryEvidence !== 'object') {
+    return null;
+  }
+  const execution = entryEvidence.execution || {};
+  const initialR = entryEvidence.initial_r || {};
+  return {
+    entry_basis: execution.entry_basis ?? null,
+    original_position_qty: execution.original_position_qty ?? null,
+    actual_entry_session: execution.actual_entry_session ?? null,
+    first_reduction_time: execution.first_reduction_time ?? null,
+    initial_r: initialR && typeof initialR === 'object'
+      ? {
+          available: initialR.available ?? null,
+          r_per_share: initialR.r_per_share ?? null,
+          initial_stop: initialR.initial_stop ?? null,
+          entry_basis: initialR.entry_basis ?? null,
+          original_position_qty: initialR.original_position_qty ?? null
+        }
+      : null
+  };
+}
+
+function entryDependencyFingerprint({ profileVersionId, entryEvidence }) {
+  const payload = {
+    profile_version_id: String(profileVersionId ?? ''),
+    entry: entryDependencyIdentity(entryEvidence)
+  };
+  return sha256Hex(JSON.stringify(payload));
+}
+
 module.exports = {
   setupDependencyFingerprint,
+  entryDependencyFingerprint,
+  entryDependencyIdentity,
   evidenceSnapshotIdentity,
   boundaryIdentity
 };

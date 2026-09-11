@@ -439,7 +439,10 @@ const CANONICAL_BO_CONFIG = {
           required: true,
           weight: 15,
           parameters: {
-            target_pct: 50
+            target_pct: 50,
+            // Section 39: compliance uses the configured target/tolerance policy;
+            // achieved partial within +/- tolerance_pct of the target passes.
+            target_tolerance_pct: 2
           },
           missing_data_behavior: 'not_applicable',
           // Section 39. Achieved partial pct is evaluated as absolute
