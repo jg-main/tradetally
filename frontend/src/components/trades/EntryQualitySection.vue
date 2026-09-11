@@ -281,10 +281,58 @@ watch(() => workflow.activeEvaluation, (value) => {
   }
 })
 
+// Evaluation-local state must not leak from D1 into a fresh D2 (in particular
+// the intended trigger and the prepared setupDependency). Reset on an actual
+// identity change only; same-id progress keeps its state, and an initial
+// activation (null -> first id) must not wipe state hydrated from the persisted
+// row.
+watch(() => workflow.activeEvaluationId, (newId, oldId) => {
+  if (newId === oldId) return
+  if (newId === null || newId === undefined) {
+    resetEvaluationLocalState()
+    return
+  }
+  const identityChanged = oldId !== null && oldId !== undefined
+  if (identityChanged) {
+    const keepPrepared = !!(
+      prepared.value &&
+      prepared.value.evaluation &&
+      prepared.value.evaluation.id === newId
+    )
+    resetEvaluationLocalState({ keepPrepared })
+  }
+  if (workflow.activeEvaluation && workflow.activeEvaluation.id === newId) {
+    evaluation.value = workflow.activeEvaluation
+    hydrateFromEvaluation(workflow.activeEvaluation)
+  }
+  if (store.evaluation && store.evaluation.id === newId) {
+    evaluation.value = store.evaluation
+    hydrateFromEvaluation(store.evaluation)
+  }
+})
+
 watch(() => store.prepared, (value) => {
+  // A stale prepare response for a superseded evaluation must not hydrate the
+  // explicit active workflow row.
+  if (
+    workflow.activeEvaluationId &&
+    value &&
+    value.evaluation &&
+    value.evaluation.id !== workflow.activeEvaluationId
+  ) {
+    return
+  }
   prepared.value = value
   if (value) hydrateFromPrepared(value)
 })
+
+// Clears every evaluation-local ref so a fresh evaluation cannot inherit the
+// previous one's intended trigger or prepared dependency gate.
+function resetEvaluationLocalState({ keepPrepared = false } = {}) {
+  if (!keepPrepared) prepared.value = null
+  evaluation.value = null
+  intendedTriggerType.value = ''
+}
 
 const profileLabel = computed(() => {
   const prep = prepared.value

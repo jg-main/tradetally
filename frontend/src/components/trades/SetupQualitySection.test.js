@@ -348,6 +348,134 @@ describe('SetupQualitySection', () => {
       expect.objectContaining({ evaluationId: 'active-99' })
     )
   })
+
+  it('adopts a replacement evaluation returned by prepare and evaluates that replacement', async () => {
+    const terminal = evaluationResult({ id: 'E1', status: 'completed' })
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([terminal])
+    mockStoreInstance.evaluation = terminal
+    mockStoreInstance.prepare.mockResolvedValue({
+      ...detectedPayload(),
+      evaluation: { id: 'E2', status: 'draft' }
+    })
+    mockStoreInstance.evaluate.mockResolvedValue({
+      evaluation: { id: 'E2', status: 'draft', results: { setup: { score: 88, grade: 'B' } } }
+    })
+    const workflow = useQualityWorkflowStore()
+    workflow.activate({ id: 'E1', trade_id: 'trade-1', status: 'completed' })
+
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-setup"]').trigger('click')
+    await flushPromises()
+
+    // The returned fresh draft replaced the terminal row as the active workflow.
+    expect(workflow.activeEvaluationId).toBe('E2')
+
+    await wrapper.get('[data-testid="leader-yes"]').setValue(true)
+    await wrapper.get('[data-testid="confirm-base-start"]').trigger('click')
+    await wrapper.get('[data-testid="confirm-pivot"]').trigger('click')
+    await wrapper.get('[data-testid="run-setup"]').trigger('click')
+    await flushPromises()
+
+    expect(mockStoreInstance.evaluate).toHaveBeenCalledWith(
+      'trade-1',
+      expect.objectContaining({ evaluationId: 'E2' })
+    )
+  })
+
+  it('does not leak D1 Setup assertions into a fresh D2', async () => {
+    const d1 = evaluationResult({
+      id: 'D1',
+      user_inputs: {
+        leader_confirmed: true,
+        base_start: { date: '2026-03-10', source: 'user_adjusted' },
+        pivot: { price: 103, source: 'user_adjusted' }
+      }
+    })
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([d1])
+    mockStoreInstance.evaluation = d1
+    mockStoreInstance.prepare.mockResolvedValue({
+      ...detectedPayload(),
+      evaluation: { id: 'D1', status: 'draft' }
+    })
+    const workflow = useQualityWorkflowStore()
+    workflow.activate({
+      id: 'D1',
+      trade_id: 'trade-1',
+      status: 'draft',
+      user_inputs: d1.user_inputs,
+      results: d1.results
+    })
+
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-setup"]').trigger('click')
+    await flushPromises()
+    // D1 persisted assertions are visible.
+    expect(wrapper.get('[data-testid="leader-yes"]').element.checked).toBe(true)
+    expect(wrapper.get('[data-testid="base-start-date-input"]').element.value).toBe('2026-03-10')
+
+    // Switch to a fresh evaluation with no persisted assertions.
+    workflow.activate({
+      id: 'D2',
+      trade_id: 'trade-1',
+      status: 'draft',
+      user_inputs: null,
+      results: null,
+      detected_context: null
+    })
+    await flushPromises()
+
+    // Re-prepare D2: no D1 assertion may survive.
+    mockStoreInstance.prepare.mockResolvedValue({
+      ...detectedPayload(),
+      evaluation: { id: 'D2', status: 'draft' }
+    })
+    await wrapper.get('[data-testid="prepare-setup"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="leader-yes"]').element.checked).toBe(false)
+    // Base Start is not pre-confirmed from D1's user-adjusted value.
+    expect(wrapper.find('[data-testid="base-start-date-input"]').exists()).toBe(false)
+    // D2 cannot evaluate without its own required inputs.
+    await wrapper.get('[data-testid="run-setup"]').trigger('click')
+    await flushPromises()
+    expect(mockStoreInstance.evaluate).not.toHaveBeenCalled()
+  })
+
+  it('clears evaluation-local Setup state when the workflow is cleared (trade change)', async () => {
+    const persisted = evaluationResult({
+      id: 'D1',
+      user_inputs: { leader_confirmed: true }
+    })
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([persisted])
+    mockStoreInstance.evaluation = persisted
+    mockStoreInstance.prepare.mockResolvedValue({
+      ...detectedPayload(),
+      evaluation: { id: 'D1', status: 'draft' }
+    })
+    const workflow = useQualityWorkflowStore()
+    workflow.activate({
+      id: 'D1',
+      trade_id: 'trade-1',
+      status: 'draft',
+      user_inputs: persisted.user_inputs,
+      results: persisted.results
+    })
+
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-setup"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="leader-yes"]').element.checked).toBe(true)
+
+    workflow.clear()
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="leader-yes"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="run-setup"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="prepare-setup"]').exists()).toBe(true)
+  })
 })
 
 describe('SetupQualitySection dynamic execution contract (requiredUserInputs)', () => {

@@ -145,6 +145,68 @@ describe('ManagementQualitySection', () => {
     })
   })
 
+  it('does not leak D1 trailing selections or prepared dependency into a fresh D2', async () => {
+    const d1 = {
+      id: 'D1',
+      status: 'draft',
+      results: { setup: setupResult(), entry: entryResult(), management: null },
+      user_inputs: {
+        trailing_ma_period: 20,
+        trailing_phase: 'activated',
+        trailing_activation_session: '2026-03-11'
+      }
+    }
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([d1])
+    mockStoreInstance.prepare.mockResolvedValue(
+      preparedPayload({ evaluation: { id: 'D1', status: 'draft', user_inputs: d1.user_inputs } })
+    )
+    const workflow = useQualityWorkflowStore()
+    workflow.activate({
+      id: 'D1',
+      trade_id: 'trade-1',
+      status: 'draft',
+      results: d1.results,
+      user_inputs: d1.user_inputs
+    })
+
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-management"]').trigger('click')
+    await flushPromises()
+    // D1's asserted SMA is locked in for D1.
+    expect(wrapper.get('[data-testid="mgmt-trailing-locked"]').text()).toContain('SMA20')
+
+    // Fresh D2 with Entry ready but NO assertions: stale D1 selections must be gone.
+    workflow.activate({
+      id: 'D2',
+      trade_id: 'trade-1',
+      status: 'draft',
+      results: { setup: setupResult(), entry: entryResult(), management: null },
+      user_inputs: null,
+      detected_context: null
+    })
+    await flushPromises()
+    expect(wrapper.find('[data-testid="mgmt-trailing-locked"]').exists()).toBe(false)
+    const select = wrapper.find('[data-testid="mgmt-trailing-select"]')
+    if (select.exists()) {
+      expect(select.element.value).toBe('')
+    }
+
+    // Fresh D3 with no Entry result: must gate on Entry, not inherit D1 dependency.
+    workflow.activate({
+      id: 'D3',
+      trade_id: 'trade-1',
+      status: 'draft',
+      results: null,
+      user_inputs: null,
+      detected_context: null
+    })
+    await flushPromises()
+    expect(wrapper.find('[data-testid="entry-required"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="run-management"]').exists()).toBe(false)
+    expect(mockStoreInstance.evaluate).not.toHaveBeenCalled()
+  })
+
   it('evaluates with the selected trailing MA and renders Management summaries', async () => {
     mockStoreInstance.fetchEvaluations.mockResolvedValue([{ id: 'eval-1', status: 'draft', results: { setup: setupResult(), entry: entryResult(), management: null } }])
     mockStoreInstance.prepare.mockResolvedValue(preparedPayload())

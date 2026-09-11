@@ -181,4 +181,48 @@ describe('Phase 5 active-evaluation coordination (store integration)', () => {
     const startCall = posted.find((call) => call.url.endsWith('/quality/evaluations'))
     expect(startCall.body).toEqual({ profileVersionId: 'pv2' })
   })
+
+  it('adopts a replacement from Setup prepare and continues the workflow on the new row', async () => {
+    // A terminal evaluation is active; Setup prepare legitimately returns E2.
+    await history.fetchEvaluations(TRADE)
+    const v1 = history.evaluations.find((row) => row.id === 'v1')
+    workflow.activate(v1)
+
+    const prepared = await setup.prepare(TRADE, { evaluationId: workflow.activeEvaluationId })
+    expect(prepared.evaluation.id).toBe('E2')
+    const adopted = workflow.adoptPreparedEvaluation('v1', prepared.evaluation)
+    expect(adopted).toBe(true)
+    expect(workflow.activeEvaluationId).toBe('E2')
+    // The replacement row now exists in history.
+    list = [{ ...e2 }, ...list]
+
+    const setupEvaluated = await setup.evaluate(TRADE, {
+      evaluationId: workflow.activeEvaluationId,
+      userInputs: { leader_confirmed: true }
+    })
+    workflow.updateActive(setupEvaluated.evaluation)
+    const entryEvaluated = await entry.evaluate(TRADE, {
+      evaluationId: workflow.activeEvaluationId,
+      userInputs: { intended_trigger_type: 'BO-PIVOT' }
+    })
+    workflow.updateActive(entryEvaluated.evaluation)
+    const finalized = await management.finalize(TRADE, {
+      evaluationId: workflow.activeEvaluationId
+    })
+    workflow.updateActive(finalized.evaluation)
+
+    await history.fetchEvaluations(TRADE)
+    expect(history.evaluations.find((row) => row.id === 'E2').status).toBe('completed')
+    expect(history.evaluations.find((row) => row.id === 'v1')).toBeTruthy()
+    expect(history.evaluations.find((row) => row.id === 'v1').is_primary).toBe(true)
+    expect(api.put).not.toHaveBeenCalled()
+
+    // The request that produced the replacement targeted v1; every later
+    // workflow write targeted E2.
+    const evaluationIds = posted
+      .filter((call) => call.body && call.body.evaluationId)
+      .map((call) => call.body.evaluationId)
+    expect(evaluationIds[0]).toBe('v1')
+    expect(evaluationIds.slice(1).every((id) => id === 'E2')).toBe(true)
+  })
 })

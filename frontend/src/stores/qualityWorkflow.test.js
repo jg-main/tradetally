@@ -72,4 +72,54 @@ describe('qualityWorkflow store', () => {
     expect(workflow.activeEvaluationId).toBeNull()
     expect(workflow.activeIsTerminal).toBe(false)
   })
+
+  describe('adoptPreparedEvaluation (race-safe handoff)', () => {
+    it('activates the returned row when nothing is active', () => {
+      const workflow = useQualityWorkflowStore()
+      expect(workflow.adoptPreparedEvaluation(undefined, { id: 'E1', trade_id: 'trade-1' })).toBe(true)
+      expect(workflow.activeEvaluationId).toBe('E1')
+    })
+
+    it('treats a same-id response as an ordinary update', () => {
+      const workflow = useQualityWorkflowStore()
+      workflow.activate({ id: 'E1', trade_id: 'trade-1', status: 'draft' })
+
+      expect(workflow.adoptPreparedEvaluation('E1', { id: 'E1', trade_id: 'trade-1', status: 'completed' })).toBe(true)
+      expect(workflow.activeEvaluationId).toBe('E1')
+      expect(workflow.activeEvaluation.status).toBe('completed')
+    })
+
+    it('replaces the active row when the request matched the active id (terminal E1 -> fresh E2)', () => {
+      const workflow = useQualityWorkflowStore()
+      workflow.activate({ id: 'E1', trade_id: 'trade-1', status: 'completed' })
+
+      expect(workflow.adoptPreparedEvaluation('E1', { id: 'E2', trade_id: 'trade-1', status: 'draft' })).toBe(true)
+      expect(workflow.activeEvaluationId).toBe('E2')
+      expect(workflow.activeEvaluation.id).toBe('E2')
+    })
+
+    it('adopts a model-B replacement for a non-terminal active row', () => {
+      const workflow = useQualityWorkflowStore()
+      workflow.activate({ id: 'E1', trade_id: 'trade-1', status: 'draft' })
+
+      expect(workflow.adoptPreparedEvaluation('E1', { id: 'E2', trade_id: 'trade-1', status: 'draft' })).toBe(true)
+      expect(workflow.activeEvaluationId).toBe('E2')
+    })
+
+    it('ignores a stale response when the active id changed in flight', () => {
+      const workflow = useQualityWorkflowStore()
+      workflow.activate({ id: 'E1', trade_id: 'trade-1', status: 'draft' })
+      workflow.activate({ id: 'E3', trade_id: 'trade-1', status: 'draft' })
+
+      expect(workflow.adoptPreparedEvaluation('E1', { id: 'E2', trade_id: 'trade-1', status: 'draft' })).toBe(false)
+      expect(workflow.activeEvaluationId).toBe('E3')
+    })
+
+    it('ignores a response with no id', () => {
+      const workflow = useQualityWorkflowStore()
+      workflow.activate({ id: 'E1', trade_id: 'trade-1', status: 'draft' })
+      expect(workflow.adoptPreparedEvaluation('E1', null)).toBe(false)
+      expect(workflow.activeEvaluationId).toBe('E1')
+    })
+  })
 })

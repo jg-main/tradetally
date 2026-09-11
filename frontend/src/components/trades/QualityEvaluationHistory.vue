@@ -266,7 +266,12 @@ async function evaluateWithCurrent(row) {
       // Publish the new active row FIRST so Entry/Management follow it, then
       // prepare Setup on that exact id (the history watcher refreshes the list).
       workflow.activate(evaluation)
-      await setupStore.prepare(props.trade.id, { evaluationId: evaluation.id })
+      const prepared = await setupStore.prepare(props.trade.id, {
+        evaluationId: evaluation.id
+      })
+      // The backend may legitimately return a replacement draft; adopt it only
+      // against the id this request was issued for.
+      workflow.adoptPreparedEvaluation(evaluation.id, prepared && prepared.evaluation)
     }
     await store.fetchEvaluations(props.trade.id)
   } catch (err) {

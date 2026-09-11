@@ -44,6 +44,37 @@ export const useQualityWorkflowStore = defineStore('qualityWorkflow', () => {
     }
   }
 
+  /**
+   * Race-safe handoff for endpoints that may legitimately return a DIFFERENT
+   * evaluation than the one requested (Setup prepare can create a replacement
+   * draft: terminal pinned row, or model-B refresh of a non-reusable snapshot).
+   *
+   * Returns true when the returned row became (or remained) the active row.
+   *
+   * - no active evaluation            -> adopt the returned row;
+   * - returned id === active id       -> ordinary same-row update;
+   * - returned id !== active id       -> replace ONLY when the request was
+   *   issued against the currently active evaluation. If the active id changed
+   *   while the request was in flight, the stale response is ignored so it
+   *   cannot hijack a newer selection.
+   */
+  function adoptPreparedEvaluation(expectedEvaluationId, returnedEvaluation) {
+    if (!returnedEvaluation || !returnedEvaluation.id) return false
+    if (!activeEvaluationId.value) {
+      activate(returnedEvaluation)
+      return true
+    }
+    if (returnedEvaluation.id === activeEvaluationId.value) {
+      updateActive(returnedEvaluation)
+      return true
+    }
+    if (expectedEvaluationId && expectedEvaluationId === activeEvaluationId.value) {
+      activate(returnedEvaluation)
+      return true
+    }
+    return false
+  }
+
   // Clears the active evaluation when it belongs to a different trade (or on
   // explicit reset). Keeps the workflow unambiguous when the trade changes.
   function ensureTrade(tradeId) {
@@ -71,6 +102,7 @@ export const useQualityWorkflowStore = defineStore('qualityWorkflow', () => {
     activeIsTerminal,
     activate,
     updateActive,
+    adoptPreparedEvaluation,
     ensureTrade,
     clear
   }

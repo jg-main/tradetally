@@ -151,6 +151,53 @@ describe('EntryQualitySection', () => {
     })
   })
 
+  it('does not leak D1 intended trigger or prepared dependency into a fresh D2', async () => {
+    const d1 = {
+      id: 'D1',
+      status: 'draft',
+      results: { setup: setupResult(), entry: null, management: null },
+      user_inputs: { intended_trigger_type: 'BO-ORH-60' },
+      detected_context: {
+        entry: {
+          allowed_trigger_types: ['BO-PIVOT', 'BO-ORH-60'],
+          intended_trigger: { value: 'BO-ORH-60', source: 'user_asserted' }
+        }
+      }
+    }
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([d1])
+    mockStoreInstance.prepare.mockResolvedValue(preparedPayload())
+    const workflow = useQualityWorkflowStore()
+    workflow.activate({
+      id: 'D1',
+      trade_id: 'trade-1',
+      status: 'draft',
+      results: d1.results,
+      user_inputs: d1.user_inputs,
+      detected_context: d1.detected_context
+    })
+
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-entry"]').trigger('click')
+    await flushPromises()
+
+    workflow.activate({
+      id: 'D2',
+      trade_id: 'trade-1',
+      status: 'draft',
+      results: null,
+      user_inputs: null,
+      detected_context: null
+    })
+    await flushPromises()
+
+    // D1's prepared setupDependency must not keep the fresh D2 enabled.
+    expect(wrapper.find('[data-testid="setup-required"]').exists()).toBe(true)
+    expect(wrapper.find('[data-testid="run-entry"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="entry-intended-trigger"]').exists()).toBe(false)
+    expect(mockStoreInstance.evaluate).not.toHaveBeenCalled()
+  })
+
   it('shows execution evidence and the allowed intended-trigger options from the profile', async () => {
     mockStoreInstance.fetchEvaluations.mockResolvedValue([setupReadyEvaluation()])
     mockStoreInstance.prepare.mockResolvedValue(preparedPayload())

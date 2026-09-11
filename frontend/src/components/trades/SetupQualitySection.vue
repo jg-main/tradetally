@@ -361,9 +361,52 @@ watch(
   }
 )
 
+// Evaluation-local state must never leak from D1 into a fresh D2. Reset on an
+// actual IDENTITY change only; same-id progress updates keep their state, and
+// an initial activation (null -> first id) must not wipe state hydrated from
+// the persisted row. A prepared payload that already belongs to the new id is
+// preserved (the current request's own result).
+watch(
+  () => workflow.activeEvaluationId,
+  (newId, oldId) => {
+    if (newId === oldId) return
+    if (newId === null || newId === undefined) {
+      resetEvaluationLocalState()
+      return
+    }
+    const identityChanged = oldId !== null && oldId !== undefined
+    if (identityChanged) {
+      const keepPrepared = !!(
+        prepared.value &&
+        prepared.value.evaluation &&
+        prepared.value.evaluation.id === newId
+      )
+      resetEvaluationLocalState({ keepPrepared })
+    }
+    if (workflow.activeEvaluation && workflow.activeEvaluation.id === newId) {
+      evaluation.value = workflow.activeEvaluation
+      hydrateFromEvaluation(workflow.activeEvaluation)
+    }
+    if (store.evaluation && store.evaluation.id === newId) {
+      evaluation.value = store.evaluation
+      hydrateFromEvaluation(store.evaluation)
+    }
+  }
+)
+
 watch(
   () => store.prepared,
   (value) => {
+    // A stale prepare response for a superseded evaluation must not hydrate the
+    // explicit active workflow row.
+    if (
+      workflow.activeEvaluationId &&
+      value &&
+      value.evaluation &&
+      value.evaluation.id !== workflow.activeEvaluationId
+    ) {
+      return
+    }
     prepared.value = value
     // After a fresh prepare, keep persisted confirmations if present.
     hydrateFromEvaluation(store.evaluation)
@@ -483,14 +526,18 @@ function hydrateFromEvaluation(value) {
 
 async function runPrepare() {
   prepared.value = null
+  // Capture the exact evaluation the request is issued against so a returned
+  // replacement row can be adopted only by this (non-superseded) request.
+  const expectedId = resolveSetupEvaluationId()
   try {
-    const payload = await store.prepare(props.trade.id, prepareOptions())
+    const payload = await store.prepare(props.trade.id, prepareOptions({}, expectedId))
+    const adopted = workflow.adoptPreparedEvaluation(expectedId, payload && payload.evaluation)
+    if (!adopted) return // superseded in flight: do not apply a stale response
     prepared.value = payload
     // Keep the displayed evaluation in sync with the returned row: a
     // re-prepare that invalidated stale Setup results must not keep showing
     // the old grade.
     evaluation.value = payload.evaluation || evaluation.value
-    if (payload.evaluation) workflow.updateActive(payload.evaluation)
   } catch (err) {
     // store.error is already surfaced in the template
   }
@@ -503,15 +550,30 @@ async function runPrepare() {
 // backend creates a genuinely fresh draft for the same version and pins to it.
 const TERMINAL_STATUSES = ['completed', 'insufficient_data']
 
-function prepareOptions(extra = {}) {
-  if (workflow.activeEvaluationId) {
-    return { ...extra, evaluationId: workflow.activeEvaluationId }
-  }
+function resolveSetupEvaluationId() {
+  if (workflow.activeEvaluationId) return workflow.activeEvaluationId
   const current = evaluation.value
-  if (current && current.id && !TERMINAL_STATUSES.includes(current.status)) {
-    return { ...extra, evaluationId: current.id }
-  }
-  return { ...extra }
+  if (current && current.id && !TERMINAL_STATUSES.includes(current.status)) return current.id
+  return undefined
+}
+
+function prepareOptions(extra = {}, evaluationId = resolveSetupEvaluationId()) {
+  return evaluationId ? { ...extra, evaluationId } : { ...extra }
+}
+
+// Clears every evaluation-local ref so a fresh evaluation cannot inherit the
+// previous one's semantic assertions or prepared dependency context. When the
+// current request's own prepare payload belongs to the new id it is kept.
+function resetEvaluationLocalState({ keepPrepared = false } = {}) {
+  if (!keepPrepared) prepared.value = null
+  evaluation.value = null
+  leader.value = null
+  baseStartInput.value = null
+  pivotInput.value = null
+  baseStartAdjusted.value = false
+  baseStartDateInput.value = ''
+  pivotAdjusted.value = false
+  pivotPriceInput.value = ''
 }
 
 function confirmBaseStart() {
@@ -553,16 +615,18 @@ function realignPivotToBase() {
 // the SAME evidence snapshot (prepare stores the coherent context).
 async function detectPivotForConfirmedBase() {
   if (!baseStartInput.value || !baseStartInput.value.date) return
+  const expectedId = resolveSetupEvaluationId()
+  const confirmedBaseStart = {
+    date: baseStartInput.value.date,
+    source: baseStartInput.value.source
+  }
   try {
     const payload = await store.prepare(
       props.trade.id,
-      prepareOptions({
-        confirmedBaseStart: {
-          date: baseStartInput.value.date,
-          source: baseStartInput.value.source
-        }
-      })
+      prepareOptions({ confirmedBaseStart }, expectedId)
     )
+    const adopted = workflow.adoptPreparedEvaluation(expectedId, payload && payload.evaluation)
+    if (!adopted) return // superseded in flight: do not apply a stale response
     prepared.value = payload
     // Sync the displayed evaluation: the server may have invalidated stale
     // Setup results when the Base Start context changed.
