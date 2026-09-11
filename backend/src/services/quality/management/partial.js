@@ -62,19 +62,23 @@ function relationToBoundary(reduction, boundary) {
   if (boundary.orderingKnown && isFiniteNumber(boundary.epoch) && isFiniteNumber(epoch)) {
     return epoch < boundary.epoch ? 'same_before' : 'same_after';
   }
-  // 1-minute bar interval OR conservative first-crossing uncertainty interval:
-  // only definite before/after the window is knowable; a reduction inside the
-  // window is ambiguous.
+  // 1-minute bar interval OR conservative first-crossing uncertainty interval.
+  // Interval bounds are treated INDEPENDENTLY: a known start already proves a
+  // reduction before it is pre-trigger even when the end is unknown, and a
+  // known end proves a reduction at/after it is post-trigger even when the
+  // start is unknown. Never fabricate the missing bound.
   const windowStart = isFiniteNumber(boundary.uncertaintyStartEpoch)
     ? boundary.uncertaintyStartEpoch
     : boundary.intervalStartEpoch;
   const windowEnd = isFiniteNumber(boundary.uncertaintyEndEpoch)
     ? boundary.uncertaintyEndEpoch
     : boundary.intervalEndEpoch;
-  if (isFiniteNumber(windowStart) && isFiniteNumber(windowEnd) && isFiniteNumber(epoch)) {
-    if (epoch < windowStart) return 'same_before';
-    if (epoch >= windowEnd) return 'same_after';
-    return 'same_unknown';
+  if (isFiniteNumber(epoch)) {
+    const startKnown = isFiniteNumber(windowStart);
+    const endKnown = isFiniteNumber(windowEnd);
+    if (startKnown && epoch < windowStart) return 'same_before';
+    if (endKnown && epoch >= windowEnd) return 'same_after';
+    if (startKnown || endKnown) return 'same_unknown';
   }
   // Session-level crossing with no intraday evidence: unknown ordering.
   return 'same_unknown';
@@ -234,17 +238,29 @@ function resolvePrematureReduction({
   stopExecutionClassification = null
 }) {
   const boundarySessionDate = boundary ? boundary.sessionDate || null : null;
+  const empty = {
+    outcome: 'not_evaluated',
+    prematureQty: null,
+    prematureFraction: null,
+    excludedQty: 0,
+    ambiguousQty: 0,
+    beforeBoundaryQty: 0,
+    unknownOrderingQty: 0,
+    boundarySessionDate
+  };
   if (!isFiniteNumber(originalPositionQty) || originalPositionQty <= 0) {
-    return { outcome: 'not_evaluated', prematureQty: null, prematureFraction: null, excludedQty: 0, ambiguousQty: 0, boundarySessionDate };
+    return empty;
   }
   if (!boundary || !boundary.sessionDate) {
     // No observed temporal boundary: never fabricate PASS/FAIL.
-    return { outcome: 'not_evaluated', prematureQty: null, prematureFraction: null, excludedQty: 0, ambiguousQty: 0, boundarySessionDate };
+    return empty;
   }
 
   let prematureQty = 0;
   let excludedQty = 0;
   let ambiguousQty = 0;
+  let beforeBoundaryQty = 0;
+  let unknownOrderingQty = 0;
   let candidateCount = 0;
 
   for (const reduction of reductions || []) {
@@ -252,21 +268,41 @@ function resolvePrematureReduction({
     const quantity = isFiniteNumber(reduction.quantity) ? reduction.quantity : 0;
     if (relation === 'before_session' || relation === 'same_before') {
       candidateCount += 1;
+      beforeBoundaryQty += quantity;
       const verdict = classifyReduction(reduction, stopExecutionClassification);
       if (verdict === 'protective') excludedQty += quantity;
       else if (verdict === 'discretionary') prematureQty += quantity;
       else ambiguousQty += quantity;
     } else if (relation === 'same_unknown') {
       candidateCount += 1;
+      unknownOrderingQty += quantity;
       ambiguousQty += quantity;
     }
   }
 
   if (candidateCount === 0) {
-    return { outcome: 'none', prematureQty: 0, prematureFraction: 0, excludedQty: 0, ambiguousQty: 0, boundarySessionDate };
+    return {
+      outcome: 'none',
+      prematureQty: 0,
+      prematureFraction: 0,
+      excludedQty: 0,
+      ambiguousQty: 0,
+      beforeBoundaryQty: 0,
+      unknownOrderingQty: 0,
+      boundarySessionDate
+    };
   }
   if (prematureQty === 0 && ambiguousQty > 0) {
-    return { outcome: 'ambiguous', prematureQty: null, prematureFraction: null, excludedQty, ambiguousQty, boundarySessionDate };
+    return {
+      outcome: 'ambiguous',
+      prematureQty: null,
+      prematureFraction: null,
+      excludedQty,
+      ambiguousQty,
+      beforeBoundaryQty,
+      unknownOrderingQty,
+      boundarySessionDate
+    };
   }
   const fraction = Math.min(1, prematureQty / originalPositionQty);
   return {
@@ -275,6 +311,8 @@ function resolvePrematureReduction({
     prematureFraction: fraction,
     excludedQty,
     ambiguousQty,
+    beforeBoundaryQty,
+    unknownOrderingQty,
     boundarySessionDate
   };
 }

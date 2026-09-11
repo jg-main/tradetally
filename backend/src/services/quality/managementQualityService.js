@@ -708,6 +708,8 @@ function buildManagementEvidenceBlock({
           premature_fraction: prematureReduction.prematureFraction,
           excluded_qty: prematureReduction.excludedQty || 0,
           ambiguous_qty: prematureReduction.ambiguousQty || 0,
+          before_boundary_qty: prematureReduction.beforeBoundaryQty || 0,
+          unknown_ordering_qty: prematureReduction.unknownOrderingQty || 0,
           boundary_session_date: prematureReduction.boundarySessionDate || null
         }
       : null,

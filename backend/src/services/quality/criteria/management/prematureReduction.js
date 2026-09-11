@@ -48,6 +48,8 @@ function evaluate({ managementState = {} }) {
     premature_reduction_fraction: premature.prematureFraction,
     excluded_protective_qty: premature.excludedQty || 0,
     ambiguous_qty: premature.ambiguousQty || 0,
+    before_boundary_qty: premature.beforeBoundaryQty || 0,
+    unknown_ordering_qty: premature.unknownOrderingQty || 0,
     boundary_session_date: premature.boundarySessionDate || null,
     original_position_qty: managementState.originalPositionQty ?? null,
     stop_execution_evidence_available: !!premature.classificationAvailable,

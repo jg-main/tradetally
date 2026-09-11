@@ -206,3 +206,51 @@ describe('trailing MA (F5/F6)', () => {
     expect(result.scoring_value).toBe('later_or_ignored');
   });
 });
+
+describe('independent corridor bounds — criterion outcome (F1)', () => {
+  it('premarket completion with a known corridor start => Partial Timing FAIL (pre_trigger)', () => {
+    const s = baseState({
+      partialCompletion: {
+        ...baseState().partialCompletion,
+        sessionsAfterTrigger: 0,
+        completionRelation: 'same_before',
+        timingOutcome: 'pre_trigger'
+      }
+    });
+    const r = partialTiming.evaluate({ managementState: s });
+    expect(r.status).toBe(CRITERION_STATUS.FAIL);
+    expect(r.scoring_value).toBe('later_or_not_completed');
+  });
+
+  it('trusted discretionary premarket reduction => No Premature Reduction FAIL with before-boundary evidence', () => {
+    const s = baseState({
+      prematureReduction: {
+        outcome: 'discretionary',
+        prematureQty: 40,
+        prematureFraction: 0.2,
+        beforeBoundaryQty: 40,
+        unknownOrderingQty: 0,
+        boundarySessionDate: '2026-03-12'
+      }
+    });
+    const r = prematureReduction.evaluate({ managementState: s });
+    expect(r.status).toBe(CRITERION_STATUS.FAIL);
+    expect(r.evidence.before_boundary_qty).toBe(40);
+  });
+
+  it('unclassified premarket reduction => UNKNOWN but the pre-trigger relation is recorded', () => {
+    const s = baseState({
+      prematureReduction: {
+        outcome: 'ambiguous',
+        ambiguousQty: 40,
+        beforeBoundaryQty: 40,
+        unknownOrderingQty: 0,
+        boundarySessionDate: '2026-03-12'
+      }
+    });
+    const r = prematureReduction.evaluate({ managementState: s });
+    expect(r.status).toBe(CRITERION_STATUS.UNKNOWN);
+    expect(r.evidence.before_boundary_qty).toBe(40);
+    expect(r.evidence.unknown_ordering_qty).toBe(0);
+  });
+});

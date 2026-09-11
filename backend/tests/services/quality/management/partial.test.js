@@ -474,3 +474,82 @@ describe('relationToBoundary — Day1/earliest_day uncertainty corridor (F1)', (
     expect(result.timingOutcome).toBe('unknown_ordering');
   });
 });
+
+describe('relationToBoundary — independent corridor bounds', () => {
+  const sessionDate = '2026-03-12';
+  const sessionOpen = 1_000_000; // 09:30
+  const sessionClose = sessionOpen + 6.5 * 3600; // 16:00
+  const elevenEighteen = sessionOpen + 1 * 3600 + 48 * 60; // 11:18
+
+  function corridor(overrides = {}) {
+    return {
+      mode: 'instant',
+      kind: 'crossing',
+      sessionDate,
+      epoch: null,
+      intervalStartEpoch: null,
+      intervalEndEpoch: null,
+      uncertaintyStartEpoch: null,
+      uncertaintyEndEpoch: null,
+      uncertain: true,
+      orderingKnown: false,
+      sessionOpenEpoch: sessionOpen,
+      sessionCloseEpoch: sessionClose,
+      ...overrides
+    };
+  }
+
+  it('start known, end unknown: before the start is definitely pre-trigger', () => {
+    const b = corridor({ uncertaintyStartEpoch: sessionOpen });
+    expect(relationToBoundary({ sessionDate, timeEpoch: sessionOpen - 2700 }, b)).toBe('same_before'); // 08:45
+    expect(relationToBoundary({ sessionDate, timeEpoch: sessionOpen + 1800 }, b)).toBe('same_unknown'); // 10:00
+  });
+
+  it('end known, start unknown: at/after the end is definitely post-trigger', () => {
+    const b = corridor({ uncertaintyEndEpoch: elevenEighteen });
+    expect(relationToBoundary({ sessionDate, timeEpoch: sessionOpen + 1800 }, b)).toBe('same_unknown'); // 10:00
+    expect(relationToBoundary({ sessionDate, timeEpoch: elevenEighteen + 12 * 60 }, b)).toBe('same_after'); // 11:30
+  });
+
+  it('both bounds known: preserves before / inside / after behavior', () => {
+    const b = corridor({ uncertaintyStartEpoch: sessionOpen, uncertaintyEndEpoch: elevenEighteen });
+    expect(relationToBoundary({ sessionDate, timeEpoch: sessionOpen - 600 }, b)).toBe('same_before');
+    expect(relationToBoundary({ sessionDate, timeEpoch: sessionOpen + 1800 }, b)).toBe('same_unknown');
+    expect(relationToBoundary({ sessionDate, timeEpoch: elevenEighteen + 60 }, b)).toBe('same_after');
+  });
+
+  it('premarket completion with start known/end unknown => pre_trigger, not unknown ordering', () => {
+    const b = corridor({ uncertaintyStartEpoch: sessionOpen });
+    const result = completion(
+      [{ timeEpoch: sessionOpen - 2700, quantity: 100, sessionDate, cumulativeQty: 100 }],
+      { boundary: b }
+    );
+    expect(result.completionRelation).toBe('same_before');
+    expect(result.timingOutcome).toBe('pre_trigger');
+  });
+
+  it('trusted discretionary premarket reduction with start known/end unknown => FAIL (discretionary)', () => {
+    const b = corridor({ uncertaintyStartEpoch: sessionOpen });
+    const result = resolvePrematureReduction({
+      reductions: [{ timeEpoch: sessionOpen - 2700, quantity: 40, sessionDate, cumulativeQty: 40 }],
+      originalPositionQty: 200,
+      boundary: b,
+      stopExecutionClassification: { available: true, complete: true, byEpoch: { [sessionOpen - 2700]: 'discretionary' } }
+    });
+    expect(result.outcome).toBe('discretionary');
+    expect(result.prematureFraction).toBeCloseTo(0.2);
+    expect(result.beforeBoundaryQty).toBe(40);
+  });
+
+  it('unclassified premarket reduction stays UNKNOWN but records the pre-trigger relation', () => {
+    const b = corridor({ uncertaintyStartEpoch: sessionOpen });
+    const result = resolvePrematureReduction({
+      reductions: [{ timeEpoch: sessionOpen - 2700, quantity: 40, sessionDate, cumulativeQty: 40 }],
+      originalPositionQty: 200,
+      boundary: b
+    });
+    expect(result.outcome).toBe('ambiguous');
+    expect(result.beforeBoundaryQty).toBe(40);
+    expect(result.unknownOrderingQty).toBe(0);
+  });
+});
