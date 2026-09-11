@@ -3,7 +3,7 @@ description: Read-only planning agent for TradeTally. Produces bounded implement
 mode: subagent
 model: openrouter/z-ai/glm-4.7-flash
 temperature: 0.1
-steps: 14
+steps: 30
 permission:
   read: allow
   glob: allow

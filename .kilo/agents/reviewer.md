@@ -4,7 +4,7 @@ mode: subagent
 model: openrouter/stepfun/step-3.7-flash
 variant: low
 temperature: 0.1
-steps: 10
+steps: 30
 permission:
   read: allow
   glob: allow

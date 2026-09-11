@@ -3,7 +3,7 @@ description: Read-only research agent for TradeTally. Investigates repository be
 mode: subagent
 model: openrouter/minimax/minimax-m3
 temperature: 0.1
-steps: 14
+steps: 30
 permission:
   read: allow
   glob: allow
