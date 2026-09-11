@@ -424,3 +424,53 @@ describe('no-trigger / observed-horizon boundary is the completed session close 
     expect(result.outcome).toBe('not_evaluated');
   });
 });
+
+describe('relationToBoundary — Day1/earliest_day uncertainty corridor (F1)', () => {
+  // Day-3 11:17 confirmed crossing bar; corridor = [Day3 open, crossing bar end).
+  const day3Open = 1_000_000;
+  const crossingBarStart = day3Open + 4 * 3600 + 47 * 60; // 11:17
+  const crossingBarEnd = crossingBarStart + 60;
+  const corridor = {
+    mode: 'instant',
+    kind: 'crossing',
+    sessionDate: '2026-03-12',
+    epoch: null,
+    intervalStartEpoch: day3Open,
+    intervalEndEpoch: crossingBarEnd,
+    uncertaintyStartEpoch: day3Open,
+    uncertaintyEndEpoch: crossingBarEnd,
+    uncertain: true,
+    orderingKnown: false,
+    sessionOpenEpoch: day3Open,
+    sessionCloseEpoch: day3Open + 6.5 * 3600
+  };
+
+  it('premarket reduction on the due date is definitely pre-trigger', () => {
+    expect(relationToBoundary({ sessionDate: '2026-03-12', timeEpoch: day3Open - 600 }, corridor)).toBe('same_before');
+  });
+
+  it('a 10:00 reduction is inside the corridor => UNKNOWN', () => {
+    expect(relationToBoundary({ sessionDate: '2026-03-12', timeEpoch: day3Open + 1800 }, corridor)).toBe('same_unknown');
+  });
+
+  it('a reduction inside the confirmed crossing bar is UNKNOWN', () => {
+    expect(relationToBoundary({ sessionDate: '2026-03-12', timeEpoch: crossingBarStart + 10 }, corridor)).toBe('same_unknown');
+  });
+
+  it('a reduction after the crossing upper bound is post-trigger', () => {
+    expect(relationToBoundary({ sessionDate: '2026-03-12', timeEpoch: crossingBarEnd + 60 }, corridor)).toBe('same_after');
+  });
+
+  it('a reduction on a later session is post-trigger', () => {
+    expect(relationToBoundary({ sessionDate: '2026-03-13', timeEpoch: 1 }, corridor)).toBe('after');
+  });
+
+  it('a completion inside the corridor makes Partial Timing UNKNOWN (never fabricated)', () => {
+    const result = completion(
+      [{ timeEpoch: day3Open + 1800, quantity: 100, sessionDate: '2026-03-12', cumulativeQty: 100 }],
+      { boundary: corridor }
+    );
+    expect(result.completionRelation).toBe('same_unknown');
+    expect(result.timingOutcome).toBe('unknown_ordering');
+  });
+});

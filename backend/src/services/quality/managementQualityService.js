@@ -675,6 +675,7 @@ function buildManagementEvidenceBlock({
                 interval_end: partialTrigger.boundary.intervalEndEpoch ?? null,
                 uncertainty_start: partialTrigger.boundary.uncertaintyStartEpoch ?? null,
                 uncertainty_end: partialTrigger.boundary.uncertaintyEndEpoch ?? null,
+                uncertainty_basis: partialTrigger.boundary.uncertaintyBasis ?? null,
                 uncertain: partialTrigger.boundary.uncertain === true,
                 precision: partialTrigger.boundary.precision || null,
                 source: partialTrigger.boundary.source || null,
@@ -718,6 +719,8 @@ function buildManagementEvidenceBlock({
           active: trailing.active,
           activation_session: trailing.activationSessionDate || null,
           activation_session_index: trailing.activationSessionIndex ?? null,
+          activation_basis: trailing.activationBasis || null,
+          partial_completion_before_close: trailing.partialCompletionBeforeClose === true,
           inactive_reason: trailing.inactiveReason || null,
           signal_date: trailing.signal ? trailing.signal.date : null,
           signal_close: trailing.signal ? trailing.signal.close : null,
@@ -1118,18 +1121,47 @@ async function resolveManagementCore({
       // exact instant.
       let boundary = partialTrigger.boundary;
       if (boundary && boundary.kind === 'crossing') {
-        boundary = {
-          ...boundary,
-          epoch: isFiniteNumber(crossing.epoch) ? crossing.epoch : null,
-          intervalStartEpoch: isFiniteNumber(crossing.intervalStartEpoch) ? crossing.intervalStartEpoch : null,
-          intervalEndEpoch: isFiniteNumber(crossing.intervalEndEpoch) ? crossing.intervalEndEpoch : null,
-          uncertaintyStartEpoch: isFiniteNumber(crossing.uncertaintyStartEpoch) ? crossing.uncertaintyStartEpoch : null,
-          uncertaintyEndEpoch: isFiniteNumber(crossing.uncertaintyEndEpoch) ? crossing.uncertaintyEndEpoch : null,
-          uncertain: crossing.uncertain === true,
-          precision: crossing.precision || 'session',
-          source: crossing.source || null,
-          orderingKnown: isFiniteNumber(crossing.epoch)
-        };
+        if (boundary.day1EarliestDayUncertainty === true) {
+          // Day 1 was point-in-time uncertain and the first CONFIRMED crossing
+          // is on earliest_day: the due instant lies in
+          // [earliest_day open, confirmed crossing upper bound].
+          const corridorStart = isFiniteNumber(boundary.uncertaintyStartEpoch)
+            ? boundary.uncertaintyStartEpoch
+            : null;
+          const crossingUpperBound = isFiniteNumber(crossing.epoch)
+            ? crossing.epoch
+            : isFiniteNumber(crossing.intervalEndEpoch)
+              ? crossing.intervalEndEpoch
+              : isFiniteNumber(crossing.uncertaintyEndEpoch)
+                ? crossing.uncertaintyEndEpoch
+                : null;
+          boundary = {
+            ...boundary,
+            epoch: null,
+            intervalStartEpoch: corridorStart,
+            intervalEndEpoch: crossingUpperBound,
+            uncertaintyStartEpoch: corridorStart,
+            uncertaintyEndEpoch: crossingUpperBound,
+            uncertain: true,
+            uncertaintyBasis: 'day1_vs_earliest_day',
+            precision: crossing.precision || 'session',
+            source: crossing.source || null,
+            orderingKnown: false
+          };
+        } else {
+          boundary = {
+            ...boundary,
+            epoch: isFiniteNumber(crossing.epoch) ? crossing.epoch : null,
+            intervalStartEpoch: isFiniteNumber(crossing.intervalStartEpoch) ? crossing.intervalStartEpoch : null,
+            intervalEndEpoch: isFiniteNumber(crossing.intervalEndEpoch) ? crossing.intervalEndEpoch : null,
+            uncertaintyStartEpoch: isFiniteNumber(crossing.uncertaintyStartEpoch) ? crossing.uncertaintyStartEpoch : null,
+            uncertaintyEndEpoch: isFiniteNumber(crossing.uncertaintyEndEpoch) ? crossing.uncertaintyEndEpoch : null,
+            uncertain: crossing.uncertain === true,
+            precision: crossing.precision || 'session',
+            source: crossing.source || null,
+            orderingKnown: isFiniteNumber(crossing.epoch)
+          };
+        }
       }
       partialTrigger = { ...partialTrigger, crossing, boundary };
     }
@@ -1614,9 +1646,36 @@ function resolveTrailingState({
     if (!partialCompletion || !partialCompletion.completed) {
       return { ...base, activationResolved: true, inactiveReason: 'partial_not_completed' };
     }
+    // Activation begins at the partial-completion INSTANT. A daily close is only
+    // eligible as an MA signal when it occurs AFTER activation, so a completion
+    // at/after the regular-session close (half-open [open, close)) pushes
+    // activation to the NEXT regular session; that day's already-completed close
+    // must not become a retrospective signal.
+    const completionSessionIndex = partialCompletion.completionSessionIndex;
+    const completionSessionDate = partialCompletion.completionSessionDate;
+    const completionTimeEpoch = partialCompletion.completionTimeEpoch;
+    const completionCloseEpoch = completionSessionDate
+      ? (regularSessionBounds(completionSessionDate) || {}).closeEpoch
+      : null;
+    if (
+      !isFiniteNumber(completionTimeEpoch) ||
+      !isFiniteNumber(completionCloseEpoch) ||
+      !Number.isInteger(completionSessionIndex)
+    ) {
+      // The completion's same-session ordering cannot be established: do not
+      // scan an earlier close.
+      return { ...base, activationResolved: false, inactiveReason: 'partial_completion_time_unknown' };
+    }
+    const activationIndex = completionTimeEpoch >= completionCloseEpoch
+      ? completionSessionIndex + 1
+      : completionSessionIndex;
     base.active = true;
     base.activationResolved = true;
-    base.activationSessionIndex = partialCompletion.completionSessionIndex;
+    base.activationSessionIndex = activationIndex;
+    base.activationSession = daily.bars[activationIndex] ? daily.bars[activationIndex].date : null;
+    base.activationSessionDate = base.activationSession;
+    base.activationBasis = 'partial_completion';
+    base.partialCompletionBeforeClose = completionTimeEpoch < completionCloseEpoch;
   } else if (activation === 'immediate') {
     base.active = true;
     base.activationResolved = true;

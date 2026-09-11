@@ -196,24 +196,53 @@ function resolvePartialTrigger({ dayEvidence, entryBasis, rPerShare, parameters 
     const dueDay = reachedEarly ? earliestDay : firstReachDay;
     const dueEntry = scoped.find((day) => day.day === dueDay);
 
-    // Boundary: early +1R is due at earliest_day's regular-session OPEN; a
-    // same-or-later first reach is due at the first crossing instant (the
-    // orchestrator fills the epoch when intraday evidence establishes it).
-    const boundary = reachedEarly
-      ? buildBoundary(dueEntry, {
-          kind: 'session_open',
-          epoch: dueEntry ? dueEntry.sessionOpenEpoch : null,
-          precision: 'session_open',
-          source: 'session_calendar',
-          orderingKnown: !!(dueEntry && isFiniteNumber(dueEntry.sessionOpenEpoch))
-        })
-      : buildBoundary(firstDay, {
-          kind: 'crossing',
-          epoch: null,
-          precision: null,
-          source: null,
-          orderingKnown: false
-        });
+    // If Day 1 is point-in-time uncertain and the first CONFIRMED crossing is
+    // exactly on earliest_day, the due DATE is known (earliest_day) but the due
+    // INSTANT is not: +1R may have occurred on Day 1 (=> due at the
+    // earliest_day regular-session OPEN) or first on earliest_day (=> due at
+    // that crossing). Represent the boundary as an uncertainty corridor rather
+    // than a falsely precise earliest_day crossing boundary.
+    const day1EarliestDayUncertainty = day1Uncertain && !reachedEarly && firstReachDay === earliestDay;
+
+    let boundary;
+    if (reachedEarly) {
+      // Early +1R is due at earliest_day's regular-session OPEN.
+      boundary = buildBoundary(dueEntry, {
+        kind: 'session_open',
+        epoch: dueEntry ? dueEntry.sessionOpenEpoch : null,
+        precision: 'session_open',
+        source: 'session_calendar',
+        orderingKnown: !!(dueEntry && isFiniteNumber(dueEntry.sessionOpenEpoch))
+      });
+    } else if (day1EarliestDayUncertainty) {
+      // Corridor: [earliest_day open, confirmed earliest_day crossing upper
+      // bound]. The orchestrator fills the upper bound from the confirmed
+      // crossing evidence (exact print, bar-interval end, or sparse uncertainty
+      // end).
+      boundary = buildBoundary(firstDay, {
+        kind: 'crossing',
+        epoch: null,
+        intervalStartEpoch: null,
+        intervalEndEpoch: null,
+        uncertaintyStartEpoch: dueEntry ? dueEntry.sessionOpenEpoch : null,
+        uncertaintyEndEpoch: null,
+        uncertain: true,
+        precision: null,
+        source: null,
+        orderingKnown: false
+      });
+      boundary.day1EarliestDayUncertainty = true;
+    } else {
+      // A same-or-later first reach is due at the first crossing instant (the
+      // orchestrator fills the epoch when intraday evidence establishes it).
+      boundary = buildBoundary(firstDay, {
+        kind: 'crossing',
+        epoch: null,
+        precision: null,
+        source: null,
+        orderingKnown: false
+      });
+    }
 
     const result = {
       ...base,

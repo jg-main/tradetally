@@ -731,7 +731,13 @@ describe('resolveTrailingState — same-date signal/exit ordering (F3)', () => {
     return ManagementQualityService.resolveTrailingState({
       policy,
       partialTrigger: { status: 'triggered' },
-      partialCompletion: { completed: true, completionSessionIndex: 0 },
+      partialCompletion: {
+        completed: true,
+        completionSessionIndex: 0,
+        completionSessionDate: dates[0],
+        // intraday completion well before the entry-session close
+        completionTimeEpoch: regularSessionBounds(dates[0]).openEpoch + 3600
+      },
       partialExit: { outcome: 'none' },
       fillsState: {
         available: true,
@@ -1040,5 +1046,136 @@ describe('evaluate explicit required-input order (F2)', () => {
         userInputs: { trailing_phase: 'activated', trailing_activation_session: '2026-03-12' }
       })
     ).rejects.toMatchObject({ code: 'INPUT_REQUIRED', details: { field: 'trailing_ma_period' } });
+  });
+});
+
+describe('resolveTrailingState — after_partial activation follows the completion instant (F2)', () => {
+  const { regularSessionBounds } = require('../../../src/services/quality/entry/sessionTime');
+  const dates = ['2026-04-01', '2026-04-02', '2026-04-03', '2026-04-06', '2026-04-07', '2026-04-08',
+    '2026-04-09', '2026-04-10', '2026-04-13', '2026-04-14', '2026-04-15', '2026-04-16'];
+  const closes = dates.map(() => 100);
+  closes[10] = 90; // below-MA close on the partial-completion session
+  const bars = dates.map((date, i) => ({ date, close: closes[i] }));
+  const daily = {
+    authoritative: true,
+    entryIndex: 0,
+    completedThroughIndex: 11,
+    indexMap: new Map(dates.map((date, i) => [date, i])),
+    bars
+  };
+  const bounds10 = regularSessionBounds(dates[10]);
+
+  function state(partialCompletion) {
+    return ManagementQualityService.resolveTrailingState({
+      policy: { trailingActivation: 'after_partial', trailingActivationSource: 'trailing_ma', executionWindowMinutes: 30 },
+      partialTrigger: { status: 'triggered' },
+      partialCompletion,
+      partialExit: { outcome: 'none' },
+      fillsState: { available: true, positionClosed: false },
+      daily,
+      nowEpoch: 0,
+      trailingPhase: null,
+      sessionIndexForDate: (d) => daily.indexMap.get(d) ?? null,
+      executionWindowMinutes: 30,
+      stopExecutionClassification: { available: false },
+      userInputs: { trailing_ma_period: 10 }
+    });
+  }
+
+  test('intraday 15:00 completion => that session close may be the first MA signal', () => {
+    const result = state({
+      completed: true,
+      completionSessionIndex: 10,
+      completionSessionDate: dates[10],
+      completionTimeEpoch: bounds10.openEpoch + 5 * 3600 // 15:00
+    });
+    expect(result.active).toBe(true);
+    expect(result.activationSessionIndex).toBe(10);
+    expect(result.partialCompletionBeforeClose).toBe(true);
+    expect(result.signal).toBeTruthy();
+    expect(result.signal.sessionIndex).toBe(10);
+  });
+
+  test('after-hours 17:00 completion => that day close MUST NOT signal; next session starts the search', () => {
+    const result = state({
+      completed: true,
+      completionSessionIndex: 10,
+      completionSessionDate: dates[10],
+      completionTimeEpoch: bounds10.closeEpoch + 3600 // 17:00
+    });
+    expect(result.active).toBe(true);
+    expect(result.activationSessionIndex).toBe(11);
+    expect(result.partialCompletionBeforeClose).toBe(false);
+    expect(result.signal).toBeNull();
+  });
+
+  test('completion exactly at the regular-session close => that close is not a post-activation signal', () => {
+    const result = state({
+      completed: true,
+      completionSessionIndex: 10,
+      completionSessionDate: dates[10],
+      completionTimeEpoch: bounds10.closeEpoch
+    });
+    expect(result.activationSessionIndex).toBe(11);
+    expect(result.signal).toBeNull();
+  });
+
+  test('after-hours Friday completion => activation starts the next actual session (Monday), not Saturday', () => {
+    const bounds7 = regularSessionBounds(dates[7]); // 2026-04-10 (Fri)
+    const result = state({
+      completed: true,
+      completionSessionIndex: 7,
+      completionSessionDate: dates[7],
+      completionTimeEpoch: bounds7.closeEpoch + 3600
+    });
+    expect(result.activationSessionIndex).toBe(8);
+    expect(result.activationSessionDate).toBe('2026-04-13'); // Monday
+  });
+
+  test('missing completion timestamp => UNKNOWN activation, not scan-from-session-start', () => {
+    const result = state({
+      completed: true,
+      completionSessionIndex: 10,
+      completionSessionDate: dates[10],
+      completionTimeEpoch: null
+    });
+    expect(result.active).toBe(false);
+    expect(result.activationResolved).toBe(false);
+    expect(result.inactiveReason).toBe('partial_completion_time_unknown');
+  });
+});
+
+describe('Day1 uncertainty corridor — orchestrator wiring (F1)', () => {
+  test('fills the corridor end from the confirmed earliest_day crossing evidence', async () => {
+    const day3 = addDays(ENTRY_SESSION, 2);
+    const day1Open = Math.floor(Date.parse(`${ENTRY_SESSION}T13:30:00.000Z`) / 1000);
+    const day3Open = Math.floor(Date.parse(`${day3}T13:30:00.000Z`) / 1000);
+    // Entry-session daily high >= +1R so the Day-1 path is evaluated; Day 2 remains below.
+    const bars = DAILY_BARS.map((bar) => (bar.date === ENTRY_SESSION ? { ...bar, high: 106 } : bar));
+    loadDailyEvidence.mockResolvedValue({ bars, source: 'finnhub', completeness: 'verified', error: null });
+    loadSessionIntradayBars.mockImplementation(async (symbol, date) => {
+      if (date === ENTRY_SESSION) {
+        // Day 1: containing-only evidence; the post-entry path is incomplete.
+        return { available: true, source: 'test_intraday', bars: [{ time: day1Open, high: 101, low: 100, close: 101 }] };
+      }
+      if (date === day3) {
+        return { available: true, source: 'test_intraday', bars: [{ time: day3Open, high: 106, low: 100, close: 105 }] };
+      }
+      return { available: false, bars: [], source: null, reason: 'no intraday' };
+    });
+
+    await ManagementQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: EVAL_ID,
+      userInputs: { trailing_ma_period: 20 }
+    });
+    const data = evaluationService.saveManagementProgress.mock.calls[0][2];
+    const boundary = data.managementEvidence.partial_trigger.boundary;
+    expect(data.managementEvidence.partial_trigger.status).toBe('triggered');
+    expect(boundary.uncertain).toBe(true);
+    expect(boundary.uncertainty_basis).toBe('day1_vs_earliest_day');
+    expect(boundary.uncertainty_start).toBe(day3Open);
+    expect(boundary.uncertainty_end).toBe(day3Open + 60);
+    expect(boundary.epoch).toBeNull();
+    expect(boundary.ordering_known).toBe(false);
   });
 });

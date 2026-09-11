@@ -393,3 +393,65 @@ describe('findCrossingInSession — sparse-intraday first-crossing discipline (F
     expect(result.precision).toBe('execution_print');
   });
 });
+
+describe('resolvePartialTrigger — Day1 uncertainty on earliest_day corridor (F1)', () => {
+  it('Day1 possible +1R and first confirmed crossing on earliest_day => uncertainty corridor, not a precise crossing', () => {
+    // Day1 unknown, Day2 below, Day3 (earliest_day) confirmed crossing.
+    const evidence = days([101, 101, 106, 106, 106], { day1Known: false, day1PossibleX: true });
+    const result = resolvePartialTrigger({
+      dayEvidence: evidence,
+      entryBasis: ENTRY_BASIS,
+      rPerShare: R_PER_SHARE,
+      parameters: PARAMS
+    });
+    expect(result.status).toBe('triggered');
+    expect(result.firstReachDay).toBe(3);
+    expect(result.boundary.kind).toBe('crossing');
+    expect(result.boundary.day1EarliestDayUncertainty).toBe(true);
+    expect(result.boundary.uncertain).toBe(true);
+    expect(result.boundary.orderingKnown).toBe(false);
+    // corridor start = earliest_day regular-session open; end filled by the orchestrator
+    expect(result.boundary.uncertaintyStartEpoch).toBe(evidence[2].sessionOpenEpoch);
+    expect(result.boundary.uncertaintyEndEpoch).toBeNull();
+  });
+
+  it('Day1 definitively below +1R keeps the normal earliest_day crossing boundary', () => {
+    const evidence = days([101, 101, 106, 106, 106], { day1Known: true });
+    const result = resolvePartialTrigger({
+      dayEvidence: evidence,
+      entryBasis: ENTRY_BASIS,
+      rPerShare: R_PER_SHARE,
+      parameters: PARAMS
+    });
+    expect(result.status).toBe('triggered');
+    expect(result.firstReachDay).toBe(3);
+    expect(result.boundary.kind).toBe('crossing');
+    expect(result.boundary.day1EarliestDayUncertainty).toBeUndefined();
+    expect(result.boundary.uncertain).toBe(false);
+  });
+
+  it('Day1 definitively crossed keeps the earliest_day regular-session open boundary', () => {
+    const evidence = days([106, 106, 106, 106, 106], { day1Known: true });
+    const result = resolvePartialTrigger({
+      dayEvidence: evidence,
+      entryBasis: ENTRY_BASIS,
+      rPerShare: R_PER_SHARE,
+      parameters: PARAMS
+    });
+    expect(result.reachedEarly).toBe(true);
+    expect(result.boundary.kind).toBe('session_open');
+    expect(result.boundary.epoch).toBe(evidence[2].sessionOpenEpoch);
+  });
+
+  it('Day1 uncertain with the first confirmed crossing after earliest_day stays insufficient_evidence', () => {
+    const evidence = days([101, 101, 101, 101, 106], { day1Known: false, day1PossibleX: true });
+    const result = resolvePartialTrigger({
+      dayEvidence: evidence,
+      entryBasis: ENTRY_BASIS,
+      rPerShare: R_PER_SHARE,
+      parameters: PARAMS
+    });
+    expect(result.status).toBe('insufficient_evidence');
+    expect(result.reason).toBe('day1_post_entry_evidence_unavailable');
+  });
+});
