@@ -202,7 +202,7 @@ describe('findCrossingInSession', () => {
     { time: 1180, high: 108 }
   ];
 
-  it('returns the first bar whose high crosses the threshold (bar precision)', () => {
+  it('returns the first bar whose high crosses the threshold as an INTERVAL, not an exact instant', () => {
     const result = findCrossingInSession({
       bars,
       priorHighest: 101,
@@ -213,7 +213,9 @@ describe('findCrossingInSession', () => {
       observations: []
     });
     expect(result.crossed).toBe(true);
-    expect(result.epoch).toBe(1120);
+    expect(result.crossingEpoch).toBeNull();
+    expect(result.crossingStartEpoch).toBe(1120);
+    expect(result.crossingEndEpoch).toBe(1180);
     expect(result.precision).toBe('1min_bar');
   });
 
@@ -228,10 +230,11 @@ describe('findCrossingInSession', () => {
       observations: []
     });
     expect(result.crossed).toBe(true);
-    expect(result.epoch).toBe(1120);
+    expect(result.crossingStartEpoch).toBe(1120);
+    expect(result.crossingEndEpoch).toBe(1180);
   });
 
-  it('uses an observed execution print when it crosses first', () => {
+  it('uses an observed execution print as an exact crossing instant', () => {
     const result = findCrossingInSession({
       bars,
       priorHighest: -Infinity,
@@ -243,7 +246,8 @@ describe('findCrossingInSession', () => {
     });
     expect(result.crossed).toBe(true);
     expect(result.precision).toBe('execution_print');
-    expect(result.epoch).toBe(1030);
+    expect(result.crossingEpoch).toBe(1030);
+    expect(result.crossingStartEpoch).toBeNull();
   });
 
   it('never uses an observation outside the regular session or before the entry', () => {
@@ -263,9 +267,9 @@ describe('findCrossingInSession', () => {
       ]
     });
     expect(result.crossed).toBe(true);
-    // Falls back to the first in-session bar at/after the entry.
+    // Falls back to the first in-session bar at/after the entry (as an interval).
     expect(result.precision).toBe('1min_bar');
-    expect(result.epoch).toBe(1060);
+    expect(result.crossingStartEpoch).toBe(1060);
   });
 
   it('does not cross when nothing reaches the threshold', () => {
@@ -293,6 +297,7 @@ describe('resolvePartialTrigger — authoritative boundary (F1)', () => {
     });
     expect(result.reachedEarly).toBe(true);
     expect(result.boundary.kind).toBe('session_open');
+    expect(result.boundary.mode).toBe('instant');
     expect(result.boundary.sessionDate).toBe(evidence[2].sessionDate);
     expect(result.boundary.epoch).toBe(evidence[2].sessionOpenEpoch);
     expect(result.boundary.precision).toBe('session_open');
@@ -309,6 +314,7 @@ describe('resolvePartialTrigger — authoritative boundary (F1)', () => {
     });
     expect(result.firstReachDay).toBe(4);
     expect(result.boundary.kind).toBe('crossing');
+    expect(result.boundary.mode).toBe('instant');
     expect(result.boundary.sessionDate).toBe(evidence[3].sessionDate);
     expect(result.boundary.epoch).toBeNull();
     expect(result.boundary.orderingKnown).toBe(false);

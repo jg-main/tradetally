@@ -344,6 +344,7 @@ describe('resolveTrailingState — activation gating (F6)', () => {
     authoritative: true,
     entryIndex: 0,
     completedThroughIndex: 3,
+    indexMap: new Map([['2026-03-10', 0], ['2026-03-11', 1], ['2026-03-12', 2], ['2026-03-13', 3]]),
     bars: [
       { date: '2026-03-10', close: 100 },
       { date: '2026-03-11', close: 100 },
@@ -573,5 +574,351 @@ describe('ManagementQualityService.finalize', () => {
     await expect(
       ManagementQualityService.finalize(USER_ID, TRADE_ID, { evaluationId: EVAL_ID })
     ).rejects.toMatchObject({ code: 'MANAGEMENT_INCOMPLETE' });
+  });
+});
+
+describe('resolveDayOnePostEntryHigh — containing-bar ambiguity (F1)', () => {
+  const { regularSessionBounds } = require('../../../src/services/quality/entry/sessionTime');
+  const DATE = '2026-03-12';
+  const bounds = regularSessionBounds(DATE);
+  const entryEpoch = bounds.openEpoch + 30; // entry 09:30:30
+
+  beforeEach(() => {
+    loadSessionIntradayBars.mockReset();
+  });
+
+  test('entry inside a containing bar that could cross +1R leaves Day-1 first reach UNCERTAIN', async () => {
+    loadSessionIntradayBars.mockResolvedValue({
+      available: true,
+      source: 'test_intraday',
+      bars: [
+        { time: bounds.openEpoch, high: 106 },        // 09:30 containing bar could cross +1R
+        { time: bounds.openEpoch + 60, high: 101 },   // fully post-entry, below
+        { time: bounds.openEpoch + 120, high: 101 }
+      ]
+    });
+    const result = await ManagementQualityService.resolveDayOnePostEntryHigh({
+      day1Bar: { date: DATE, high: 106 },
+      entryEpoch,
+      entryBasis: 100,
+      rPerShare: 5,
+      minimumMfeR: 1.0,
+      symbol: 'TEST',
+      userId: USER_ID,
+      observations: []
+    });
+    expect(result.highKnown).toBe(false);
+    expect(result.possibleX).toBe(true);
+    expect(result.reason).toBe('day1_containing_bar_could_cross');
+  });
+
+  test('entry inside a containing bar provably below +1R lets later evidence resolve Day 1 normally', async () => {
+    loadSessionIntradayBars.mockResolvedValue({
+      available: true,
+      source: 'test_intraday',
+      bars: [
+        { time: bounds.openEpoch, high: 101 },        // 09:30 containing bar below +1R
+        { time: bounds.openEpoch + 60, high: 102 }    // fully post-entry
+      ]
+    });
+    const result = await ManagementQualityService.resolveDayOnePostEntryHigh({
+      day1Bar: { date: DATE, high: 102 },
+      entryEpoch,
+      entryBasis: 100,
+      rPerShare: 5,
+      minimumMfeR: 1.0,
+      symbol: 'TEST',
+      userId: USER_ID,
+      observations: []
+    });
+    expect(result.highKnown).toBe(true);
+    expect(result.possibleX).toBe(false);
+    expect(result.high).toBe(102);
+  });
+
+  test('a fully post-entry bar that crosses establishes the Day-1 crossing', async () => {
+    loadSessionIntradayBars.mockResolvedValue({
+      available: true,
+      source: 'test_intraday',
+      bars: [
+        { time: bounds.openEpoch, high: 101 },
+        { time: bounds.openEpoch + 60, high: 106 }    // fully post-entry crossing
+      ]
+    });
+    const result = await ManagementQualityService.resolveDayOnePostEntryHigh({
+      day1Bar: { date: DATE, high: 106 },
+      entryEpoch,
+      entryBasis: 100,
+      rPerShare: 5,
+      minimumMfeR: 1.0,
+      symbol: 'TEST',
+      userId: USER_ID,
+      observations: []
+    });
+    expect(result.highKnown).toBe(true);
+    expect(result.possibleX).toBe(false);
+    expect(result.high).toBe(106);
+    expect(result.precision).toBe('1min_bar');
+  });
+
+  test('a containing bar below +1R with no fully post-entry evidence is a definitive no-cross with an unknown exact value', async () => {
+    loadSessionIntradayBars.mockResolvedValue({
+      available: true,
+      source: 'test_intraday',
+      bars: [{ time: bounds.openEpoch, high: 101 }] // only the containing bar
+    });
+    const result = await ManagementQualityService.resolveDayOnePostEntryHigh({
+      day1Bar: { date: DATE, high: 101 },
+      entryEpoch,
+      entryBasis: 100,
+      rPerShare: 5,
+      minimumMfeR: 1.0,
+      symbol: 'TEST',
+      userId: USER_ID,
+      observations: []
+    });
+    expect(result.highKnown).toBe(true);
+    expect(result.possibleX).toBe(false);
+    expect(result.definitivelyBelowThreshold).toBe(true);
+    expect(result.highValueKnown).toBe(false);
+    expect(result.high).toBeNull();
+  });
+});
+
+describe('resolveTrailingState — same-date signal/exit ordering (F3)', () => {
+  const { regularSessionBounds } = require('../../../src/services/quality/entry/sessionTime');
+  const dates = [];
+  for (let i = 0; i < 25; i += 1) {
+    dates.push(`2026-04-${String(i + 1).padStart(2, '0')}`);
+  }
+  const bars = dates.map((date, i) => ({ date, close: i === 20 ? 90 : 100 }));
+  const daily = {
+    authoritative: true,
+    entryIndex: 0,
+    completedThroughIndex: 24,
+    indexMap: new Map(dates.map((date, i) => [date, i])),
+    bars
+  };
+  const signalDate = dates[20];
+  const signalCloseEpoch = regularSessionBounds(signalDate).closeEpoch;
+  const policy = { trailingActivation: 'after_partial', trailingActivationSource: 'trailing_ma', executionWindowMinutes: 30 };
+
+  function stateWithExit(sessionDate, timeEpoch, classification) {
+    return ManagementQualityService.resolveTrailingState({
+      policy,
+      partialTrigger: { status: 'triggered' },
+      partialCompletion: { completed: true, completionSessionIndex: 0 },
+      partialExit: { outcome: 'none' },
+      fillsState: {
+        available: true,
+        positionClosed: true,
+        lastClosingTimeEpoch: timeEpoch,
+        lastClosingPrice: 100,
+        lastClosingSessionDate: sessionDate,
+        firstFullClose: { sessionDate, timeEpoch, quantity: 200, cumulativeQty: 200, price: 100 }
+      },
+      daily,
+      nowEpoch: 0,
+      trailingPhase: null,
+      sessionIndexForDate: (d) => daily.indexMap.get(d) ?? null,
+      executionWindowMinutes: 30,
+      stopExecutionClassification: classification,
+      userInputs: { trailing_ma_period: 20 }
+    });
+  }
+
+  test('protective stop 11:00 on the signal date => superseded NOT_APPLICABLE', () => {
+    const state = stateWithExit(signalDate, signalCloseEpoch - 3600, { available: true, complete: true, byEpoch: { [signalCloseEpoch - 3600]: 'protective' } });
+    expect(state.signal).toBeTruthy();
+    expect(state.supersession.outcome).toBe('superseded_protective');
+  });
+
+  test('ambiguous 11:00 same-day exit => superseded UNKNOWN', () => {
+    const state = stateWithExit(signalDate, signalCloseEpoch - 3600, { available: false });
+    expect(state.supersession.outcome).toBe('superseded_ambiguous');
+  });
+
+  test('discretionary 11:00 same-day exit => superseded_discretionary', () => {
+    const state = stateWithExit(signalDate, signalCloseEpoch - 3600, { available: true, complete: true, byEpoch: { [signalCloseEpoch - 3600]: 'discretionary' } });
+    expect(state.supersession.outcome).toBe('superseded_discretionary');
+  });
+
+  test('an after-close exit on the signal date is NOT a pre-signal supersession', () => {
+    const state = stateWithExit(signalDate, signalCloseEpoch + 600, { available: true, complete: true, byEpoch: { [signalCloseEpoch + 600]: 'protective' } });
+    expect(state.supersession.outcome).toBe('none');
+    expect(state.execution).toBeTruthy();
+  });
+
+  test('a protective exit on a prior session remains superseded', () => {
+    const prior = dates[18];
+    const priorClose = regularSessionBounds(prior).closeEpoch;
+    const state = stateWithExit(prior, priorClose - 3600, { available: true, complete: true, byEpoch: { [priorClose - 3600]: 'protective' } });
+    expect(state.signal).toBeTruthy();
+    expect(state.supersession.outcome).toBe('superseded_protective');
+  });
+});
+
+describe('resolveTrailingState — explicit activation validation (F4)', () => {
+  const daily = {
+    authoritative: true,
+    entryIndex: 2,
+    completedThroughIndex: 5,
+    indexMap: new Map([['2026-03-10', 0], ['2026-03-11', 1], ['2026-03-12', 2], ['2026-03-13', 3], ['2026-03-16', 4], ['2026-03-17', 5]]),
+    bars: [
+      { date: '2026-03-10', close: 100 },
+      { date: '2026-03-11', close: 100 },
+      { date: '2026-03-12', close: 100 },
+      { date: '2026-03-13', close: 100 },
+      { date: '2026-03-16', close: 100 },
+      { date: '2026-03-17', close: 100 }
+    ]
+  };
+  const policy = { trailingActivation: 'explicit', trailingActivationSource: 'trailing_ma', executionWindowMinutes: 30 };
+
+  function state({ session, fillsState = { available: true, positionClosed: false }, phase = 'activated' }) {
+    return ManagementQualityService.resolveTrailingState({
+      policy,
+      partialTrigger: { status: 'never_reached' },
+      partialCompletion: { completed: false },
+      partialExit: { outcome: 'none' },
+      fillsState,
+      daily,
+      nowEpoch: 0,
+      trailingPhase: phase,
+      sessionIndexForDate: (d) => daily.indexMap.get(d) ?? null,
+      executionWindowMinutes: 30,
+      stopExecutionClassification: { available: false },
+      userInputs: { trailing_phase: phase, trailing_activation_session: session, trailing_ma_period: 20 }
+    });
+  }
+
+  test('a valid activation session on a real trading session at/after entry is accepted', () => {
+    const result = state({ session: '2026-03-12' });
+    expect(result.active).toBe(true);
+    expect(result.activationResolved).toBe(true);
+    expect(result.activationSessionIndex).toBe(2);
+  });
+
+  test('an activation session before the entry is rejected', () => {
+    const result = state({ session: '2026-03-10' });
+    expect(result.active).toBe(false);
+    expect(result.inactiveReason).toBe('activation_session_before_entry');
+  });
+
+  test('a weekend/non-session activation date is rejected rather than shifted', () => {
+    const result = state({ session: '2026-03-14' }); // Saturday, not in the daily evidence
+    expect(result.active).toBe(false);
+    expect(result.inactiveReason).toBe('activation_session_not_a_trading_session');
+  });
+
+  test('an activation after the position was fully closed is rejected', () => {
+    const result = state({
+      session: '2026-03-16',
+      fillsState: { available: true, positionClosed: true, lastClosingSessionDate: '2026-03-12' }
+    });
+    expect(result.active).toBe(false);
+    expect(result.inactiveReason).toBe('activation_session_after_position_closed');
+  });
+});
+
+describe('resolveTrailingApplicability — required-input transitions (F4)', () => {
+  const explicit = { trailingActivation: 'explicit' };
+
+  test('explicit with no phase assertion requires trailing_phase only', () => {
+    const r = ManagementQualityService.resolveTrailingApplicability({
+      policy: explicit, partialTrigger: { status: 'never_reached' }, partialCompletion: { completed: false },
+      partialExit: { outcome: 'none' }, trailingPhase: null, activationSessionEstablished: false
+    });
+    expect(r.phaseRequired).toBe(true);
+    expect(r.smaRequired).toBe(false);
+    expect(r.activationSessionRequired).toBe(false);
+  });
+
+  test('explicit activated with no session requires the activation boundary and an SMA', () => {
+    const r = ManagementQualityService.resolveTrailingApplicability({
+      policy: explicit, partialTrigger: { status: 'never_reached' }, partialCompletion: { completed: false },
+      partialExit: { outcome: 'none' }, trailingPhase: 'activated', activationSessionEstablished: false
+    });
+    expect(r.activationSessionRequired).toBe(true);
+    expect(r.smaRequired).toBe(true);
+  });
+
+  test('explicit activated with a session but no SMA requires trailing_ma_period', () => {
+    const r = ManagementQualityService.resolveTrailingApplicability({
+      policy: explicit, partialTrigger: { status: 'never_reached' }, partialCompletion: { completed: false },
+      partialExit: { outcome: 'none' }, trailingPhase: 'activated', activationSessionEstablished: true
+    });
+    expect(r.activationSessionRequired).toBe(false);
+    expect(r.smaRequired).toBe(true);
+  });
+
+  test('explicit not_activated requires nothing', () => {
+    const r = ManagementQualityService.resolveTrailingApplicability({
+      policy: explicit, partialTrigger: { status: 'never_reached' }, partialCompletion: { completed: false },
+      partialExit: { outcome: 'none' }, trailingPhase: 'not_activated', activationSessionEstablished: false
+    });
+    expect(r.phaseRequired).toBe(false);
+    expect(r.smaRequired).toBe(false);
+    expect(r.activationSessionRequired).toBe(false);
+  });
+});
+
+describe('explicit activation end-to-end (F4)', () => {
+  function explicitConfig() {
+    const config = JSON.parse(JSON.stringify(CONFIG));
+    const trailing = config.dimensions.management.criteria.find((c) => c.key === 'trailing_ma');
+    trailing.parameters.activation = 'explicit';
+    return config;
+  }
+
+  test('prepare requires trailing_phase first and not the SMA/session', async () => {
+    installDbRouter(explicitConfig());
+    const payload = await ManagementQualityService.prepare(USER_ID, TRADE_ID, { evaluationId: EVAL_ID });
+    expect(payload.requiredManagementUserInputs).toContain('trailing_phase');
+    expect(payload.requiredManagementUserInputs).not.toContain('trailing_ma_period');
+    expect(payload.requiredManagementUserInputs).not.toContain('trailing_activation_session');
+    expect(payload.trailingMa.phaseRequired).toBe(true);
+  });
+
+  test('prepare requires the activation session and the SMA once the phase is activated', async () => {
+    const evaluation = evaluationRow();
+    evaluation.user_inputs = { trailing_phase: 'activated' };
+    evaluationService.getEvaluation.mockResolvedValue(evaluation);
+    installDbRouter(explicitConfig());
+    const payload = await ManagementQualityService.prepare(USER_ID, TRADE_ID, { evaluationId: EVAL_ID });
+    expect(payload.requiredManagementUserInputs).toContain('trailing_activation_session');
+    expect(payload.requiredManagementUserInputs).toContain('trailing_ma_period');
+    expect(payload.requiredManagementUserInputs).not.toContain('trailing_phase');
+  });
+
+  test('evaluate rejects an activation session that is not a trading session', async () => {
+    installDbRouter(explicitConfig());
+    await expect(
+      ManagementQualityService.evaluate(USER_ID, TRADE_ID, {
+        evaluationId: EVAL_ID,
+        userInputs: { trailing_phase: 'activated', trailing_activation_session: '2026-04-01', trailing_ma_period: 20 }
+      })
+    ).rejects.toMatchObject({ code: 'INVALID_ACTIVATION_SESSION' });
+  });
+
+  test('evaluate rejects an activation session before the entry', async () => {
+    installDbRouter(explicitConfig());
+    await expect(
+      ManagementQualityService.evaluate(USER_ID, TRADE_ID, {
+        evaluationId: EVAL_ID,
+        userInputs: { trailing_phase: 'activated', trailing_activation_session: '2026-03-05', trailing_ma_period: 20 }
+      })
+    ).rejects.toMatchObject({ code: 'INVALID_ACTIVATION_SESSION' });
+  });
+
+  test('evaluate accepts an exact valid activation session', async () => {
+    installDbRouter(explicitConfig());
+    const payload = await ManagementQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: EVAL_ID,
+      userInputs: { trailing_phase: 'activated', trailing_activation_session: '2026-03-12', trailing_ma_period: 20 }
+    });
+    expect(payload.evaluation).toBeTruthy();
+    const data = evaluationService.saveManagementProgress.mock.calls[0][2];
+    expect(data.trailingActivation).toMatchObject({ mode: 'establish', session: '2026-03-12' });
   });
 });

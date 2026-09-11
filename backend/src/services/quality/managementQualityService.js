@@ -362,7 +362,10 @@ function parseActivationSession(rawValue) {
 // Day 1 post-entry high. The whole daily bar is valid only when the actual
 // entry is at/before the regular-session open; otherwise only evidence
 // genuinely observable at/after the entry and within the Day-1 regular session
-// is used. Later-day scale-ins and pre-entry prints can never influence it.
+// is used. The 1-minute bar CONTAINING the entry mixes pre- and post-entry
+// action: its whole high is never treated as post-entry evidence, but if it
+// could have crossed +1R the Day-1 first reach is marked UNCERTAIN (never
+// silently ruled out by later complete bars).
 async function resolveDayOnePostEntryHigh({
   day1Bar,
   entryEpoch,
@@ -378,23 +381,17 @@ async function resolveDayOnePostEntryHigh({
     ? entryBasis + minimumMfeR * rPerShare
     : null;
   if (!day1Bar || !bounds) {
-    return { available: false, high: null, precision: null, source: null, possibleX: false, reason: 'day1_session_unknown' };
+    return { highKnown: false, high: null, highValueKnown: false, possibleX: false, precision: null, source: null, reason: 'day1_session_unknown' };
   }
   if (isFiniteNumber(entryEpoch) && entryEpoch <= bounds.openEpoch) {
     // The actual entry is at/before the open, so the entire regular session is
     // post-entry and the completed daily high is exact.
-    return {
-      available: true,
-      high: day1Bar.high,
-      precision: 'daily_bar',
-      source: 'daily_bar',
-      possibleX: false,
-      reason: null
-    };
+    return { highKnown: true, high: day1Bar.high, highValueKnown: true, possibleX: false, precision: 'daily_bar', source: 'daily_bar', reason: null };
   }
+  const dailyAtOrAboveThreshold = thresholdPrice !== null
+    && isFiniteNumber(day1Bar.high)
+    && day1Bar.high >= thresholdPrice;
 
-  // Entry after the open: bound every observation to the Day-1 regular session
-  // and at/after the entry.
   const boundedObservations = (observations || []).filter((obs) =>
     isFiniteNumber(obs.price) && obs.price > 0 &&
     isFiniteNumber(obs.epoch) &&
@@ -403,21 +400,28 @@ async function resolveDayOnePostEntryHigh({
     (!isFiniteNumber(entryEpoch) || obs.epoch >= entryEpoch)
   );
 
-  let high = -Infinity;
+  const resolutionSeconds = 60;
+  let postEntryHigh = -Infinity;
   let precision = null;
   let source = null;
+  let containingPossibleX = false;
+  let intradayAvailable = false;
   try {
     const intraday = await loadSessionIntradayBars(symbol, day1Bar.date, userId);
     if (intraday && intraday.available && intraday.bars.length > 0) {
-      let intradayHigh = -Infinity;
+      intradayAvailable = true;
       for (const bar of intraday.bars) {
         if (!isFiniteNumber(bar.time) || !isFiniteNumber(bar.high)) continue;
         if (bar.time < bounds.openEpoch || bar.time >= bounds.closeEpoch) continue;
+        const containsEntry = isFiniteNumber(entryEpoch)
+          && entryEpoch > bar.time
+          && entryEpoch < bar.time + resolutionSeconds;
+        if (containsEntry) {
+          if (thresholdPrice !== null && bar.high >= thresholdPrice) containingPossibleX = true;
+          continue; // never use the containing bar's whole high as post-entry
+        }
         if (isFiniteNumber(entryEpoch) && bar.time < entryEpoch) continue;
-        intradayHigh = Math.max(intradayHigh, bar.high);
-      }
-      if (intradayHigh !== -Infinity) {
-        high = intradayHigh;
+        postEntryHigh = Math.max(postEntryHigh, bar.high);
         precision = '1min_bar';
         source = intraday.source || 'intraday_cache';
       }
@@ -426,25 +430,49 @@ async function resolveDayOnePostEntryHigh({
     // Fall through; bounded observations may still establish the high.
   }
   for (const obs of boundedObservations) {
-    if (obs.price > high) {
-      high = obs.price;
-      if (!precision) {
+    if (obs.price > postEntryHigh) {
+      postEntryHigh = obs.price;
+      if (precision !== '1min_bar') {
         precision = 'execution_print';
         source = 'executions_jsonb';
       }
     }
   }
-  if (high !== -Infinity) {
-    return { available: true, high, precision: precision || 'execution_print', source: source || 'executions_jsonb', possibleX: false, reason: null };
+
+  if (thresholdPrice !== null && postEntryHigh >= thresholdPrice) {
+    // A fully post-entry bar or an execution print establishes the crossing.
+    return { highKnown: true, high: postEntryHigh, highValueKnown: true, possibleX: false, precision: precision || 'execution_print', source: source || 'executions_jsonb', reason: null };
+  }
+  if (containingPossibleX) {
+    return { highKnown: false, high: null, highValueKnown: false, possibleX: true, precision: null, source: null, reason: 'day1_containing_bar_could_cross' };
+  }
+  if (intradayAvailable) {
+    // The containing bar is provably below the threshold and no fully
+    // post-entry evidence reached it: Day 1 definitively did not cross.
+    return {
+      highKnown: true,
+      high: postEntryHigh === -Infinity ? null : postEntryHigh,
+      highValueKnown: postEntryHigh !== -Infinity,
+      definitivelyBelowThreshold: true,
+      possibleX: false,
+      precision,
+      source,
+      reason: null
+    };
+  }
+  if (dailyAtOrAboveThreshold) {
+    // No intraday evidence: the daily high could include a post-entry crossing.
+    return { highKnown: false, high: null, highValueKnown: false, possibleX: true, precision: null, source: null, reason: 'day1_post_entry_evidence_unavailable' };
   }
   return {
-    available: false,
-    high: null,
-    precision: null,
-    source: null,
-    possibleX: thresholdPrice !== null && isFiniteNumber(day1Bar.high) && day1Bar.high >= thresholdPrice,
-    upperBound: isFiniteNumber(day1Bar.high) ? day1Bar.high : null,
-    reason: 'day1_post_entry_evidence_unavailable'
+    highKnown: true,
+    high: postEntryHigh === -Infinity ? null : postEntryHigh,
+    highValueKnown: postEntryHigh !== -Infinity,
+    definitivelyBelowThreshold: true,
+    possibleX: false,
+    precision,
+    source,
+    reason: null
   };
 }
 
@@ -616,11 +644,15 @@ function buildManagementEvidenceBlock({
             : null,
           crossing_precision: partialTrigger.crossing ? partialTrigger.crossing.precision : null,
           crossing_source: partialTrigger.crossing ? partialTrigger.crossing.source : null,
+          crossing_interval_start: partialTrigger.crossing ? partialTrigger.crossing.intervalStartEpoch ?? null : null,
+          crossing_interval_end: partialTrigger.crossing ? partialTrigger.crossing.intervalEndEpoch ?? null : null,
           boundary: partialTrigger.boundary
             ? {
                 kind: partialTrigger.boundary.kind,
                 session: partialTrigger.boundary.sessionDate || null,
                 epoch: partialTrigger.boundary.epoch,
+                interval_start: partialTrigger.boundary.intervalStartEpoch ?? null,
+                interval_end: partialTrigger.boundary.intervalEndEpoch ?? null,
                 precision: partialTrigger.boundary.precision || null,
                 source: partialTrigger.boundary.source || null,
                 ordering_known: partialTrigger.boundary.orderingKnown === true
@@ -763,17 +795,30 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
       prepareInputs.immutable_semantic_context.trailing_activation &&
       prepareInputs.immutable_semantic_context.trailing_activation.session) ||
     null;
+  // An activation boundary is only "established" when it is an actual trading
+  // session at/after the entry and not after the position was fully closed.
+  const activationResolution = establishedActivationSession
+    ? resolveActivationSessionIndex(core.daily, establishedActivationSession)
+    : { valid: false };
+  const closeIndex = core.fillsState && core.fillsState.positionClosed && core.fillsState.lastClosingSessionDate
+    ? (core.daily.indexMap ? core.daily.indexMap.get(core.fillsState.lastClosingSessionDate) : null)
+    : null;
+  const activationSessionValid = activationResolution.valid === true
+    && Number.isInteger(core.daily.entryIndex)
+    && activationResolution.index >= core.daily.entryIndex
+    && !(Number.isInteger(closeIndex) && activationResolution.index > closeIndex);
   const applicability = resolveTrailingApplicability({
     policy,
     partialTrigger,
     partialCompletion: previewCompletion,
     partialExit: previewExit,
     trailingPhase: establishedPhase,
-    activationSessionEstablished: !!establishedActivationSession
+    activationSessionEstablished: activationSessionValid
   });
   const effectiveRequiredInputs = [];
-  if (applicability.smaRequired) effectiveRequiredInputs.push('trailing_ma_period');
+  if (applicability.phaseRequired) effectiveRequiredInputs.push('trailing_phase');
   if (applicability.activationSessionRequired) effectiveRequiredInputs.push('trailing_activation_session');
+  if (applicability.smaRequired) effectiveRequiredInputs.push('trailing_ma_period');
 
   return {
     evaluation: toFrontendEvaluation(evaluation),
@@ -813,8 +858,9 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
           prepareDetected.management.trailing_phase.assertedAt) ||
         null,
       activationSession: establishedActivationSession,
-      activationSessionEstablished: !!establishedActivationSession,
+      activationSessionEstablished: activationSessionValid,
       smaRequired: applicability.smaRequired,
+      phaseRequired: applicability.phaseRequired,
       applicabilityReason: applicability.reason
     },
     trailingApplicability: applicability,
@@ -824,18 +870,19 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
   };
 }
 
-// Maps an asserted activation session date to a daily-bar index: exact session
-// when present, otherwise the first session at/after the date.
+// Resolves an asserted activation session date to a daily-bar index. The date
+// MUST be an actual trading session represented by authoritative daily
+// evidence; a weekend/holiday/absent date is rejected rather than silently
+// shifted to the next session.
 function resolveActivationSessionIndex(daily, date) {
-  if (!date || !daily || !Array.isArray(daily.bars)) return null;
-  if (daily.indexMap && daily.indexMap.has(date)) {
-    const exact = daily.indexMap.get(date);
-    if (Number.isInteger(exact)) return exact;
+  if (!date || !daily || !Array.isArray(daily.bars)) {
+    return { valid: false, index: null, reason: 'activation_session_missing' };
   }
-  for (let i = 0; i < daily.bars.length; i += 1) {
-    if (daily.bars[i] && daily.bars[i].date >= date) return i;
+  const exact = daily.indexMap ? daily.indexMap.get(date) : undefined;
+  if (!Number.isInteger(exact)) {
+    return { valid: false, index: null, reason: 'activation_session_not_a_trading_session' };
   }
-  return null;
+  return { valid: true, index: exact, reason: null };
 }
 
 // Deterministic trailing-phase applicability used by prepare() (and mirrored by
@@ -843,25 +890,26 @@ function resolveActivationSessionIndex(daily, date) {
 // whether an explicit activation boundary is still needed.
 function resolveTrailingApplicability({ policy, partialTrigger, partialCompletion, partialExit, trailingPhase, activationSessionEstablished }) {
   const activation = policy.trailingActivation || null;
-  const result = { activation, smaRequired: false, activationSessionRequired: false, reason: null };
+  const result = { activation, phaseRequired: false, smaRequired: false, activationSessionRequired: false, reason: null };
   if (!activation) return { ...result, reason: 'trailing_not_configured' };
 
   if (activation === 'immediate') {
     return { ...result, smaRequired: true, reason: 'immediate_activation' };
   }
   if (activation === 'explicit') {
+    if (trailingPhase !== 'activated' && trailingPhase !== 'not_activated') {
+      // Explicit activation needs the phase assertion first.
+      return { ...result, phaseRequired: true, reason: 'activation_not_asserted' };
+    }
     if (trailingPhase === 'not_activated') {
       return { ...result, smaRequired: false, reason: 'explicit_not_activated' };
     }
-    if (trailingPhase === 'activated') {
-      return {
-        ...result,
-        smaRequired: true,
-        activationSessionRequired: !activationSessionEstablished,
-        reason: activationSessionEstablished ? 'explicit_activated' : 'explicit_activation_boundary_required'
-      };
-    }
-    return { ...result, smaRequired: true, reason: 'activation_not_asserted' };
+    return {
+      ...result,
+      smaRequired: true,
+      activationSessionRequired: !activationSessionEstablished,
+      reason: activationSessionEstablished ? 'explicit_activated' : 'explicit_activation_boundary_required'
+    };
   }
   // after_partial (canonical): trailing only activates after a completed partial.
   if (partialExit && partialExit.outcome === 'superseded_protective') {
@@ -950,7 +998,9 @@ async function resolveManagementCore({
         observations
       });
       day1.high = day1PostEntry.high;
-      day1.highKnown = day1PostEntry.available === true;
+      day1.highKnown = day1PostEntry.highKnown === true;
+      day1.highValueKnown = day1PostEntry.highValueKnown === true;
+      day1.definitivelyBelowThreshold = day1PostEntry.definitivelyBelowThreshold === true;
       day1.precision = day1PostEntry.precision;
       day1.source = day1PostEntry.source;
       day1.possibleX = day1PostEntry.possibleX === true;
@@ -993,7 +1043,13 @@ async function resolveManagementCore({
               observations
             });
             if (found.crossed) {
-              crossing = { epoch: found.epoch, precision: found.precision, source: intraday.source || found.source };
+              crossing = {
+                epoch: isFiniteNumber(found.crossingEpoch) ? found.crossingEpoch : null,
+                intervalStartEpoch: isFiniteNumber(found.crossingStartEpoch) ? found.crossingStartEpoch : null,
+                intervalEndEpoch: isFiniteNumber(found.crossingEndEpoch) ? found.crossingEndEpoch : null,
+                precision: found.precision,
+                source: intraday.source || found.source
+              };
             }
           }
         } catch (error) {
@@ -1003,18 +1059,22 @@ async function resolveManagementCore({
       if (!crossing) {
         crossing = {
           epoch: null,
+          intervalStartEpoch: null,
+          intervalEndEpoch: null,
           precision: reachDay === 1 ? 'daily_bar' : 'session',
           source: daily.source || 'daily_bar'
         };
       }
-      // The crossing instant also establishes the authoritative boundary when
-      // the first reach is on/after earliest_day. For the early case the
-      // boundary is deterministically the earliest_day regular-session open.
+      // The crossing evidence also establishes the authoritative boundary when
+      // the first reach is on/after earliest_day. A 1-minute bar establishes an
+      // interval, never a fabricated exact instant.
       let boundary = partialTrigger.boundary;
       if (boundary && boundary.kind === 'crossing') {
         boundary = {
           ...boundary,
           epoch: isFiniteNumber(crossing.epoch) ? crossing.epoch : null,
+          intervalStartEpoch: isFiniteNumber(crossing.intervalStartEpoch) ? crossing.intervalStartEpoch : null,
+          intervalEndEpoch: isFiniteNumber(crossing.intervalEndEpoch) ? crossing.intervalEndEpoch : null,
           precision: crossing.precision || 'session',
           source: crossing.source || null,
           orderingKnown: isFiniteNumber(crossing.epoch)
@@ -1051,6 +1111,26 @@ async function resolveManagementCore({
       day = [...dayEvidence].reverse().find((entry) => entry.sessionCompleted) || null;
     }
     if (!day) return null;
+    if (isFiniteNumber(day.sessionCloseEpoch)) {
+      // A completed session in which no trigger occurred has a KNOWN close: the
+      // premature-reduction observation boundary, so reductions during that
+      // session are before the boundary rather than merely "same date unknown".
+      return {
+        mode: 'instant',
+        kind: 'window_end',
+        day: day.day,
+        sessionIndex: day.sessionIndex,
+        sessionDate: day.sessionDate,
+        sessionOpenEpoch: day.sessionOpenEpoch,
+        sessionCloseEpoch: day.sessionCloseEpoch,
+        epoch: day.sessionCloseEpoch,
+        intervalStartEpoch: null,
+        intervalEndEpoch: null,
+        precision: 'session_close',
+        source: 'session_calendar',
+        orderingKnown: true
+      };
+    }
     return {
       mode: 'session',
       kind: 'window_end',
@@ -1060,6 +1140,8 @@ async function resolveManagementCore({
       sessionOpenEpoch: day.sessionOpenEpoch,
       sessionCloseEpoch: day.sessionCloseEpoch,
       epoch: null,
+      intervalStartEpoch: null,
+      intervalEndEpoch: null,
       precision: null,
       source: null,
       orderingKnown: false
@@ -1291,13 +1373,23 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   });
 
   // Explicit activation without an authoritative boundary needs semantic input;
-  // never scan from entry. Likewise an active phase needs its SMA.
-  if (policy.trailingActivation === 'explicit' && trailingPhase === 'activated' && !trailingActivationSession) {
-    throw new ManagementQualityInputError(
-      'trailing_activation_session is required when the trailing phase is asserted activated.',
-      'INPUT_REQUIRED',
-      { field: 'trailing_activation_session' }
-    );
+  // never scan from entry. An invalid asserted boundary is rejected clearly
+  // rather than silently shifted.
+  if (policy.trailingActivation === 'explicit' && trailingPhase === 'activated') {
+    if (!trailingActivationSession) {
+      throw new ManagementQualityInputError(
+        'trailing_activation_session is required when the trailing phase is asserted activated.',
+        'INPUT_REQUIRED',
+        { field: 'trailing_activation_session' }
+      );
+    }
+    if (trailing.active !== true) {
+      throw new ManagementQualityInputError(
+        `trailing_activation_session ${trailingActivationSession} is not a valid authoritative activation boundary (${trailing.inactiveReason || 'unresolved'}).`,
+        'INVALID_ACTIVATION_SESSION',
+        { reason: trailing.inactiveReason || null }
+      );
+    }
   }
   if (trailing.active === true && !trailingPeriod) {
     throw new ManagementQualityInputError(
@@ -1475,15 +1567,27 @@ function resolveTrailingState({
     // An activated explicit phase MUST have an authoritative activation
     // boundary; never fall back to the partial completion or entry.
     const assertedSession = userInputs && userInputs.trailing_activation_session;
-    const activationIndex = resolveActivationSessionIndex(daily, assertedSession);
-    if (!Number.isInteger(activationIndex)) {
+    if (!assertedSession) {
       return { ...base, activationResolved: false, inactiveReason: 'activation_boundary_missing' };
+    }
+    const resolved = resolveActivationSessionIndex(daily, assertedSession);
+    if (!resolved.valid) {
+      return { ...base, activationResolved: false, inactiveReason: resolved.reason };
+    }
+    if (!Number.isInteger(daily.entryIndex) || resolved.index < daily.entryIndex) {
+      return { ...base, activationResolved: false, inactiveReason: 'activation_session_before_entry' };
+    }
+    const closeIndex = fillsState && fillsState.positionClosed && fillsState.lastClosingSessionDate && daily.indexMap
+      ? daily.indexMap.get(fillsState.lastClosingSessionDate)
+      : null;
+    if (Number.isInteger(closeIndex) && resolved.index > closeIndex) {
+      return { ...base, activationResolved: false, inactiveReason: 'activation_session_after_position_closed' };
     }
     base.active = true;
     base.activationResolved = true;
-    base.activationSession = assertedSession || null;
-    base.activationSessionDate = daily.bars[activationIndex] ? daily.bars[activationIndex].date : (assertedSession || null);
-    base.activationSessionIndex = activationIndex;
+    base.activationSession = assertedSession;
+    base.activationSessionDate = daily.bars[resolved.index] ? daily.bars[resolved.index].date : assertedSession;
+    base.activationSessionIndex = resolved.index;
   }
 
   if (!base.active) return base;
@@ -1502,11 +1606,29 @@ function resolveTrailingState({
 
   const positionClosed = !!(fillsState && fillsState.positionClosed);
   const exit = fillsState && fillsState.firstFullClose ? fillsState.firstFullClose : null;
+  // The MA signal exists only at the COMPLETED daily close, so its effective
+  // instant is the regular-session close of the signal session.
+  const signalCloseEpoch = signal ? (regularSessionBounds(signal.date) || {}).closeEpoch : null;
 
   if (positionClosed && exit) {
-    const closedBeforeSignal = !signal || (exit.sessionDate && signal.date && exit.sessionDate < signal.date);
-    if (closedBeforeSignal) {
-      const verdict = classifyExit(fillsState.firstFullClose, stopExecutionClassification);
+    const exitEpoch = isFiniteNumber(exit.timeEpoch) ? exit.timeEpoch : null;
+    let ordering = 'after';
+    if (!signal) {
+      ordering = 'before';
+    } else if (exit.sessionDate && exit.sessionDate < signal.date) {
+      ordering = 'before';
+    } else if (exit.sessionDate && exit.sessionDate === signal.date) {
+      // Same date: an exit before the close is pre-signal; an after-close exit
+      // is not a pre-signal supersession.
+      if (exitEpoch !== null && isFiniteNumber(signalCloseEpoch)) {
+        ordering = exitEpoch < signalCloseEpoch ? 'before' : 'after';
+      } else {
+        ordering = 'unknown';
+      }
+    }
+
+    if (ordering === 'before' || ordering === 'unknown') {
+      const verdict = ordering === 'unknown' ? 'ambiguous' : classifyExit(fillsState.firstFullClose, stopExecutionClassification);
       const outcome =
         verdict === 'protective' ? 'superseded_protective'
           : verdict === 'discretionary' ? 'superseded_discretionary'
@@ -1515,7 +1637,13 @@ function resolveTrailingState({
         ...base,
         signal,
         signalReason: signal ? null : 'no_signal_before_exit',
-        supersession: { outcome, reason: 'exit_before_signal', closeSessionDate: exit.sessionDate || null, closeTimeEpoch: exit.timeEpoch ?? null }
+        supersession: {
+          outcome,
+          reason: ordering === 'unknown' ? 'exit_signal_same_session_ordering_unknown' : 'exit_before_signal',
+          closeSessionDate: exit.sessionDate || null,
+          closeTimeEpoch: exit.timeEpoch ?? null,
+          signalCloseEpoch: isFiniteNumber(signalCloseEpoch) ? signalCloseEpoch : null
+        }
       };
     }
   }

@@ -32,6 +32,14 @@ function boundaryMode(boundary) {
 
 /**
  * Classifies a reduction relative to the trigger boundary.
+ *
+ * The boundary may be:
+ *   - an exact instant (session_open or an execution_print crossing) -> precise
+ *     before/after ordering;
+ *   - a 1-minute bar INTERVAL (1min_bar crossing) -> before the bar is before,
+ *     after the bar is after, inside the bar is UNKNOWN;
+ *   - session granularity -> intra-session ordering is UNKNOWN.
+ *
  * @returns {'before_session'|'same_before'|'same_after'|'same_unknown'|'after_hours'|'after'|'unknown'}
  */
 function relationToBoundary(reduction, boundary) {
@@ -41,27 +49,32 @@ function relationToBoundary(reduction, boundary) {
   if (session > boundary.sessionDate) return 'after';
   const epoch = reduction.timeEpoch;
   const mode = boundaryMode(boundary);
+  const afterHours = isFiniteNumber(boundary.sessionCloseEpoch) && isFiniteNumber(epoch) && epoch >= boundary.sessionCloseEpoch;
+
   if (mode !== 'instant') {
-    // Session-granularity boundary (window expiry / no trigger instant): an
-    // after-hours reduction on the boundary session is still after the regular
-    // session; otherwise the intra-session ordering is unknown, not "after".
-    if (isFiniteNumber(boundary.sessionCloseEpoch) && isFiniteNumber(epoch) && epoch >= boundary.sessionCloseEpoch) {
-      return 'after_hours';
-    }
+    // Session-granularity boundary: an after-hours reduction is after the
+    // regular session; otherwise intra-session ordering is unknown.
+    return afterHours ? 'after_hours' : 'same_unknown';
+  }
+  if (afterHours) return 'after_hours';
+
+  // Exact-instant boundary (session open or execution print).
+  if (boundary.orderingKnown && isFiniteNumber(boundary.epoch) && isFiniteNumber(epoch)) {
+    return epoch < boundary.epoch ? 'same_before' : 'same_after';
+  }
+  // 1-minute bar-interval boundary: only definite before/after the interval is
+  // knowable; a reduction inside the bar is ambiguous.
+  if (
+    isFiniteNumber(boundary.intervalStartEpoch) &&
+    isFiniteNumber(boundary.intervalEndEpoch) &&
+    isFiniteNumber(epoch)
+  ) {
+    if (epoch < boundary.intervalStartEpoch) return 'same_before';
+    if (epoch >= boundary.intervalEndEpoch) return 'same_after';
     return 'same_unknown';
   }
-  if (!boundary.orderingKnown || !isFiniteNumber(boundary.epoch) || !isFiniteNumber(epoch)) {
-    // A reduction on the boundary session whose intra-session ordering cannot
-    // be proven is not "after" and is not definitively premature.
-    if (isFiniteNumber(boundary.sessionCloseEpoch) && isFiniteNumber(epoch) && epoch >= boundary.sessionCloseEpoch) {
-      return 'after_hours';
-    }
-    return 'same_unknown';
-  }
-  if (isFiniteNumber(boundary.sessionCloseEpoch) && epoch >= boundary.sessionCloseEpoch) {
-    return 'after_hours';
-  }
-  return epoch < boundary.epoch ? 'same_before' : 'same_after';
+  // Session-level crossing with no intraday evidence: unknown ordering.
+  return 'same_unknown';
 }
 
 function resolvePartialCompletion({
@@ -219,6 +232,10 @@ function resolvePrematureReduction({
 }) {
   const boundarySessionDate = boundary ? boundary.sessionDate || null : null;
   if (!isFiniteNumber(originalPositionQty) || originalPositionQty <= 0) {
+    return { outcome: 'not_evaluated', prematureQty: null, prematureFraction: null, excludedQty: 0, ambiguousQty: 0, boundarySessionDate };
+  }
+  if (!boundary || !boundary.sessionDate) {
+    // No observed temporal boundary: never fabricate PASS/FAIL.
     return { outcome: 'not_evaluated', prematureQty: null, prematureFraction: null, excludedQty: 0, ambiguousQty: 0, boundarySessionDate };
   }
 

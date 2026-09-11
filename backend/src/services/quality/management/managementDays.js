@@ -65,6 +65,8 @@ function buildDayEvidence({ bars, entryIndex, latestDay, isSessionCompleted, ses
       sessionCloseEpoch: bounds && isFiniteNumber(bounds.closeEpoch) ? bounds.closeEpoch : null,
       high: isFiniteNumber(bar.high) ? bar.high : null,
       highKnown: isFiniteNumber(bar.high),
+      highValueKnown: isFiniteNumber(bar.high),
+      definitivelyBelowThreshold: false,
       source: 'daily_bar',
       precision: 'daily_bar',
       sessionCompleted: completed,
@@ -75,15 +77,21 @@ function buildDayEvidence({ bars, entryIndex, latestDay, isSessionCompleted, ses
   return days;
 }
 
-function buildBoundary(day, { kind, epoch, precision, source, orderingKnown }) {
+function buildBoundary(day, { kind, epoch, precision, source, orderingKnown, intervalStartEpoch, intervalEndEpoch }) {
   return {
     kind,
+    // Instant boundaries (session open / crossing) order by epoch or interval;
+    // window-end boundaries fall back to session granularity.
+    mode: kind === 'session_open' || kind === 'crossing' ? 'instant' : 'session',
     day: day ? day.day : null,
     sessionIndex: day ? day.sessionIndex : null,
     sessionDate: day ? day.sessionDate : null,
     sessionOpenEpoch: day ? day.sessionOpenEpoch : null,
     sessionCloseEpoch: day ? day.sessionCloseEpoch : null,
     epoch: isFiniteNumber(epoch) ? epoch : null,
+    // A 1-minute crossing is an INTERVAL, never a fabricated exact instant.
+    intervalStartEpoch: isFiniteNumber(intervalStartEpoch) ? intervalStartEpoch : null,
+    intervalEndEpoch: isFiniteNumber(intervalEndEpoch) ? intervalEndEpoch : null,
     precision: precision || null,
     source: source || null,
     orderingKnown: orderingKnown === true
@@ -146,6 +154,8 @@ function resolvePartialTrigger({ dayEvidence, entryBasis, rPerShare, parameters 
       sessionDate: day.sessionDate,
       high: day.high,
       highKnown: day.highKnown === true,
+      highValueKnown: isFiniteNumber(day.high) || day.highValueKnown === true,
+      definitivelyBelowThreshold: day.definitivelyBelowThreshold === true,
       source: day.source || null,
       precision: day.precision || null,
       mfeR
@@ -165,7 +175,9 @@ function resolvePartialTrigger({ dayEvidence, entryBasis, rPerShare, parameters 
 
   const day1 = scoped.find((day) => day.day === 1);
   const day1Uncertain = !!day1 && day1.highKnown !== true && day1.possibleX === true;
-  const anyUnknownHigh = scoped.some((day) => day.highKnown !== true && day.possibleX !== true);
+  const anyUnknownHigh = scoped.some(
+    (day) => day.highKnown !== true && day.possibleX !== true && day.definitivelyBelowThreshold !== true
+  );
 
   if (firstReachDay !== null) {
     const firstDay = scoped.find((day) => day.day === firstReachDay);
@@ -236,7 +248,8 @@ function findCrossingInSession({
   entryEpoch,
   sessionOpenEpoch,
   sessionCloseEpoch,
-  observations = []
+  observations = [],
+  barResolutionSeconds = 60
 }) {
   let highest = isFiniteNumber(priorHighest) ? priorHighest : -Infinity;
   const scoped = (bars || [])
@@ -253,30 +266,60 @@ function findCrossingInSession({
     .filter((o) => !isFiniteNumber(entryEpoch) || o.epoch >= entryEpoch)
     .sort((a, b) => a.epoch - b.epoch);
 
+  const printCrossing = (observation) => ({
+    crossed: true,
+    crossingEpoch: observation.epoch,
+    crossingStartEpoch: null,
+    crossingEndEpoch: null,
+    price: observation.price,
+    precision: 'execution_print',
+    source: 'executions_jsonb',
+    reason: null
+  });
+
   let obsIndex = 0;
   for (const bar of scoped) {
     while (obsIndex < obs.length && obs[obsIndex].epoch <= bar.time) {
       highest = Math.max(highest, obs[obsIndex].price);
-      if (highest >= thresholdPrice) {
-        return { crossed: true, epoch: obs[obsIndex].epoch, price: obs[obsIndex].price, precision: 'execution_print', source: 'executions_jsonb', reason: null };
-      }
+      if (highest >= thresholdPrice) return printCrossing(obs[obsIndex]);
       obsIndex += 1;
     }
     if (isFiniteNumber(bar.high)) {
       highest = Math.max(highest, bar.high);
       if (highest >= thresholdPrice) {
-        return { crossed: true, epoch: bar.time, price: bar.high, precision: '1min_bar', source: 'intraday_cache', reason: null };
+        // A 1-minute bar proves the crossing occurred somewhere inside the bar
+        // interval; it does NOT establish an exact sub-minute instant.
+        const resolution = isFiniteNumber(barResolutionSeconds) && barResolutionSeconds > 0
+          ? barResolutionSeconds
+          : 60;
+        return {
+          crossed: true,
+          crossingEpoch: null,
+          crossingStartEpoch: bar.time,
+          crossingEndEpoch: bar.time + resolution,
+          price: bar.high,
+          precision: '1min_bar',
+          source: 'intraday_cache',
+          reason: null
+        };
       }
     }
   }
   while (obsIndex < obs.length) {
     highest = Math.max(highest, obs[obsIndex].price);
-    if (highest >= thresholdPrice) {
-      return { crossed: true, epoch: obs[obsIndex].epoch, price: obs[obsIndex].price, precision: 'execution_print', source: 'executions_jsonb', reason: null };
-    }
+    if (highest >= thresholdPrice) return printCrossing(obs[obsIndex]);
     obsIndex += 1;
   }
-  return { crossed: false, epoch: null, price: null, precision: null, source: null, reason: null };
+  return {
+    crossed: false,
+    crossingEpoch: null,
+    crossingStartEpoch: null,
+    crossingEndEpoch: null,
+    price: null,
+    precision: null,
+    source: null,
+    reason: null
+  };
 }
 
 module.exports = {

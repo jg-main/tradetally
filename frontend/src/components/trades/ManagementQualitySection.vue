@@ -366,6 +366,9 @@ const phaseNotActivated = computed(() => trailingPhase.value === 'not_activated'
 // never-triggered partial needs no SMA), falling back to the config-level
 // requirement for older payloads.
 const smaRequired = computed(() => {
+  // For explicit activation the requirement follows the local phase assertion
+  // (the prepared payload was computed before the user asserted the phase).
+  if (requiresActivationAssertion.value) return trailingPhase.value === 'activated'
   const prep = prepared.value && prepared.value.trailingMa
   if (prep && typeof prep.smaRequired === 'boolean') return prep.smaRequired
   if (prepared.value && Array.isArray(prepared.value.requiredManagementUserInputs)) {

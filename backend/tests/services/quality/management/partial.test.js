@@ -306,3 +306,121 @@ describe('relationToBoundary', () => {
     expect(relationToBoundary({ sessionDate: '2026-03-12', timeEpoch: 1_030_000 }, sessionBoundary)).toBe('after_hours');
   });
 });
+
+describe('relationToBoundary — 1-minute crossing is an interval (F1)', () => {
+  // 11:17 bar: [1_010_000, 1_010_060)
+  function barBoundary() {
+    return {
+      mode: 'instant',
+      kind: 'crossing',
+      sessionDate: '2026-03-12',
+      epoch: null,
+      intervalStartEpoch: 1_010_000,
+      intervalEndEpoch: 1_010_060,
+      orderingKnown: false,
+      precision: '1min_bar',
+      source: 'intraday_cache',
+      sessionOpenEpoch: 1_000_000,
+      sessionCloseEpoch: 1_023_400
+    };
+  }
+
+  it('a reduction inside the crossing bar is UNKNOWN ordering', () => {
+    // 11:17:10 is inside the 11:17:00-11:17:59 bar.
+    expect(relationToBoundary({ sessionDate: '2026-03-12', timeEpoch: 1_010_010 }, barBoundary())).toBe('same_unknown');
+  });
+
+  it('a reduction before the crossing-bar open is before the trigger', () => {
+    expect(relationToBoundary({ sessionDate: '2026-03-12', timeEpoch: 1_009_000 }, barBoundary())).toBe('same_before');
+  });
+
+  it('a reduction at/after the crossing-bar close is after the trigger', () => {
+    expect(relationToBoundary({ sessionDate: '2026-03-12', timeEpoch: 1_010_060 }, barBoundary())).toBe('same_after');
+  });
+
+  it('an exact trustworthy execution print establishes exact ordering', () => {
+    const printBoundary = { ...barBoundary(), epoch: 1_010_005, intervalStartEpoch: null, intervalEndEpoch: null, orderingKnown: true, precision: 'execution_print' };
+    expect(relationToBoundary({ sessionDate: '2026-03-12', timeEpoch: 1_010_004 }, printBoundary)).toBe('same_before');
+    expect(relationToBoundary({ sessionDate: '2026-03-12', timeEpoch: 1_010_006 }, printBoundary)).toBe('same_after');
+  });
+
+  it('a partial completion inside the crossing bar is unknown ordering, not on-time', () => {
+    const result = completion(
+      [{ timeEpoch: 1_010_010, quantity: 100, sessionDate: '2026-03-12', cumulativeQty: 100 }],
+      { boundary: barBoundary() }
+    );
+    expect(result.completionRelation).toBe('same_unknown');
+    expect(result.timingOutcome).toBe('unknown_ordering');
+  });
+});
+
+describe('no-trigger / observed-horizon boundary is the completed session close (F2)', () => {
+  // The orchestrator builds this for never_reached / the last completed session.
+  function windowEndBoundary(epoch = 1_023_400) {
+    return {
+      mode: 'instant',
+      kind: 'window_end',
+      sessionDate: '2026-03-12',
+      epoch,
+      intervalStartEpoch: null,
+      intervalEndEpoch: null,
+      orderingKnown: true,
+      precision: 'session_close',
+      source: 'session_calendar',
+      sessionOpenEpoch: 1_000_000,
+      sessionCloseEpoch: 1_023_400
+    };
+  }
+
+  it('no +1R through Day 5 + discretionary Day-5 15:00 reduction => premature FAIL', () => {
+    const result = resolvePrematureReduction({
+      reductions: [{ timeEpoch: 1_020_000, quantity: 40, sessionDate: '2026-03-12', cumulativeQty: 40 }],
+      originalPositionQty: 200,
+      boundary: windowEndBoundary(),
+      stopExecutionClassification: { available: true, complete: true, byEpoch: { 1_020_000: 'discretionary' } }
+    });
+    expect(result.outcome).toBe('discretionary');
+    expect(result.prematureFraction).toBeCloseTo(0.2);
+  });
+
+  it('the same protective reduction is excluded', () => {
+    const result = resolvePrematureReduction({
+      reductions: [{ timeEpoch: 1_020_000, quantity: 40, sessionDate: '2026-03-12', cumulativeQty: 40 }],
+      originalPositionQty: 200,
+      boundary: windowEndBoundary(),
+      stopExecutionClassification: { available: true, complete: true, byEpoch: { 1_020_000: 'protective' } }
+    });
+    expect(result.outcome).toBe('none');
+    expect(result.excludedQty).toBe(40);
+  });
+
+  it('a Day-5 after-hours reduction is outside the canonical pre-expiry interval', () => {
+    const result = resolvePrematureReduction({
+      reductions: [{ timeEpoch: 1_030_000, quantity: 40, sessionDate: '2026-03-12', cumulativeQty: 40 }],
+      originalPositionQty: 200,
+      boundary: windowEndBoundary(),
+      stopExecutionClassification: { available: true, complete: true, byEpoch: { 1_030_000: 'discretionary' } }
+    });
+    expect(result.outcome).toBe('none');
+  });
+
+  it('a reduction during the last completed (pending) session is definitively pre-trigger', () => {
+    // Pending through completed Day 2: boundary is Day-2 close.
+    const result = resolvePrematureReduction({
+      reductions: [{ timeEpoch: 1_015_000, quantity: 40, sessionDate: '2026-03-12', cumulativeQty: 40 }],
+      originalPositionQty: 200,
+      boundary: windowEndBoundary(1_016_000),
+      stopExecutionClassification: { available: true, complete: true, byEpoch: { 1_015_000: 'discretionary' } }
+    });
+    expect(result.outcome).toBe('discretionary');
+  });
+
+  it('never fabricates PASS/FAIL without a boundary', () => {
+    const result = resolvePrematureReduction({
+      reductions: [{ timeEpoch: 1_015_000, quantity: 40, sessionDate: '2026-03-12', cumulativeQty: 40 }],
+      originalPositionQty: 200,
+      boundary: null
+    });
+    expect(result.outcome).toBe('not_evaluated');
+  });
+});
