@@ -15,6 +15,7 @@ const profileService = require('../../src/services/quality/profileService');
 const historyService = require('../../src/services/quality/historyService');
 const comparisonService = require('../../src/services/quality/comparisonService');
 const evaluationService = require('../../src/services/quality/evaluationService');
+const setupQualityService = require('../../src/services/quality/setupQualityService');
 
 function binary(pass, fail) {
   return { type: 'binary', pass_score: pass, fail_score: fail };
@@ -78,8 +79,8 @@ async function createFixture(v1SetupCriteria) {
   const userId = user.rows[0].id;
 
   const trade = await db.query(
-    `INSERT INTO trades (user_id, symbol, side, quantity, entry_price, trade_date, instrument_type)
-     VALUES ($1, 'TEST', 'long', 100, 100, '2026-03-10', 'stock') RETURNING id`,
+    `INSERT INTO trades (user_id, symbol, side, quantity, entry_price, entry_time, trade_date, instrument_type)
+     VALUES ($1, 'TEST', 'long', 100, 100, '2026-03-10T14:30:00Z', '2026-03-10', 'stock') RETURNING id`,
     [userId]
   );
   const tradeId = trade.rows[0].id;
@@ -258,6 +259,82 @@ describe('Phase 5 — historical re-evaluation (real PostgreSQL)', () => {
     expect(evaluationC.id).not.toBe(evaluationB.id);
   });
 
+  test('an explicit re-evaluation always creates a fresh row and never resumes an abandoned draft', async () => {
+    const v1 = await profileService.getCurrentVersion(fixture.profileId, fixture.userId);
+    const v2 = await createVersion(fixture);
+
+    // Manual draft for v2 (D1): an abandoned, non-empty draft.
+    const d1 = await historyService.startEvaluation(fixture.userId, fixture.tradeId, v2.id);
+    await db.query(
+      `UPDATE trade_quality_evaluations
+         SET user_inputs = $2, detected_context = $3, evidence_snapshot = $4
+       WHERE id = $1`,
+      [d1.id, JSON.stringify({ leader_confirmed: true }), JSON.stringify({ abandoned: true }), JSON.stringify({ bar: 1 })]
+    );
+    const d1Before = await readEvaluation(d1.id);
+
+    // Explicit "Evaluate with v2" MUST create D2 even though D1 is open.
+    const d2 = await historyService.startEvaluation(fixture.userId, fixture.tradeId, v2.id);
+    expect(d2.id).not.toBe(d1.id);
+    expect(d2.profile_version_id).toBe(v2.id);
+    expect(d2.status).toBe('draft');
+
+    const d2Row = await readEvaluation(d2.id);
+    expect(d2Row.results).toBeNull();
+    expect(d2Row.evidence_snapshot).toBeNull();
+    expect(d2Row.user_inputs).toBeNull();
+    expect(d2Row.detected_context).toBeNull();
+
+    // A third explicit call creates D3, distinct from D1 and D2.
+    const d3 = await historyService.startEvaluation(fixture.userId, fixture.tradeId, v2.id);
+    expect(d3.id).not.toBe(d1.id);
+    expect(d3.id).not.toBe(d2.id);
+
+    // The abandoned draft is untouched.
+    const d1After = await readEvaluation(d1.id);
+    expect(d1After.status).toBe('draft');
+    expect(d1After.user_inputs).toEqual(d1Before.user_inputs);
+    expect(d1After.detected_context).toEqual(d1Before.detected_context);
+    expect(d1After.evidence_snapshot).toEqual(d1Before.evidence_snapshot);
+  });
+
+  test('terminal-pinned prepare creates a fresh v2 draft and never attaches to an abandoned v2 draft', async () => {
+    const v2 = await createVersion(fixture);
+    const terminalV2 = await insertTerminalEvaluation({
+      ...fixture,
+      versionId: v2.id,
+      results: {
+        setup: dimensionSummary(90, 'A', 'PASS', 100),
+        entry: dimensionSummary(90, 'A', 'PASS', 100),
+        management: dimensionSummary(90, 'A', 'PASS', 100)
+      },
+      evaluatedAt: '2026-09-04T10:00:00Z'
+    });
+    const abandoned = await historyService.startEvaluation(fixture.userId, fixture.tradeId, v2.id);
+
+    // Profile advances to v3: prepare must NOT resolve the current version.
+    await createVersion(fixture);
+
+    const payload = await setupQualityService.prepare(fixture.userId, fixture.tradeId, {
+      evaluationId: terminalV2
+    });
+
+    expect(payload.profileVersion.id).toBe(v2.id);
+    expect(payload.evaluation.profile_version_id).toBe(v2.id);
+    expect(payload.evaluation.id).not.toBe(terminalV2);
+    expect(payload.evaluation.id).not.toBe(abandoned.id);
+    expect(payload.evaluation.status).toBe('draft');
+
+    // The abandoned draft and the terminal row are both untouched.
+    const abandonedAfter = await readEvaluation(abandoned.id);
+    expect(abandonedAfter.status).toBe('draft');
+    expect(abandonedAfter.profile_version_id).toBe(v2.id);
+    const terminalAfter = await readEvaluation(terminalV2);
+    expect(terminalAfter.status).toBe('completed');
+    expect(terminalAfter.profile_version_id).toBe(v2.id);
+    expect(terminalAfter.results.setup.score).toBe(90);
+  });
+
   test('rejects an unauthorized profile version for the trade owner', async () => {
     const otherUser = await db.query(
       `INSERT INTO users (email, username, password_hash, is_verified, is_active, admin_approved, role)
@@ -380,6 +457,38 @@ describe('Phase 5 — primary selection (real PostgreSQL)', () => {
     const after = await readEvaluation(evalA);
     expect(after.results).toEqual(before.results);
     expect(after.profile_version_id).toBe(before.profile_version_id);
+  });
+
+  test('re-selecting the same primary preserves selected_at; switching advances it', async () => {
+    const v1 = await profileService.getCurrentVersion(fixture.profileId, fixture.userId);
+    const v2 = await createVersion(fixture);
+    const mk = (score) => ({ setup: dimensionSummary(score, 'A', 'PASS', 100), entry: null, management: null });
+    const evalA = await insertTerminalEvaluation({ ...fixture, versionId: v1.id, results: mk(90), evaluatedAt: '2026-09-03T10:00:00Z' });
+    const evalB = await insertTerminalEvaluation({ ...fixture, versionId: v2.id, results: mk(80), evaluatedAt: '2026-09-04T10:00:00Z' });
+
+    const readSelectedAt = async () => {
+      const result = await db.query(
+        'SELECT evaluation_id, selected_at FROM trade_quality_primary_evaluations WHERE trade_id = $1',
+        [fixture.tradeId]
+      );
+      return result.rows[0];
+    };
+
+    const first = await historyService.selectPrimary(fixture.userId, fixture.tradeId, evalA);
+    const t1 = (await readSelectedAt()).selected_at;
+    expect(new Date(first.selected_at).toISOString()).toBe(new Date(t1).toISOString());
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await historyService.selectPrimary(fixture.userId, fixture.tradeId, evalA);
+    const sameRow = await readSelectedAt();
+    expect(sameRow.evaluation_id).toBe(evalA);
+    expect(new Date(sameRow.selected_at).toISOString()).toBe(new Date(t1).toISOString());
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await historyService.selectPrimary(fixture.userId, fixture.tradeId, evalB);
+    const switched = await readSelectedAt();
+    expect(switched.evaluation_id).toBe(evalB);
+    expect(new Date(switched.selected_at).getTime()).toBeGreaterThan(new Date(t1).getTime());
   });
 
   test('rejects a draft, a foreign trade, and a foreign user', async () => {

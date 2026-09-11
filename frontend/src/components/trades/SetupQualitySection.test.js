@@ -1,9 +1,16 @@
 import { mount, flushPromises } from '@vue/test-utils'
 import { reactive } from 'vue'
+import { createPinia, setActivePinia } from 'pinia'
 import { describe, expect, it, beforeEach, vi } from 'vitest'
 import SetupQualitySection from './SetupQualitySection.vue'
+import { useQualityWorkflowStore } from '@/stores/qualityWorkflow'
 
 let mockStoreInstance
+
+// The section also reads the shared active-evaluation workflow store.
+beforeEach(() => {
+  setActivePinia(createPinia())
+})
 
 vi.mock('@/stores/qualitySetup', () => ({
   useQualitySetupStore: () => mockStoreInstance
@@ -319,6 +326,27 @@ describe('SetupQualitySection', () => {
     })
     expect(wrapper.text()).toContain('103.5')
     expect(wrapper.get('[data-testid="confirm-pivot"]').exists()).toBe(true)
+  })
+
+  it('prefers the explicitly active workflow evaluation over the discovered draft', async () => {
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([
+      { id: 'latest-1', status: 'draft', results: {} }
+    ])
+    mockStoreInstance.prepare.mockResolvedValue({
+      evaluation: { id: 'active-99', status: 'draft', results: {} }
+    })
+    const workflow = useQualityWorkflowStore()
+    workflow.activate({ id: 'active-99', trade_id: 'trade-1', status: 'draft' })
+
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-setup"]').trigger('click')
+    await flushPromises()
+
+    expect(mockStoreInstance.prepare).toHaveBeenCalledWith(
+      'trade-1',
+      expect.objectContaining({ evaluationId: 'active-99' })
+    )
   })
 })
 

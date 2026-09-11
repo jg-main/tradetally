@@ -957,10 +957,15 @@ async function prepare(userId, tradeId, { profileId, confirmedBaseStart, evaluat
     const loadedPinnedVersionId = pinnedEvaluation.profile_version_id;
     if (TERMINAL_STATUSES.includes(pinnedEvaluation.status)) {
       // The pinned evaluation is an immutable terminal snapshot. Never mutate
-      // it (spec sections 6/10): fall through to a FRESH draft of the SAME
-      // pinned version instead of erroring, so a re-detect after finalize
-      // starts a new evaluation rather than rewriting history.
-      pinnedEvaluation = null;
+      // it, and never attach preparation to some unrelated still-open draft for
+      // the same version: create a genuinely FRESH draft for the SAME immutable
+      // version and pin preparation to that exact new row (Phase 5 hardening).
+      const historyService = require('./historyService');
+      pinnedEvaluation = await historyService.startEvaluation(
+        userId,
+        tradeId,
+        loadedPinnedVersionId
+      );
     }
     version = await profileService.findVersionById(loadedPinnedVersionId, userId);
     if (!version) {

@@ -124,6 +124,38 @@ describe('QualityComparisonPanel', () => {
     expect(wrapper.find('[data-testid="criterion-config-changed"]').exists()).toBe(true)
   })
 
+  it('never labels a disabled-on-both criterion as removed/added', () => {
+    const comparison = buildComparison()
+    comparison.dimensions.setup.criteria = [
+      {
+        key: 'base_duration',
+        presence: 'none',
+        status: { left: null, right: null },
+        score: { left: null, right: null, delta: null },
+        enabled: { left: false, right: false },
+        configuration_changed: false
+      },
+      {
+        key: 'prior_move',
+        presence: 'only_left',
+        status: { left: 'FAIL', right: null },
+        score: { left: 60, right: null, delta: null },
+        configuration_changed: null
+      }
+    ]
+    const wrapper = mount(QualityComparisonPanel, { props: { comparison } })
+
+    const rows = wrapper.findAll('[data-testid="comparison-criterion"]')
+    const dormant = rows.find((row) => row.text().includes('Base Duration'))
+    const dormantBadge = dormant.find('[data-testid="criterion-presence"]')
+    expect(dormantBadge.text()).toBe('disabled (both)')
+    expect(dormantBadge.text()).not.toBe('removed')
+    expect(dormant.find('[data-testid="criterion-delta"]').text()).toContain('disabled (both versions)')
+
+    const removed = rows.find((row) => row.text().includes('Prior Move'))
+    expect(removed.find('[data-testid="criterion-presence"]').text()).toBe('removed')
+  })
+
   it('emits close', async () => {
     const wrapper = mount(QualityComparisonPanel, { props: { comparison: buildComparison() } })
     await wrapper.get('[data-testid="close-comparison"]').trigger('click')

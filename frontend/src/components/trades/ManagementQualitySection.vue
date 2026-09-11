@@ -254,12 +254,14 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import { useQualityManagementStore } from '@/stores/qualityManagement'
+import { useQualityWorkflowStore } from '@/stores/qualityWorkflow'
 
 const props = defineProps({
   trade: { type: Object, required: true }
 })
 
 const store = useQualityManagementStore()
+const workflow = useQualityWorkflowStore()
 
 const prepared = ref(null)
 const evaluation = ref(null)
@@ -277,8 +279,20 @@ const CRITERION_LABELS = {
 }
 
 watch(() => store.evaluation, (value) => {
+  // An explicitly selected active evaluation must not be overridden by the
+  // store's independent "latest draft" discovery.
+  if (workflow.activeEvaluationId && value && value.id !== workflow.activeEvaluationId) return
   evaluation.value = value
   hydrateFromEvaluation(value)
+})
+
+// Follow the active workflow row (started by History or progressed by
+// Setup/Entry) so Management always operates on the SAME evaluation.
+watch(() => workflow.activeEvaluation, (value) => {
+  if (value && value.id === workflow.activeEvaluationId) {
+    evaluation.value = value
+    hydrateFromEvaluation(value)
+  }
 })
 
 watch(() => store.prepared, (value) => {
@@ -495,11 +509,12 @@ function hydrateFromPrepared(value) {
 }
 
 async function runPrepare() {
-  const evaluationId = evaluation.value && evaluation.value.id
+  const evaluationId = workflow.activeEvaluationId || (evaluation.value && evaluation.value.id)
   try {
     const payload = await store.prepare(props.trade.id, { evaluationId })
     prepared.value = payload
     evaluation.value = payload.evaluation || evaluation.value
+    if (payload.evaluation) workflow.updateActive(payload.evaluation)
   } catch (err) {
     // store.error is already surfaced
   }
@@ -507,7 +522,8 @@ async function runPrepare() {
 
 async function runEvaluate() {
   if (!canEvaluate.value) return
-  const evaluationId = (prepared.value && prepared.value.evaluation && prepared.value.evaluation.id)
+  const evaluationId = workflow.activeEvaluationId
+    || (prepared.value && prepared.value.evaluation && prepared.value.evaluation.id)
     || (evaluation.value && evaluation.value.id)
   if (!evaluationId) {
     store.error = 'Prepare Management first.'
@@ -525,17 +541,21 @@ async function runEvaluate() {
     const payload = await store.evaluate(props.trade.id, { evaluationId, userInputs })
     evaluation.value = payload.evaluation
     prepared.value = { ...(prepared.value || {}), evaluation: payload.evaluation }
+    if (payload.evaluation) workflow.updateActive(payload.evaluation)
   } catch (err) {
     // store.error is already surfaced
   }
 }
 
 async function runFinalize() {
-  const evaluationId = evaluation.value && evaluation.value.id
+  const evaluationId = workflow.activeEvaluationId || (evaluation.value && evaluation.value.id)
   if (!evaluationId) return
   try {
     const payload = await store.finalize(props.trade.id, { evaluationId })
     evaluation.value = payload.evaluation
+    // Publishing the terminal row updates History from draft to terminal
+    // without a page reload, and never changes the primary.
+    if (payload.evaluation) workflow.updateActive(payload.evaluation)
   } catch (err) {
     // store.error is already surfaced
   }
@@ -543,11 +563,20 @@ async function runFinalize() {
 
 onMounted(async () => {
   try {
+    workflow.ensureTrade(props.trade.id)
     const list = await store.fetchEvaluations(props.trade.id)
-    const latestDraft = Array.isArray(list)
-      ? list.find((item) => item.status !== 'completed' && item.status !== 'insufficient_data')
-      : null
-    evaluation.value = store.evaluation || latestDraft || null
+    if (
+      workflow.activeEvaluationId &&
+      workflow.activeEvaluation &&
+      workflow.activeEvaluation.id === workflow.activeEvaluationId
+    ) {
+      evaluation.value = workflow.activeEvaluation
+    } else {
+      const latestDraft = Array.isArray(list)
+        ? list.find((item) => item.status !== 'completed' && item.status !== 'insufficient_data')
+        : null
+      evaluation.value = store.evaluation || latestDraft || null
+    }
     hydrateFromEvaluation(evaluation.value)
   } catch (err) {
     // The panel shows the Entry gate/CTA instead.

@@ -154,6 +154,87 @@ describe('comparisonService criterion alignment', () => {
   });
 });
 
+describe('comparisonService criterion presence semantics (Phase 5 hardening)', () => {
+  test('enabled on the left, disabled on the right is only_left (removed on the right)', () => {
+    const comparison = comparisonService.buildDimensionComparison(
+      'setup',
+      { results: { setup: dimResult([row('leader', 'PASS', 100)]) } },
+      { results: { setup: dimResult([]) } },
+      maps([{ key: 'leader', enabled: true, required: true, weight: 100, scoring: { type: 'binary' } }]),
+      maps([{ key: 'leader', enabled: false, required: true, weight: 100, scoring: { type: 'binary' } }])
+    );
+    const leader = comparison.criteria.find((criterion) => criterion.key === 'leader');
+    expect(leader.presence).toBe('only_left');
+  });
+
+  test('disabled on the left, enabled on the right is only_right (added on the right)', () => {
+    const comparison = comparisonService.buildDimensionComparison(
+      'setup',
+      { results: { setup: dimResult([]) } },
+      { results: { setup: dimResult([row('leader', 'PASS', 100)]) } },
+      maps([{ key: 'leader', enabled: false, required: true, weight: 100, scoring: { type: 'binary' } }]),
+      maps([{ key: 'leader', enabled: true, required: true, weight: 100, scoring: { type: 'binary' } }])
+    );
+    const leader = comparison.criteria.find((criterion) => criterion.key === 'leader');
+    expect(leader.presence).toBe('only_right');
+  });
+
+  test('disabled on BOTH versions is presence none, never removed/added', () => {
+    const comparison = comparisonService.buildDimensionComparison(
+      'setup',
+      { results: { setup: dimResult([]) } },
+      { results: { setup: dimResult([]) } },
+      maps([{ key: 'leader', enabled: false, required: true, weight: 100, scoring: { type: 'binary' } }]),
+      maps([{ key: 'leader', enabled: false, required: true, weight: 100, scoring: { type: 'binary' } }])
+    );
+    const leader = comparison.criteria.find((criterion) => criterion.key === 'leader');
+    expect(leader.presence).toBe('none');
+    expect(leader.presence).not.toBe('only_left');
+    expect(leader.presence).not.toBe('only_right');
+    expect(leader.enabled).toEqual({ left: false, right: false });
+  });
+
+  test('absent is distinct from NOT_APPLICABLE', () => {
+    const comparison = comparisonService.buildDimensionComparison(
+      'setup',
+      { results: { setup: dimResult([row('leader', 'NOT_APPLICABLE', null)]) } },
+      { results: { setup: dimResult([row('base_duration', 'PASS', 100)]) } },
+      maps([{ key: 'leader', enabled: true, required: true, weight: 100, scoring: { type: 'binary' } }]),
+      maps([{ key: 'base_duration', enabled: true, required: true, weight: 100, scoring: { type: 'binary' } }])
+    );
+    const leader = comparison.criteria.find((criterion) => criterion.key === 'leader');
+    expect(leader.status.left).toBe('NOT_APPLICABLE');
+    expect(leader.status.right).toBeNull();
+    expect(leader.presence).toBe('only_left');
+  });
+
+  test('missing_data_behavior is part of configuration comparison', () => {
+    const left = { key: 'partial_timing', enabled: true, required: true, weight: 20, scoring: { type: 'binary' }, missing_data_behavior: 'unknown' };
+    const right = { key: 'partial_timing', enabled: true, required: true, weight: 20, scoring: { type: 'binary' }, missing_data_behavior: 'not_applicable' };
+
+    expect(comparisonService.sameCriterionConfig(left, right)).toBe(false);
+
+    const comparison = comparisonService.buildDimensionComparison(
+      'management',
+      { results: { management: dimResult([row('partial_timing', 'UNKNOWN', null)]) } },
+      { results: { management: dimResult([row('partial_timing', 'NOT_APPLICABLE', null)]) } },
+      { setup: new Map(), entry: new Map(), management: configMap([left]) },
+      { setup: new Map(), entry: new Map(), management: configMap([right]) }
+    );
+    const criterion = comparison.criteria.find((entry) => entry.key === 'partial_timing');
+    expect(criterion.configuration_changed).toBe(true);
+    expect(criterion.configuration.left.missing_data_behavior).toBe('unknown');
+    expect(criterion.configuration.right.missing_data_behavior).toBe('not_applicable');
+  });
+
+  test('an omitted missing_data_behavior equals the documented default unknown', () => {
+    const omitted = { key: 'leader', enabled: true, required: true, weight: 100, scoring: { type: 'binary' } };
+    const explicit = { key: 'leader', enabled: true, required: true, weight: 100, scoring: { type: 'binary' }, missing_data_behavior: 'unknown' };
+    expect(comparisonService.sameCriterionConfig(omitted, explicit)).toBe(true);
+    expect(comparisonService.criterionConfigurationView(omitted).missing_data_behavior).toBe('unknown');
+  });
+});
+
 describe('comparisonService.compareEvaluations', () => {
   test('rejects when either id is missing', async () => {
     await expect(comparisonService.compareEvaluations('user-1', 'trade-1', null, 'b')).rejects.toMatchObject({

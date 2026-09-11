@@ -54,13 +54,30 @@ function stableStringify(value) {
   return `{${keys.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
 }
 
+// The complete generic criterion configuration envelope
+// (docs/QUALITY_PROFILES_REQUIREMENT.md section 56):
+//   enabled | required | weight | parameters | scoring | missing_data_behavior
+// `key` is the alignment identity, not compared. `missing_data_behavior`
+// materially changes UNKNOWN vs NOT_APPLICABLE (and therefore coverage and
+// compliance), so it must participate in configuration comparison.
+//
+// `missing_data_behavior` defaults to the documented generic default
+// ('unknown') when omitted, so an omitted value and an explicit 'unknown' are
+// treated as the same configuration (value-based stable comparison).
+function normalizedMissingDataBehavior(config) {
+  return config && config.missing_data_behavior !== undefined && config.missing_data_behavior !== null
+    ? config.missing_data_behavior
+    : 'unknown';
+}
+
 function sameCriterionConfig(a, b) {
   const policy = (config) => ({
     enabled: config.enabled === undefined ? true : config.enabled,
     required: config.required === true,
     weight: config.weight,
     parameters: config.parameters === undefined ? null : config.parameters,
-    scoring: config.scoring === undefined ? null : config.scoring
+    scoring: config.scoring === undefined ? null : config.scoring,
+    missing_data_behavior: normalizedMissingDataBehavior(config)
   });
   return stableStringify(policy(a)) === stableStringify(policy(b));
 }
@@ -72,7 +89,8 @@ function criterionConfigurationView(config) {
     required: config.required === true,
     weight: config.weight ?? null,
     parameters: config.parameters ?? null,
-    scoring: config.scoring ?? null
+    scoring: config.scoring ?? null,
+    missing_data_behavior: normalizedMissingDataBehavior(config)
   };
 }
 
@@ -343,6 +361,8 @@ module.exports = {
   // exposed for focused unit tests
   stableStringify,
   sameCriterionConfig,
+  normalizedMissingDataBehavior,
+  criterionConfigurationView,
   alignCriterionKeys,
   buildCriterionComparison,
   buildDimensionComparison,

@@ -306,12 +306,14 @@
 <script setup>
 import { computed, onMounted, ref, watch } from 'vue'
 import { useQualitySetupStore } from '@/stores/qualitySetup'
+import { useQualityWorkflowStore } from '@/stores/qualityWorkflow'
 
 const props = defineProps({
   trade: { type: Object, required: true }
 })
 
 const store = useQualitySetupStore()
+const workflow = useQualityWorkflowStore()
 
 const prepared = ref(null)
 const evaluation = ref(null)
@@ -339,8 +341,23 @@ const CRITERION_LABELS = {
 watch(
   () => store.evaluation,
   (value) => {
+    // An explicitly selected active evaluation must not be overridden by the
+    // store's independent "latest draft" discovery.
+    if (workflow.activeEvaluationId && value && value.id !== workflow.activeEvaluationId) return
     evaluation.value = value
     hydrateFromEvaluation(value)
+  }
+)
+
+// The active workflow row is the single source of truth: when History starts a
+// re-evaluation (or another section progresses it), Setup follows that exact id.
+watch(
+  () => workflow.activeEvaluation,
+  (value) => {
+    if (value && value.id === workflow.activeEvaluationId) {
+      evaluation.value = value
+      hydrateFromEvaluation(value)
+    }
   }
 )
 
@@ -473,18 +490,23 @@ async function runPrepare() {
     // re-prepare that invalidated stale Setup results must not keep showing
     // the old grade.
     evaluation.value = payload.evaluation || evaluation.value
+    if (payload.evaluation) workflow.updateActive(payload.evaluation)
   } catch (err) {
     // store.error is already surfaced in the template
   }
 }
 
-// Phase 5: once the workflow is working on a specific non-terminal evaluation,
-// re-prepare stays pinned to that exact evaluation (and therefore to its
-// immutable profile version). Terminal snapshots are never pinned; a new draft
-// is started instead.
+// Phase 5: once the workflow is working on a specific evaluation, re-prepare
+// stays pinned to that exact evaluation (and therefore to its immutable profile
+// version). The explicitly selected active evaluation wins over any
+// automatically discovered draft. A terminal active row is still passed: the
+// backend creates a genuinely fresh draft for the same version and pins to it.
 const TERMINAL_STATUSES = ['completed', 'insufficient_data']
 
 function prepareOptions(extra = {}) {
+  if (workflow.activeEvaluationId) {
+    return { ...extra, evaluationId: workflow.activeEvaluationId }
+  }
   const current = evaluation.value
   if (current && current.id && !TERMINAL_STATUSES.includes(current.status)) {
     return { ...extra, evaluationId: current.id }
@@ -601,7 +623,8 @@ watch(pivotPriceInput, (value) => {
 
 async function runEvaluate() {
   if (!canEvaluate.value) return
-  const evaluationId = (prepared.value && prepared.value.evaluation && prepared.value.evaluation.id) ||
+  const evaluationId = workflow.activeEvaluationId ||
+    (prepared.value && prepared.value.evaluation && prepared.value.evaluation.id) ||
     (evaluation.value && evaluation.value.id)
   if (!evaluationId) {
     store.error = 'Run Prepare Setup first.'
@@ -630,6 +653,7 @@ async function runEvaluate() {
     })
     evaluation.value = payload.evaluation
     prepared.value = { ...(prepared.value || {}), evaluation: payload.evaluation }
+    if (payload.evaluation) workflow.updateActive(payload.evaluation)
   } catch (err) {
     // store.error is already surfaced in the template
   }
@@ -649,9 +673,19 @@ function resetPanel() {
 onMounted(async () => {
   loadingExisting.value = true
   try {
+    workflow.ensureTrade(props.trade.id)
     await store.fetchEvaluations(props.trade.id)
-    evaluation.value = store.evaluation
-    hydrateFromEvaluation(store.evaluation)
+    // Prefer an explicitly selected active evaluation over "latest draft".
+    if (
+      workflow.activeEvaluationId &&
+      workflow.activeEvaluation &&
+      workflow.activeEvaluation.id === workflow.activeEvaluationId
+    ) {
+      evaluation.value = workflow.activeEvaluation
+    } else {
+      evaluation.value = store.evaluation
+    }
+    hydrateFromEvaluation(evaluation.value)
   } catch (err) {
     // Ignore — the panel shows the Prepare CTA instead.
   } finally {

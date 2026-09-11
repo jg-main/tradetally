@@ -143,6 +143,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useQualityHistoryStore } from '@/stores/qualityHistory'
 import { useQualitySetupStore } from '@/stores/qualitySetup'
+import { useQualityWorkflowStore } from '@/stores/qualityWorkflow'
 import QualityComparisonPanel from './QualityComparisonPanel.vue'
 
 const props = defineProps({
@@ -151,6 +152,7 @@ const props = defineProps({
 
 const store = useQualityHistoryStore()
 const setupStore = useQualitySetupStore()
+const workflow = useQualityWorkflowStore()
 const evaluations = computed(() => store.evaluations)
 
 const compareSelection = ref([])
@@ -254,12 +256,16 @@ async function setPrimary(row) {
 }
 
 // Creates a NEW draft pinned to the profile's current immutable version,
-// switches the existing Quality workflow to it, and leaves primary/history
-// untouched (old evaluations stay visible; primary is never auto-promoted).
+// makes it the active workflow evaluation (Setup -> Entry -> Management all
+// operate on the SAME row), and leaves primary/history untouched (old
+// evaluations stay visible; primary is never auto-promoted).
 async function evaluateWithCurrent(row) {
   try {
     const evaluation = await store.startEvaluation(props.trade.id, row.current_version_id)
     if (evaluation) {
+      // Publish the new active row FIRST so Entry/Management follow it, then
+      // prepare Setup on that exact id (the history watcher refreshes the list).
+      workflow.activate(evaluation)
       await setupStore.prepare(props.trade.id, { evaluationId: evaluation.id })
     }
     await store.fetchEvaluations(props.trade.id)
@@ -268,6 +274,22 @@ async function evaluateWithCurrent(row) {
   }
 }
 
-onMounted(load)
-watch(() => props.trade.id, load)
+onMounted(() => {
+  workflow.ensureTrade(props.trade.id)
+  load()
+})
+watch(() => props.trade.id, (tradeId) => {
+  workflow.ensureTrade(tradeId)
+  load()
+})
+
+// Any Setup/Entry/Management progress or finalize bumps the workflow revision;
+// refresh the history rows so the active evaluation's summaries/status update
+// without a page reload. Primary is never changed here.
+watch(
+  () => workflow.revision,
+  () => {
+    load()
+  }
+)
 </script>

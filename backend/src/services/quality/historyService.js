@@ -136,18 +136,21 @@ async function assertTradeOwned(userId, tradeId) {
 }
 
 /**
- * Starts (or resumes) a NON-TERMINAL evaluation pinned to the explicitly
- * selected immutable profile version.
+ * Starts a FRESH evaluation pinned to the explicitly selected immutable
+ * profile version.
  *
- * Historical re-evaluation creates a new evaluation; it never mutates the
- * historical one. The version is frozen at creation because the caller selects
- * an exact profile_version_id — the workflow never resolves "current version"
- * again, so a profile that advances to a newer version while the draft is in
- * progress does not move the evaluation.
+ * This is the Phase-5 historical re-evaluation contract: an explicit
+ * "Evaluate with vN" ALWAYS creates a NEW trade_quality_evaluations row, even
+ * when another still-open draft for the same trade+version already exists. An
+ * abandoned draft is a legitimate historical record (possibly stale evidence
+ * or assertions from another attempt) and is never resumed, mutated, or
+ * deleted here. A future "Resume draft" action is a distinct explicit
+ * operation and is out of scope.
  *
- * A still-open (draft/needs_input) evaluation for the same trade+version is
- * resumed instead of creating duplicate drafts; a terminal evaluation for that
- * version is never reused, so re-evaluation always gets a fresh row.
+ * The version is frozen at creation because the caller selects an exact
+ * profile_version_id — the workflow never resolves "current version" again, so
+ * a profile that advances while the draft is in progress does not move the
+ * evaluation.
  */
 async function startEvaluation(userId, tradeId, profileVersionId) {
   if (!profileVersionId || typeof profileVersionId !== 'string') {
@@ -167,31 +170,12 @@ async function startEvaluation(userId, tradeId, profileVersionId) {
     );
   }
 
-  const existing = await db.query(
-    `
-      SELECT id
-      FROM trade_quality_evaluations
-      WHERE user_id = $1
-        AND trade_id = $2
-        AND profile_version_id = $3
-        AND status NOT IN ('completed', 'insufficient_data')
-      ORDER BY created_at DESC, id DESC
-      LIMIT 1
-    `,
-    [userId, tradeId, profileVersionId]
-  );
+  // Always a NEW row. Reuse the generic evaluation persistence (single INSERT
+  // that enforces trade + version ownership); never a second grading path and
+  // never a lookup for an existing draft.
+  const created = await evaluationService.createEvaluation(userId, tradeId, profileVersionId);
 
-  let evaluationId;
-  if (existing.rows.length > 0) {
-    evaluationId = existing.rows[0].id;
-  } else {
-    // Reuse the generic evaluation persistence (single INSERT that enforces
-    // trade + version ownership). Never a second grading path.
-    const created = await evaluationService.createEvaluation(userId, tradeId, profileVersionId);
-    evaluationId = created.id;
-  }
-
-  return findEnrichedEvaluation(userId, tradeId, evaluationId);
+  return findEnrichedEvaluation(userId, tradeId, created.id);
 }
 
 /**
@@ -258,6 +242,11 @@ async function selectPrimary(userId, tradeId, evaluationId) {
 
     // trade_id is the PRIMARY KEY, so this single statement can never leave
     // two primaries for a trade, even under concurrent selections.
+    //
+    // Re-selecting the evaluation that is ALREADY primary must be state
+    // idempotent: selected_at is preserved (unchanged) instead of being
+    // rewritten to CURRENT_TIMESTAMP. Switching to a different evaluation does
+    // advance selected_at.
     const upsert = await client.query(
       `
         INSERT INTO trade_quality_primary_evaluations (trade_id, user_id, evaluation_id)
@@ -265,7 +254,11 @@ async function selectPrimary(userId, tradeId, evaluationId) {
         ON CONFLICT (trade_id) DO UPDATE
           SET evaluation_id = EXCLUDED.evaluation_id,
               user_id = EXCLUDED.user_id,
-              selected_at = CURRENT_TIMESTAMP
+              selected_at = CASE
+                WHEN trade_quality_primary_evaluations.evaluation_id IS DISTINCT FROM EXCLUDED.evaluation_id
+                THEN CURRENT_TIMESTAMP
+                ELSE trade_quality_primary_evaluations.selected_at
+              END
         RETURNING trade_id, user_id, evaluation_id, selected_at
       `,
       [tradeId, userId, evaluationId]

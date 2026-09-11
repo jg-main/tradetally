@@ -83,10 +83,10 @@
               <span
                 v-if="criterion.presence !== 'both'"
                 class="ml-1 rounded px-1 text-[10px] font-semibold"
-                :class="criterion.presence === 'only_right' ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'"
+                :class="presenceClass(criterion.presence)"
                 data-testid="criterion-presence"
               >
-                {{ criterion.presence === 'only_right' ? 'added' : 'removed' }}
+                {{ presenceLabel(criterion.presence) }}
               </span>
               <span
                 v-if="criterion.configuration_changed"
@@ -106,9 +106,9 @@
               <span v-if="criterion.score.delta !== null">
                 {{ criterion.score.delta > 0 ? '+' : '' }}{{ criterion.score.delta }}
               </span>
-              <span v-else-if="criterion.presence !== 'both'">
-                {{ criterion.presence === 'only_right' ? 'not present in left' : 'not present in right' }}
-              </span>
+              <span v-else-if="criterion.presence === 'only_right'">not present in left</span>
+              <span v-else-if="criterion.presence === 'only_left'">not present in right</span>
+              <span v-else-if="criterion.presence === 'none'">disabled (both versions)</span>
               <span v-else>N/A</span>
             </td>
           </tr>
@@ -162,6 +162,22 @@ function dimensionLabel(key) {
 
 function criterionLabel(key) {
   return CRITERION_LABELS[key] || key
+}
+
+// Presence semantics: a criterion configured disabled on BOTH versions is
+// explicitly reported, never as "removed". Historical absence (only in one
+// immutable version) is "added"/"removed"; "none" means disabled in both.
+function presenceLabel(presence) {
+  if (presence === 'only_right') return 'added'
+  if (presence === 'only_left') return 'removed'
+  if (presence === 'none') return 'disabled (both)'
+  return presence
+}
+
+function presenceClass(presence) {
+  if (presence === 'only_right') return 'bg-green-100 text-green-700'
+  if (presence === 'only_left') return 'bg-amber-100 text-amber-700'
+  return 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-200'
 }
 
 function headerLabel(meta) {

@@ -1,10 +1,17 @@
 import { mount, flushPromises } from '@vue/test-utils'
 import { reactive } from 'vue'
+import { createPinia, setActivePinia } from 'pinia'
 import { describe, expect, it, beforeEach, vi } from 'vitest'
 import QualityEvaluationHistory from './QualityEvaluationHistory.vue'
+import { useQualityWorkflowStore } from '@/stores/qualityWorkflow'
 
 let historyStore
 let setupStore
+
+// The history panel also reads the shared active-evaluation workflow store.
+beforeEach(() => {
+  setActivePinia(createPinia())
+})
 
 vi.mock('@/stores/qualityHistory', () => ({
   useQualityHistoryStore: () => historyStore
@@ -160,8 +167,25 @@ describe('QualityEvaluationHistory', () => {
 
     expect(historyStore.startEvaluation).toHaveBeenCalledWith('trade-1', 'v2')
     expect(setupStore.prepare).toHaveBeenCalledWith('trade-1', { evaluationId: 'eval-new' })
-    // History is refreshed and the old evaluation remains present.
-    expect(historyStore.fetchEvaluations).toHaveBeenCalledTimes(2)
+    // The new evaluation becomes the single active workflow row.
+    expect(useQualityWorkflowStore().activeEvaluationId).toBe('eval-new')
+    // History is refreshed (activate + explicit refresh) and the old evaluation
+    // remains present.
+    expect(historyStore.fetchEvaluations.mock.calls.length).toBeGreaterThanOrEqual(2)
+    expect(historyStore.selectPrimary).not.toHaveBeenCalled()
+  })
+
+  it('refreshes history when the active evaluation progresses or finalizes', async () => {
+    historyStore.evaluations = [historyRow({ id: 'eval-new', status: 'draft' })]
+    mountSection()
+    await flushPromises()
+    const before = historyStore.fetchEvaluations.mock.calls.length
+
+    // Simulates Setup/Entry/Management publishing progress and finalize.
+    useQualityWorkflowStore().updateActive({ id: 'eval-new', trade_id: 'trade-1', status: 'completed' })
+
+    await flushPromises()
+    expect(historyStore.fetchEvaluations.mock.calls.length).toBeGreaterThan(before)
   })
 
   it('does not offer Evaluate with newer version when the row is already the current version', async () => {

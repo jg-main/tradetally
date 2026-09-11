@@ -85,32 +85,9 @@ describe('historyService.startEvaluation', () => {
     expect(evaluationService.createEvaluation).not.toHaveBeenCalled();
   });
 
-  test('resumes an existing non-terminal draft for the same trade+version', async () => {
+  test('always creates a NEW evaluation and never resumes an existing open draft', async () => {
     db.query
       .mockResolvedValueOnce({ rows: [{ found: 1 }] }) // assertTradeOwned
-      .mockResolvedValueOnce({ rows: [{ id: 'eval-existing' }] }) // existing non-terminal
-      .mockResolvedValueOnce({ rows: [enrichedRow({ id: 'eval-existing' })] }); // findEnrichedEvaluation
-    profileService.findVersionById.mockResolvedValue({
-      id: VERSION,
-      profile_id: 'profile-1',
-      version_number: 3,
-      configuration: { dimensions: {} }
-    });
-
-    const row = await historyService.startEvaluation(USER, TRADE, VERSION);
-
-    expect(evaluationService.createEvaluation).not.toHaveBeenCalled();
-    expect(row.id).toBe('eval-existing');
-    const existingQuery = db.query.mock.calls[1][0];
-    expect(existingQuery).toMatch(/profile_version_id = \$3/);
-    expect(existingQuery).toMatch(/status NOT IN \('completed', 'insufficient_data'\)/);
-    expect(db.query.mock.calls[1][1]).toEqual([USER, TRADE, VERSION]);
-  });
-
-  test('creates a NEW evaluation (via createEvaluation) when no open draft exists', async () => {
-    db.query
-      .mockResolvedValueOnce({ rows: [{ found: 1 }] }) // assertTradeOwned
-      .mockResolvedValueOnce({ rows: [] }) // no existing draft
       .mockResolvedValueOnce({ rows: [enrichedRow({ id: 'eval-new' })] }); // findEnrichedEvaluation
     profileService.findVersionById.mockResolvedValue({
       id: VERSION,
@@ -123,7 +100,33 @@ describe('historyService.startEvaluation', () => {
     const row = await historyService.startEvaluation(USER, TRADE, VERSION);
 
     expect(evaluationService.createEvaluation).toHaveBeenCalledWith(USER, TRADE, VERSION);
+    // No "find an existing draft" lookup is issued: only the ownership check
+    // and the enriched read after creation.
+    expect(db.query.mock.calls).toHaveLength(2);
+    expect(
+      db.query.mock.calls.some(([sql]) => String(sql).includes('status NOT IN'))
+    ).toBe(false);
     expect(row.id).toBe('eval-new');
+  });
+
+  test('issues a fresh INSERT on every explicit re-evaluation call', async () => {
+    db.query.mockResolvedValue({ rows: [enrichedRow()] });
+    profileService.findVersionById.mockResolvedValue({
+      id: VERSION,
+      profile_id: 'profile-1',
+      version_number: 3,
+      configuration: { dimensions: {} }
+    });
+    evaluationService.createEvaluation
+      .mockResolvedValueOnce({ id: 'eval-d2' })
+      .mockResolvedValueOnce({ id: 'eval-d3' });
+
+    await historyService.startEvaluation(USER, TRADE, VERSION);
+    await historyService.startEvaluation(USER, TRADE, VERSION);
+
+    expect(evaluationService.createEvaluation).toHaveBeenCalledTimes(2);
+    expect(evaluationService.createEvaluation).toHaveBeenNthCalledWith(1, USER, TRADE, VERSION);
+    expect(evaluationService.createEvaluation).toHaveBeenNthCalledWith(2, USER, TRADE, VERSION);
   });
 });
 

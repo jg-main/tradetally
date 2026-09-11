@@ -1,9 +1,16 @@
 import { mount, flushPromises } from '@vue/test-utils'
 import { reactive } from 'vue'
+import { createPinia, setActivePinia } from 'pinia'
 import { describe, expect, it, beforeEach, vi } from 'vitest'
 import ManagementQualitySection from './ManagementQualitySection.vue'
+import { useQualityWorkflowStore } from '@/stores/qualityWorkflow'
 
 let mockStoreInstance
+
+// The section also reads the shared active-evaluation workflow store.
+beforeEach(() => {
+  setActivePinia(createPinia())
+})
 
 vi.mock('@/stores/qualityManagement', () => ({
   useQualityManagementStore: () => mockStoreInstance
@@ -115,6 +122,27 @@ describe('ManagementQualitySection', () => {
 
     const options = wrapper.get('[data-testid="mgmt-trailing-select"]').findAll('option')
     expect(options.map((option) => option.element.value).filter(Boolean)).toEqual(['10', '20'])
+  })
+
+  it('prefers the explicitly active workflow evaluation over the discovered draft', async () => {
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([{ id: 'eval-1', status: 'draft', results: { setup: setupResult(), entry: entryResult(), management: null } }])
+    mockStoreInstance.prepare.mockResolvedValue(preparedPayload())
+    const workflow = useQualityWorkflowStore()
+    workflow.activate({
+      id: 'active-99',
+      trade_id: 'trade-1',
+      status: 'draft',
+      results: { setup: setupResult(), entry: entryResult(), management: null }
+    })
+
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-management"]').trigger('click')
+    await flushPromises()
+
+    expect(mockStoreInstance.prepare).toHaveBeenCalledWith('trade-1', {
+      evaluationId: 'active-99'
+    })
   })
 
   it('evaluates with the selected trailing MA and renders Management summaries', async () => {
