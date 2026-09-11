@@ -1,18 +1,17 @@
 'use strict';
 
 // Management execution-fill reconstruction
-// (docs/QUALITY_PROFILES_REQUIREMENT.md sections 28, 36-40).
+// (docs/QUALITY_PROFILES_REQUIREMENT.md sections 28, 36-40, 44).
 //
 // Pure helpers over the FULL chronological fill list (opening AND closing
 // fills). The Entry dimension already freezes the ORIGINAL POSITION and ENTRY
 // BASIS; Management consumes those immutable values but must additionally
-// reconstruct reductions (closing fills) to detect premature reductions and
-// partial completion. This module shares the exact normalization contract of
-// executionEvidenceService so opening/closing classification is consistent.
+// reconstruct reductions (closing fills) to detect premature reductions,
+// partial completion, and the actual exit price/time. This module shares the
+// exact normalization contract of executionEvidenceService.
 
 const {
   parseExecutions,
-  toEpochSeconds,
   directionFromSide,
   normalizeFills
 } = require('../executionEvidenceService');
@@ -23,13 +22,6 @@ function asNumber(value) {
   return Number.isFinite(n) ? n : null;
 }
 
-/**
- * Reconstructs the full chronological fill list for a trade.
- *
- * @param {object} trade - trades row with side/executions.
- * @returns {object|null}
- *   { direction, fills: [{ timeEpoch, action, quantity, price }], available }
- */
 function reconstructManagementFills(trade) {
   const direction = directionFromSide(trade && trade.side);
   const executions = parseExecutions(trade && trade.executions);
@@ -42,73 +34,75 @@ function isClosingAction(action, direction) {
   return direction === 'long' ? action === 'sell' : action === 'buy';
 }
 
-/**
- * Reductions (closing fills) in chronological order.
- */
 function closingFills(fills, direction) {
   return (fills || []).filter((fill) => isClosingAction(fill.action, direction));
 }
 
-/**
- * Total closing quantity across the given fills.
- */
 function totalQuantity(fills) {
   return (fills || []).reduce((sum, fill) => sum + (asNumber(fill.quantity) || 0), 0);
 }
 
-/**
- * Session date (YYYY-MM-DD) for a fill timestamp using the ET session clock.
- */
 function fillSessionDate(fill, sessionDateInZone) {
   if (!fill || !Number.isFinite(fill.timeEpoch)) return null;
   return sessionDateInZone(fill.timeEpoch);
 }
 
 /**
- * Reconstructs reductions and the partial/premature picture from the full fill
- * list, using the IMMUTABLE original position quantity from Entry.
+ * Reconstructs reductions (closing fills in chronological order) with price,
+ * the final closing fill, and the first full-close event.
  *
- * @param {object} params
- * @param {Array} params.fills - full chronological fills.
- * @param {string} params.direction - 'long' | 'short'.
- * @param {number} params.originalPositionQty - immutable Entry original position.
- * @param {Function} params.sessionDateInZone - epoch -> YYYY-MM-DD.
  * @returns {object}
- *   { reductions: [{timeEpoch, quantity, sessionDate, cumulativeQty}],
- *     totalReductionQty, positionClosed (boolean), lastClosingTimeEpoch,
- *     lastClosingSessionDate, remainingQty }
+ *   { reductions: [{timeEpoch, quantity, price, sessionDate, cumulativeQty}],
+ *     totalReductionQty, positionClosed, lastClosingTimeEpoch,
+ *     lastClosingPrice, lastClosingSessionDate, firstFullClose, remainingQty }
  */
 function reconstructReductions({ fills, direction, originalPositionQty, sessionDateInZone }) {
   const closes = closingFills(fills, direction);
   const reductions = [];
   let cumulative = 0;
   let lastClosingTimeEpoch = null;
+  let lastClosingPrice = null;
   let lastClosingSessionDate = null;
+  let firstFullClose = null;
+  const positionQty = asNumber(originalPositionQty);
+
   for (const fill of closes) {
-    cumulative += asNumber(fill.quantity) || 0;
+    const quantity = asNumber(fill.quantity) || 0;
+    cumulative += quantity;
     const sessionDate = fillSessionDate(fill, sessionDateInZone);
     if (fill.timeEpoch !== null && fill.timeEpoch !== undefined) {
       lastClosingTimeEpoch = fill.timeEpoch;
+      lastClosingPrice = asNumber(fill.price);
       lastClosingSessionDate = sessionDate;
     }
-    reductions.push({
+    const reduction = {
       timeEpoch: fill.timeEpoch,
-      quantity: asNumber(fill.quantity) || 0,
+      quantity,
+      price: asNumber(fill.price),
       sessionDate,
       cumulativeQty: cumulative
-    });
+    };
+    reductions.push(reduction);
+    if (
+      !firstFullClose &&
+      positionQty !== null &&
+      positionQty > 0 &&
+      cumulative >= positionQty - 1e-9
+    ) {
+      firstFullClose = reduction;
+    }
   }
-  const totalReductionQty = cumulative;
-  const positionQty = asNumber(originalPositionQty);
-  const positionClosed =
-    positionQty !== null && positionQty > 0 && totalReductionQty >= positionQty - 1e-9;
+
+  const positionClosed = positionQty !== null && positionQty > 0 && cumulative >= positionQty - 1e-9;
   return {
     reductions,
-    totalReductionQty,
+    totalReductionQty: cumulative,
     positionClosed,
     lastClosingTimeEpoch,
+    lastClosingPrice,
     lastClosingSessionDate,
-    remainingQty: positionQty !== null ? Math.max(0, positionQty - totalReductionQty) : null
+    firstFullClose,
+    remainingQty: positionQty !== null ? Math.max(0, positionQty - cumulative) : null
   };
 }
 

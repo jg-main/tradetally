@@ -166,4 +166,41 @@ describe('ManagementQualitySection', () => {
 
     expect(wrapper.find('[data-testid="finalize-evaluation"]').exists()).toBe(true)
   })
+
+  it('shows the activation assertion for explicit activation and allows N/A without an SMA', async () => {
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([{ id: 'eval-1', status: 'draft', results: { setup: setupResult(), entry: entryResult(), management: null } }])
+    mockStoreInstance.prepare.mockResolvedValue(preparedPayload({
+      policy: { trailingActivation: 'explicit', available: { trailing: true } },
+      requiredManagementUserInputs: ['trailing_ma_period', 'trailing_phase'],
+      trailingMa: { value: null, established: false, phase: null, phaseEstablished: false }
+    }))
+    mockStoreInstance.evaluate.mockResolvedValue({ evaluation: persistedEvaluation({ user_inputs: { trailing_phase: 'not_activated' } }) })
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-management"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="mgmt-phase-select"]').exists()).toBe(true)
+    await wrapper.get('[data-testid="mgmt-phase-select"]').setValue('not_activated')
+    await wrapper.get('[data-testid="run-management"]').trigger('click')
+    await flushPromises()
+
+    expect(mockStoreInstance.evaluate).toHaveBeenCalledWith('trade-1', {
+      evaluationId: 'eval-1',
+      userInputs: { trailing_phase: 'not_activated' }
+    })
+  })
+
+  it('explains the after-partial activation basis', async () => {
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([{ id: 'eval-1', status: 'draft', results: { setup: setupResult(), entry: entryResult(), management: null } }])
+    mockStoreInstance.prepare.mockResolvedValue(preparedPayload({
+      policy: { trailingActivation: 'after_partial', available: { trailing: true } }
+    }))
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-management"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="mgmt-activation-after-partial"]').exists()).toBe(true)
+  })
 })

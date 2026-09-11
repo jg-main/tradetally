@@ -4,19 +4,22 @@
 //
 // Pure functions. The selected trailing MA (SMA10 or SMA20) is computed from
 // completed daily closes; the exit signal is the FIRST completed daily close
-// STRICTLY below the selected MA (equality is HOLD). Execution timing is
-// evaluated against regular-session boundaries (next session after the signal),
-// never calendar arithmetic.
+// STRICTLY below the selected MA (equality is HOLD). The signal search begins
+// only once the trailing phase is active. Execution timing is evaluated against
+// regular-session boundaries (the next session after the signal), never
+// calendar arithmetic.
 //
-// No future-data leakage: a session's SMA uses only closes up to and including
-// that session; the signal search only uses sessions that have completed.
+// Point-in-time discipline:
+//   - only COMPLETED daily bars may create a close-below-MA signal;
+//   - an exit before the next session's open (signal-day close, after-hours,
+//     overnight, premarket) is never "within window";
+//   - no future-data leakage.
 
 function isFiniteNumber(value) {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
 // Simple moving average of `period` closes ending at `endIndex` (inclusive).
-// Returns null when the window is incomplete.
 function smaAt(bars, endIndex, period) {
   if (!Array.isArray(bars) || !Number.isInteger(period) || period < 1) return null;
   if (!Number.isInteger(endIndex) || endIndex < 0 || endIndex >= bars.length) return null;
@@ -31,16 +34,6 @@ function smaAt(bars, endIndex, period) {
   return sum / period;
 }
 
-/**
- * Computes the trailing MA series over the given bars for `period`.
- *
- * @param {Array} bars - normalized daily bars.
- * @param {number} period - SMA period (10 or 20).
- * @param {number} fromIndex - first index at which the SMA may be used
- *   (inclusive); SMA values before this are not needed.
- * @returns {Array<{sessionIndex, date, close, sma}>} from the first index where
- *   the SMA is computable.
- */
 function smaSeries(bars, period, fromIndex = 0) {
   if (!Array.isArray(bars) || !Number.isInteger(period) || period < 1) return [];
   const series = [];
@@ -48,32 +41,28 @@ function smaSeries(bars, period, fromIndex = 0) {
     if (i < fromIndex) continue;
     const sma = smaAt(bars, i, period);
     if (sma === null) continue;
-    series.push({
-      sessionIndex: i,
-      date: bars[i].date,
-      close: bars[i].close,
-      sma
-    });
+    series.push({ sessionIndex: i, date: bars[i].date, close: bars[i].close, sma });
   }
   return series;
 }
 
 /**
- * Finds the first completed daily close strictly below the selected SMA,
- * searching from `fromIndex` (the entry session) onward.
+ * Finds the first COMPLETED daily close strictly below the selected SMA,
+ * searching from `fromIndex` (trailing activation) through
+ * `completedThroughIndex` (the last completed session).
  *
- * @param {Array} bars - normalized daily bars.
- * @param {number} period - selected SMA period.
- * @param {number} fromIndex - entry session index (inclusive).
- * @returns {object|null} { sessionIndex, date, close, sma } or null when no
- *   signal exists within the available bars.
+ * @returns {object|null} { sessionIndex, date, close, sma } or null.
  */
-function findTrailingSignal(bars, period, fromIndex) {
-  const series = smaSeries(bars, period, fromIndex);
-  for (const point of series) {
-    // Equality is HOLD, not exit (section 44).
-    if (point.close < point.sma) {
-      return point;
+function findTrailingSignal({ bars, period, fromIndex, completedThroughIndex }) {
+  if (!Array.isArray(bars)) return null;
+  const upper = Number.isInteger(completedThroughIndex) ? completedThroughIndex : bars.length - 1;
+  for (let i = fromIndex; i <= upper; i += 1) {
+    if (i < 0 || i >= bars.length) continue;
+    const sma = smaAt(bars, i, period);
+    if (sma === null) continue;
+    const close = bars[i].close;
+    if (isFiniteNumber(close) && close < sma) {
+      return { sessionIndex: i, date: bars[i].date, close, sma, completed: true };
     }
   }
   return null;
@@ -82,92 +71,62 @@ function findTrailingSignal(bars, period, fromIndex) {
 /**
  * Classifies actual-exit execution timing relative to a trailing signal.
  *
- * @param {object} params
- * @param {object} params.signal - { sessionIndex, date } from findTrailingSignal.
- * @param {Array} params.bars - normalized daily bars.
- * @param {number} params.actualExitEpoch - epoch seconds of the final closing fill.
- * @param {Function} params.regularSessionBounds - date -> { openEpoch, closeEpoch }.
- * @param {number} [params.executionWindowMinutes=30]
+ * Boundary semantics (inclusive where stated):
+ *   - exit before the next session open           -> later_or_ignored (0)
+ *   - open <= exit <= open + windowMinutes         -> within_window (100)
+ *   - windowClose < exit < next session close      -> later_same_next_session (70)
+ *   - next session close <= exit < second close    -> one_session_late (40)
+ *   - otherwise                                    -> later_or_ignored (0)
+ *
  * @returns {object}
- *   { outcome: 'within_window'|'later_same_next_session'|'one_session_late'|
- *              'later_or_ignored'|'no_next_session',
- *     nextSessionDate, windowOpenEpoch, windowCloseEpoch, actualExitEpoch }
  */
 function classifyTrailingExecution({
-  signal,
-  bars,
+  nextSession,
+  secondNextSession,
   actualExitEpoch,
-  regularSessionBounds,
-  executionWindowMinutes = 30
+  executionWindowMinutes
 }) {
-  if (!signal || !Array.isArray(bars)) {
-    return { outcome: 'later_or_ignored', reason: 'no_signal' };
+  const base = {
+    outcome: 'later_or_ignored',
+    reason: null,
+    beforeNextOpen: false,
+    nextSessionDate: nextSession ? nextSession.date : null,
+    windowOpenEpoch: nextSession ? nextSession.openEpoch : null,
+    windowCloseEpoch: null,
+    actualExitEpoch: isFiniteNumber(actualExitEpoch) ? actualExitEpoch : null
+  };
+  if (!nextSession || !isFiniteNumber(nextSession.openEpoch) || !isFiniteNumber(nextSession.closeEpoch)) {
+    return { ...base, reason: 'no_next_session' };
   }
-  const nextIndex = signal.sessionIndex + 1;
-  if (nextIndex >= bars.length) {
-    return { outcome: 'later_or_ignored', reason: 'no_next_session' };
-  }
-  const nextDate = bars[nextIndex].date;
-  const nextBounds = regularSessionBounds(nextDate);
-  if (!nextBounds) {
-    return { outcome: 'later_or_ignored', reason: 'no_next_session_bounds' };
-  }
-  const windowMinutes = Number.isInteger(executionWindowMinutes) && executionWindowMinutes > 0
+  const minutes = Number.isInteger(executionWindowMinutes) && executionWindowMinutes > 0
     ? executionWindowMinutes
-    : 30;
-  const windowOpenEpoch = nextBounds.openEpoch;
-  const windowCloseEpoch = nextBounds.openEpoch + windowMinutes * 60;
+    : null;
+  if (minutes === null) {
+    return { ...base, reason: 'execution_window_unconfigured' };
+  }
+  const windowCloseEpoch = nextSession.openEpoch + minutes * 60;
+  base.windowCloseEpoch = windowCloseEpoch;
 
   if (!isFiniteNumber(actualExitEpoch)) {
-    return {
-      outcome: 'later_or_ignored',
-      reason: 'no_exit_evidence',
-      nextSessionDate: nextDate,
-      windowOpenEpoch,
-      windowCloseEpoch,
-      actualExitEpoch: null
-    };
+    return { ...base, reason: 'no_exit_evidence' };
   }
-
+  if (actualExitEpoch < nextSession.openEpoch) {
+    return { ...base, reason: 'exit_before_next_session_open', beforeNextOpen: true };
+  }
   if (actualExitEpoch <= windowCloseEpoch) {
-    return {
-      outcome: 'within_window',
-      nextSessionDate: nextDate,
-      windowOpenEpoch,
-      windowCloseEpoch,
-      actualExitEpoch
-    };
+    return { ...base, outcome: 'within_window', reason: null };
   }
-  if (actualExitEpoch < nextBounds.closeEpoch) {
-    return {
-      outcome: 'later_same_next_session',
-      nextSessionDate: nextDate,
-      windowOpenEpoch,
-      windowCloseEpoch,
-      actualExitEpoch
-    };
+  if (actualExitEpoch < nextSession.closeEpoch) {
+    return { ...base, outcome: 'later_same_next_session', reason: null };
   }
-  // One additional session late: exit during the session after the next.
-  const secondNextIndex = nextIndex + 1;
-  if (secondNextIndex < bars.length) {
-    const secondBounds = regularSessionBounds(bars[secondNextIndex].date);
-    if (secondBounds && actualExitEpoch < secondBounds.closeEpoch) {
-      return {
-        outcome: 'one_session_late',
-        nextSessionDate: nextDate,
-        windowOpenEpoch,
-        windowCloseEpoch,
-        actualExitEpoch
-      };
-    }
+  if (
+    secondNextSession &&
+    isFiniteNumber(secondNextSession.closeEpoch) &&
+    actualExitEpoch < secondNextSession.closeEpoch
+  ) {
+    return { ...base, outcome: 'one_session_late', reason: null };
   }
-  return {
-    outcome: 'later_or_ignored',
-    nextSessionDate: nextDate,
-    windowOpenEpoch,
-    windowCloseEpoch,
-    actualExitEpoch
-  };
+  return { ...base, outcome: 'later_or_ignored', reason: 'exit_after_one_late_session' };
 }
 
 module.exports = {

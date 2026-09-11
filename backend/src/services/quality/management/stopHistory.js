@@ -15,16 +15,20 @@
 //     floor across concurrent orders.
 //
 // A planned/default/current stop plus a partial UI-only change log is therefore
-// NOT trustworthy complete stop-order lifecycle evidence. Per sections 41.4 and
-// 42, Stop Ratchet and Post-Partial Breakeven are UNKNOWN when complete history
-// is unavailable; they must NEVER be inferred from the current/final stop_loss
-// or from a reasonable final exit.
+// NOT trustworthy complete stop-order lifecycle evidence. Per sections 41.4,
+// 42 and 60, Stop Ratchet and Post-Partial Breakeven are UNKNOWN when complete
+// history is unavailable; they must NEVER be inferred from the current/final
+// stop_loss or from a reasonable final exit.
 //
-// A genuinely trustworthy stop-history source may be supplied via the optional
-// `trustedStopHistory` hook (with its own provenance establishing why it is a
-// complete logical stop-modification sequence). No such TradeTally source
-// exists today, so production always resolves to UNKNOWN. The hook exists so
-// the evaluator contract is honest and testable, not to enable fabrication.
+// The same evidence discipline is applied to protective-stop CLASSIFICATION:
+// a reduction is only treated as a protective-stop execution when trustworthy
+// evidence explicitly classifies it. No TradeTally source does, so production
+// classification is unavailable and the affected criteria return UNKNOWN rather
+// than a fabricated PASS/FAIL.
+//
+// Optional hooks (`trustedStopHistory`, `trustedStopExecutionClassification`)
+// exist so the evaluator contract is honest and testable, not to enable
+// fabrication.
 
 function asNumber(value) {
   if (value === null || value === undefined || value === '') return null;
@@ -38,20 +42,11 @@ const AUDIT_REASON =
   'changes (no establishment, cancellation, replacement, or effective-quantity ' +
   'per stop); a trustworthy complete stop-modification sequence cannot be established.';
 
-/**
- * Resolves the logical stop-modification sequence (chronological, per-price
- * change) for the protective stop covering a long position.
- *
- * @param {object} params
- * @param {object} [params.trustedStopHistory] - optional authoritative source:
- *   {
- *     modifications: [{ epoch, price }],  // chronological, non-decreasing-by-rule
- *     source: string,
- *     provenance: string
- *   }
- * @returns {object}
- *   { available, modifications: [{epoch, price}], source, provenance, reason }
- */
+const CLASSIFICATION_REASON =
+  'TradeTally does not persist an order type per fill, so it cannot distinguish a ' +
+  'discretionary reduction from a protective-stop execution. Reductions are neither ' +
+  'confirmed protective nor confirmed discretionary.';
+
 function resolveStopHistory({ trustedStopHistory = null } = {}) {
   if (trustedStopHistory && Array.isArray(trustedStopHistory.modifications)) {
     const modifications = trustedStopHistory.modifications
@@ -80,44 +75,86 @@ function resolveStopHistory({ trustedStopHistory = null } = {}) {
 }
 
 /**
- * Determines whether a logical stop-modification sequence is non-decreasing
- * (Stop Ratchet / Never Lower, section 41). Normalizes prices to the configured
- * valid tick before comparison; a downward move of more than
- * `downwardToleranceTicks` ticks fails. For a long position any net decrease is
- * a failure with canonical tolerance 0 ticks.
+ * Resolves a trustworthy protective-stop classification for closing fills.
+ * Production has no such source, so this returns `available:false` unless a
+ * hook is supplied.
  *
- * @param {object} params
- * @param {Array} params.modifications - [{ epoch, price }] chronological.
- * @param {number} [params.tickSize] - valid price increment (default 0.01).
- * @param {number} [params.downwardToleranceTicks=0]
- * @returns {object} { valid, violations: [{index, fromPrice, toPrice, ticksDown}] }
+ * @returns {{available:boolean, complete:boolean, byEpoch:object, source:(string|null), reason:(string|null)}}
  */
-function evaluateStopRatchet({ modifications, tickSize = 0.01, downwardToleranceTicks = 0 }) {
+function resolveStopExecutionClassification({ trustedStopExecutionClassification = null } = {}) {
+  if (
+    trustedStopExecutionClassification &&
+    trustedStopExecutionClassification.available === true &&
+    trustedStopExecutionClassification.byEpoch &&
+    typeof trustedStopExecutionClassification.byEpoch === 'object'
+  ) {
+    return {
+      available: true,
+      complete: trustedStopExecutionClassification.complete === true,
+      byEpoch: trustedStopExecutionClassification.byEpoch,
+      source: trustedStopExecutionClassification.source || 'trusted_stop_classification',
+      reason: null
+    };
+  }
+  return {
+    available: false,
+    complete: false,
+    byEpoch: {},
+    source: null,
+    reason: CLASSIFICATION_REASON
+  };
+}
+
+/**
+ * Determines whether a logical stop-modification sequence is non-decreasing
+ * (Stop Ratchet / Never Lower, section 41). Execution slippage is not a stop
+ * modification. When the configured tolerance requires a tick and no
+ * trustworthy tick is available, the result is unresolved (UNKNOWN) rather
+ * than fabricated.
+ *
+ * @returns {{resolved:boolean, valid:(boolean|null), violations:Array, reason:(string|null)}}
+ */
+function evaluateStopRatchet({ modifications, tickSize = null, tickKnown = false, downwardToleranceTicks = 0 }) {
   const mods = modifications || [];
-  const tick = Number.isFinite(tickSize) && tickSize > 0 ? tickSize : 0.01;
   const tolerance = Number.isFinite(downwardToleranceTicks) && downwardToleranceTicks >= 0
     ? downwardToleranceTicks
     : 0;
+  const needsTick = tolerance > 0;
+
+  if (needsTick && !tickKnown) {
+    return {
+      resolved: false,
+      valid: null,
+      violations: [],
+      reason:
+        'A positive downward-tolerance requires a trustworthy instrument tick size, which is not stored; Stop Ratchet cannot be resolved.'
+    };
+  }
+  const tick = tickKnown && Number.isFinite(tickSize) && tickSize > 0 ? tickSize : null;
+  const epsilon = 1e-6;
+
   const violations = [];
   for (let i = 1; i < mods.length; i += 1) {
     const from = mods[i - 1];
     const to = mods[i];
     if (from.price === null || to.price === null) continue;
-    const ticksDown = Math.round((from.price - to.price) / tick);
-    if (ticksDown > tolerance) {
-      violations.push({
-        index: i,
-        fromPrice: from.price,
-        toPrice: to.price,
-        ticksDown
-      });
+    if (tick) {
+      const ticksDown = Math.round((from.price - to.price) / tick);
+      if (ticksDown > tolerance) {
+        violations.push({ index: i, fromPrice: from.price, toPrice: to.price, ticksDown });
+      }
+    } else if (from.price - to.price > epsilon) {
+      // Tolerance is zero: any genuine decrease violates the no-lowering rule.
+      violations.push({ index: i, fromPrice: from.price, toPrice: to.price, ticksDown: null });
     }
   }
-  return { valid: violations.length === 0, violations };
+  return { resolved: true, valid: violations.length === 0, violations, reason: null };
 }
 
 module.exports = {
   AUDIT_REASON,
+  CLASSIFICATION_REASON,
   resolveStopHistory,
+  resolveStopExecutionClassification,
   evaluateStopRatchet
 };

@@ -3,26 +3,27 @@
 // No Premature Reduction criterion (docs/QUALITY_PROFILES_REQUIREMENT.md section 40).
 //
 // Before the canonical partial trigger occurs, the position should remain at
-// original size unless reduced by a legitimate protective stop. Any
-// discretionary reduction before the trigger is a failure.
+// original size unless reduced by a legitimate protective stop. Premature
+// reduction is evaluated independently of eventual partial compliance.
 //
-// Premature reduction is evaluated independently of eventual partial
-// compliance. Without trustworthy stop-execution evidence, a pre-trigger
-// reduction cannot be proven protective, so it is counted as premature (the
-// evaluator documents this limitation; a protective-stop execution hook exists
-// upstream so tests can prove legitimate protective reductions are excluded).
+// Evidence discipline (hardening): a pre-trigger reduction is only excluded as
+// protective when trustworthy evidence explicitly classifies it. TradeTally
+// cannot distinguish a discretionary reduction from a protective-stop
+// execution, so an unclassified pre-trigger reduction is UNKNOWN — never a
+// fabricated FAIL. With no pre-trigger reduction the criterion may PASS.
 
 const { CRITERION_STATUS } = require('../../constants');
 const { unknownResult } = require('./common');
 
-function evaluate({ criterion = {}, managementState = {} }) {
+function evaluate({ managementState = {} }) {
   const initialR = managementState.initialR || {};
   const daily = managementState.daily || {};
+  const policy = managementState.policy || {};
   const premature = managementState.prematureReduction || {};
 
   if (!initialR.available) {
     return unknownResult(
-      'Initial R is unavailable, so the canonical partial trigger cannot be established; premature reduction cannot be evaluated.',
+      'Initial R is unavailable, so the partial trigger boundary cannot be established; premature reduction cannot be evaluated.',
       { initial_r_available: false }
     );
   }
@@ -32,36 +33,49 @@ function evaluate({ criterion = {}, managementState = {} }) {
       { daily_authoritative: false }
     );
   }
-  if (!managementState.fills || !managementState.fills.available) {
+  if (!policy.partialTrigger) {
     return unknownResult(
-      'Execution fill evidence is unavailable, so reductions cannot be reconstructed; premature reduction is UNKNOWN.',
-      {}
+      'No explicit partial-trigger policy is configured for this profile version; premature reduction is UNKNOWN.',
+      { policy_available: policy.available || null }
     );
   }
-
-  const fraction = premature.prematureFraction ?? null;
-  if (fraction === null) {
-    return unknownResult('The premature-reduction fraction could not be established.', {});
+  if (!managementState.fills || !managementState.fills.available) {
+    return unknownResult('Execution fill evidence is unavailable, so reductions cannot be reconstructed; premature reduction is UNKNOWN.', {});
   }
 
-  const passed = fraction <= 1e-9;
-
-  return {
-    status: passed ? CRITERION_STATUS.PASS : CRITERION_STATUS.FAIL,
-    scoring_value: fraction,
-    raw_value: fraction,
-    evidence: {
-      premature_reduction_qty: premature.prematureQty,
-      premature_reduction_fraction: fraction,
-      excluded_protective_qty: premature.excludedQty || 0,
-      boundary_session_date: premature.boundarySessionDate || null,
-      original_position_qty: managementState.originalPositionQty ?? null,
-      stop_execution_evidence_available: !!premature.protectiveStopEvidenceAvailable
-    },
-    message: passed
-      ? 'No discretionary reduction occurred before the canonical partial trigger.'
-      : `${(fraction * 100).toFixed(1)}% of the original position was reduced before the canonical partial trigger.`
+  const evidence = {
+    premature_reduction_qty: premature.prematureQty,
+    premature_reduction_fraction: premature.prematureFraction,
+    excluded_protective_qty: premature.excludedQty || 0,
+    ambiguous_qty: premature.ambiguousQty || 0,
+    boundary_session_date: premature.boundarySessionDate || null,
+    original_position_qty: managementState.originalPositionQty ?? null,
+    stop_execution_evidence_available: !!premature.classificationAvailable,
+    stop_execution_evidence_complete: !!premature.classificationComplete
   };
+
+  if (premature.outcome === 'none') {
+    return {
+      status: CRITERION_STATUS.PASS,
+      scoring_value: 0,
+      raw_value: 0,
+      evidence,
+      message: 'No reduction occurred before the canonical partial trigger.'
+    };
+  }
+  if (premature.outcome === 'discretionary') {
+    return {
+      status: CRITERION_STATUS.FAIL,
+      scoring_value: premature.prematureFraction,
+      raw_value: premature.prematureFraction,
+      evidence,
+      message: `${(premature.prematureFraction * 100).toFixed(1)}% of the original position was reduced before the canonical partial trigger.`
+    };
+  }
+  return unknownResult(
+    'A pre-trigger reduction exists but TradeTally cannot distinguish a discretionary reduction from a protective-stop execution; premature reduction is UNKNOWN.',
+    evidence
+  );
 }
 
 module.exports = { evaluate };

@@ -524,7 +524,11 @@ const CANONICAL_BO_CONFIG = {
             trade_level_selection: 'required',
             exit_signal: 'first_daily_close_below_selected_ma',
             equality_triggers: false,
-            execution_window_minutes: 30
+            execution_window_minutes: 30,
+            // Section 46: the trailing phase activates only after the canonical
+            // partial is completed; a close below the MA before activation is
+            // irrelevant.
+            activation: 'after_partial'
           },
           missing_data_behavior: 'not_applicable',
           // Section 44 (outcome categories).

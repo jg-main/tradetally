@@ -983,6 +983,18 @@ async function saveManagementProgress(evaluationId, userId, data = {}) {
     ? data.trailingMa
     : { mode: 'none' };
 
+  const currentPhase =
+    (typeof currentInputs.trailing_phase === 'string' && currentInputs.trailing_phase)
+      ? currentInputs.trailing_phase
+      : (currentInputs.immutable_semantic_context &&
+          currentInputs.immutable_semantic_context.trailing_phase &&
+          typeof currentInputs.immutable_semantic_context.trailing_phase.value === 'string')
+        ? currentInputs.immutable_semantic_context.trailing_phase.value
+        : null;
+  const phase = data.trailingPhase && typeof data.trailingPhase === 'object'
+    ? data.trailingPhase
+    : { mode: 'none' };
+
   // In-memory pre-checks (the authoritative race protection is the SQL CAS).
   if (expectedFingerprint !== null && currentFingerprint !== expectedFingerprint) {
     throw managementStaleError('STALE_DEPENDENCY');
@@ -1006,6 +1018,22 @@ async function saveManagementProgress(evaluationId, userId, data = {}) {
   }
   const trailingMode =
     trailing.mode === 'establish' && currentTrailing !== null ? 'preserve' : trailing.mode;
+
+  if (
+    phase.mode === 'establish' &&
+    currentPhase !== null &&
+    currentPhase !== phase.value
+  ) {
+    throw managementStaleError('TRAILING_PHASE_IMMUTABLE');
+  }
+  if (
+    phase.mode === 'preserve' &&
+    currentPhase !== null &&
+    currentPhase !== phase.value
+  ) {
+    throw managementStaleError('TRAILING_PHASE_IMMUTABLE');
+  }
+  const phaseMode = phase.mode === 'establish' && currentPhase !== null ? 'preserve' : phase.mode;
 
   const configuration = lookup.rows[0].configuration;
   if (
@@ -1100,6 +1128,46 @@ async function saveManagementProgress(evaluationId, userId, data = {}) {
     }
   }
 
+  if (phaseMode === 'establish') {
+    const previousContext =
+      persistedUserInputs.immutable_semantic_context &&
+      typeof persistedUserInputs.immutable_semantic_context === 'object'
+        ? persistedUserInputs.immutable_semantic_context
+        : {};
+    const previousPhase =
+      previousContext.trailing_phase && typeof previousContext.trailing_phase === 'object'
+        ? previousContext.trailing_phase
+        : {};
+    persistedUserInputs.trailing_phase = phase.value;
+    persistedUserInputs.immutable_semantic_context = {
+      ...previousContext,
+      trailing_phase: {
+        value: phase.value,
+        source: 'user_asserted',
+        asserted_at: previousPhase.asserted_at || phase.assertedAt || new Date().toISOString(),
+        timing: 'post_trade'
+      }
+    };
+  } else if (phaseMode === 'preserve' && currentPhase !== null) {
+    persistedUserInputs.trailing_phase = currentPhase;
+    const previousContext =
+      persistedUserInputs.immutable_semantic_context &&
+      typeof persistedUserInputs.immutable_semantic_context === 'object'
+        ? persistedUserInputs.immutable_semantic_context
+        : {};
+    if (!(previousContext.trailing_phase && previousContext.trailing_phase.asserted_at)) {
+      persistedUserInputs.immutable_semantic_context = {
+        ...previousContext,
+        trailing_phase: {
+          value: currentPhase,
+          source: 'user_asserted',
+          asserted_at: phase.assertedAt || new Date().toISOString(),
+          timing: 'post_trade'
+        }
+      };
+    }
+  }
+
   const where = [
     'id = $1',
     'user_id = $2',
@@ -1123,11 +1191,20 @@ async function saveManagementProgress(evaluationId, userId, data = {}) {
     currentRevision ?? '',
     currentEntryFingerprint ?? ''
   ];
+  let paramIndex = 14;
   if (trailingMode === 'establish') {
     where.push(`COALESCE(user_inputs->>'trailing_ma_period', '') = ''`);
   } else if (trailingMode === 'preserve') {
-    where.push(`COALESCE(user_inputs->>'trailing_ma_period', '') = $14`);
+    where.push(`COALESCE(user_inputs->>'trailing_ma_period', '') = $${paramIndex}`);
     params.push(String(trailing.value));
+    paramIndex += 1;
+  }
+  if (phaseMode === 'establish') {
+    where.push(`COALESCE(user_inputs->>'trailing_phase', '') = ''`);
+  } else if (phaseMode === 'preserve') {
+    where.push(`COALESCE(user_inputs->>'trailing_phase', '') = $${paramIndex}`);
+    params.push(String(phase.value));
+    paramIndex += 1;
   }
 
   const updated = await db.query(
@@ -1179,6 +1256,17 @@ async function saveManagementProgress(evaluationId, userId, data = {}) {
     if (trailingMode !== 'none' && latestTrailing !== null && latestTrailing !== trailing.value) {
       throw managementStaleError('TRAILING_MA_IMMUTABLE');
     }
+    const latestPhase =
+      (typeof latestInputs.trailing_phase === 'string' && latestInputs.trailing_phase)
+        ? latestInputs.trailing_phase
+        : (latestInputs.immutable_semantic_context &&
+            latestInputs.immutable_semantic_context.trailing_phase &&
+            typeof latestInputs.immutable_semantic_context.trailing_phase.value === 'string')
+          ? latestInputs.immutable_semantic_context.trailing_phase.value
+          : null;
+    if (phaseMode !== 'none' && latestPhase !== null && latestPhase !== phase.value) {
+      throw managementStaleError('TRAILING_PHASE_IMMUTABLE');
+    }
     throw managementStaleError('STALE_DEPENDENCY');
   }
   return updated.rows[0] || null;
@@ -1191,7 +1279,9 @@ function managementStaleError(code) {
     STALE_ENTRY_DEPENDENCY:
       'Management results were not saved because the Entry dependency changed during evaluation. Re-run Management prepare/evaluate.',
     TRAILING_MA_IMMUTABLE:
-      'trailing_ma_period is immutable for this evaluation; another request established a different value. Create a new evaluation to change it.'
+      'trailing_ma_period is immutable for this evaluation; another request established a different value. Create a new evaluation to change it.',
+    TRAILING_PHASE_IMMUTABLE:
+      'trailing_phase is immutable for this evaluation; another request established a different value. Create a new evaluation to change it.'
   };
   const error = new Error(messages[code] || 'Management results could not be saved.');
   error.code = code;

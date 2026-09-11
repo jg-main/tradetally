@@ -3,13 +3,14 @@
 // Post-Partial Breakeven Protection criterion
 // (docs/QUALITY_PROFILES_REQUIREMENT.md section 42).
 //
-// After the required 50% partial is completed, the remaining position must have
-// a protective stop >= the original entry basis by the configured deadline
+// After the required partial is completed, the remaining position must have a
+// protective stop >= the original entry basis by the configured deadline
 // (canonical: end of the same trigger/partial session).
 //
-// NOT_APPLICABLE when the partial rule never triggered; UNKNOWN when stop
-// history is unavailable. The comparison always uses the immutable original
-// entry basis, never the current/final trade.stop_loss.
+// NOT_APPLICABLE when the partial rule never triggered or a proven protective
+// exit superseded it; UNKNOWN when the trigger is pending, the exit is
+// unclassifiable, or stop history is unavailable. The comparison always uses
+// the immutable original entry basis, never the current/final trade.stop_loss.
 
 const { CRITERION_STATUS } = require('../../constants');
 const { unknownResult, notApplicableResult } = require('./common');
@@ -40,39 +41,69 @@ function resolveOutcome({ modifications, entryBasis, completionTimeEpoch, deadli
   return { outcome: 'no_meaningful_reduction', stopAtNextSession, baseline };
 }
 
-function evaluate({ criterion = {}, managementState = {} }) {
+function evaluate({ managementState = {} }) {
+  const policy = managementState.policy || {};
   const partialTrigger = managementState.partialTrigger || {};
   const partialCompletion = managementState.partialCompletion || {};
+  const partialExit = managementState.partialExit || {};
   const stopHistory = managementState.stopHistory || {};
   const entryBasis = managementState.entryBasis;
   const beContext = managementState.be || {};
 
-  if (!partialTrigger.triggered || partialTrigger.supersededByExit) {
+  if (!policy.partialTrigger) {
+    return unknownResult(
+      'No explicit partial-trigger policy is configured for this profile version; Post-Partial Breakeven is UNKNOWN.',
+      { policy_available: policy.available || null }
+    );
+  }
+
+  if (partialExit.outcome === 'superseded_protective') {
     return notApplicableResult(
-      partialTrigger.supersededByExit
-        ? 'The position was fully closed before the partial became due; Post-Partial Breakeven is NOT_APPLICABLE.'
-        : 'Cumulative MFE never reached the configured minimum through the partial window; Post-Partial Breakeven is NOT_APPLICABLE.',
-      { reason: partialTrigger.supersededByExit ? 'superseded_by_exit' : partialTrigger.reason || 'never_reached_minimum_mfe' }
+      'A proven protective-stop exit closed the position before the partial became due; Post-Partial Breakeven is NOT_APPLICABLE.',
+      { reason: 'superseded_protective' }
+    );
+  }
+  if (partialExit.outcome === 'superseded_discretionary') {
+    return {
+      status: CRITERION_STATUS.FAIL,
+      scoring_value: 'no_meaningful_reduction',
+      raw_value: 'superseded_discretionary',
+      evidence: { reason: 'superseded_discretionary' },
+      message: 'The position was fully closed before the partial became due without evidence of a protective stop.'
+    };
+  }
+  if (partialExit.outcome === 'superseded_ambiguous') {
+    return unknownResult(
+      'The position was fully closed before the partial became due and TradeTally cannot classify the exit as protective; Post-Partial Breakeven is UNKNOWN.',
+      { reason: 'superseded_ambiguous' }
+    );
+  }
+
+  if (partialTrigger.status === 'never_reached') {
+    return notApplicableResult(
+      'Cumulative MFE never reached the configured minimum through the partial window; Post-Partial Breakeven is NOT_APPLICABLE.',
+      { reason: partialTrigger.reason || 'never_reached_minimum_mfe' }
+    );
+  }
+  if (partialTrigger.status !== 'triggered') {
+    return unknownResult(
+      partialTrigger.status === 'pending'
+        ? 'The partial window has not yet fully elapsed (the trigger is pending); Post-Partial Breakeven is UNKNOWN.'
+        : 'The point-in-time +1R trigger could not be established from trustworthy evidence; Post-Partial Breakeven is UNKNOWN.',
+      { trigger_status: partialTrigger.status, reason: partialTrigger.reason || null }
     );
   }
   if (!stopHistory.available) {
     return unknownResult(
-      stopHistory.reason ||
-        'Trustworthy stop-history evidence is unavailable, so post-partial breakeven protection cannot be established; it is UNKNOWN.',
+      stopHistory.reason || 'Trustworthy stop-history evidence is unavailable, so post-partial breakeven protection cannot be established; it is UNKNOWN.',
       { stop_history_available: false, provenance: stopHistory.provenance || null }
     );
   }
   if (partialCompletion.completionTimeEpoch === null || partialCompletion.completionTimeEpoch === undefined) {
-    return unknownResult(
-      'The partial completion time could not be established; Post-Partial Breakeven is UNKNOWN.',
-      {}
-    );
+    return unknownResult('The partial completion time could not be established; Post-Partial Breakeven is UNKNOWN.', {});
   }
   if (!Number.isFinite(entryBasis) || entryBasis <= 0) {
-    return unknownResult(
-      'The immutable original entry basis is unavailable; Post-Partial Breakeven is UNKNOWN.',
-      {}
-    );
+    return unknownResult('The immutable original entry basis is unavailable; Post-Partial Breakeven is UNKNOWN.', {});
   }
 
   const { outcome, stopAtDeadline, stopAtNextSession, baseline } = resolveOutcome({
@@ -95,6 +126,7 @@ function evaluate({ criterion = {}, managementState = {} }) {
         ? new Date(partialCompletion.completionTimeEpoch * 1000).toISOString()
         : null,
       deadline_epoch: beContext.deadlineEpoch ?? null,
+      deadline_sessions: policy.postPartialDeadlineSessions ?? null,
       next_session_close_epoch: beContext.nextSessionCloseEpoch ?? null,
       stop_at_deadline: stopAtDeadline,
       stop_at_next_session: stopAtNextSession,
@@ -103,7 +135,7 @@ function evaluate({ criterion = {}, managementState = {} }) {
       provenance: stopHistory.provenance || null
     },
     message: passed
-      ? `The protective stop reached or exceeded the original entry basis (${entryBasis}) during the partial session.`
+      ? `The protective stop reached or exceeded the original entry basis (${entryBasis}) by the configured deadline.`
       : `The protective stop did not reach the original entry basis by the deadline (outcome: ${outcome}).`
   };
 }

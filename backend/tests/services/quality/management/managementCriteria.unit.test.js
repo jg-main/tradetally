@@ -6,198 +6,166 @@ const prematureReduction = require('../../../../src/services/quality/criteria/ma
 const stopRatchet = require('../../../../src/services/quality/criteria/management/stopRatchet');
 const breakevenProtection = require('../../../../src/services/quality/criteria/management/breakevenProtection');
 const trailingMA = require('../../../../src/services/quality/criteria/management/trailingMA');
-
 const { CRITERION_STATUS } = require('../../../../src/services/quality/constants');
 
-function state(overrides = {}) {
+function baseState(overrides = {}) {
   return {
     direction: 'long',
     entryBasis: 100,
     originalPositionQty: 200,
     initialR: { available: true, r_per_share: 5 },
-    daily: { authoritative: true, bars: [], entryIndex: 2, source: 'test', completeness: 'verified', reason: null },
-    fills: { available: true, reductions: [], totalReductionQty: 0, positionClosed: false, lastClosingTimeEpoch: null, lastClosingSessionDate: null, remainingQty: 200 },
-    partialTrigger: { triggered: false, reason: 'never_reached_minimum_mfe' },
-    partialCompletion: { completed: false, achievedFraction: null, achievedPct: null, timingOutcome: 'later_or_not_completed' },
-    prematureReduction: { prematureQty: 0, prematureFraction: 0, excludedQty: 0 },
+    daily: { authoritative: true, bars: [], entryIndex: 2, completedThroughIndex: 10, source: 'test', completeness: 'verified', reason: null },
+    fills: { available: true, reductions: [], totalReductionQty: 0, positionClosed: false, lastClosingTimeEpoch: null, lastClosingPrice: null, lastClosingSessionDate: null, remainingQty: 200 },
+    policy: {
+      partialTrigger: { earliest_day: 3, latest_day: 5, minimum_mfe_r: 1 },
+      partialTriggerSource: 'partial_timing',
+      partialTarget: { target_pct: 50, target_tolerance_pct: 2 },
+      partialToleranceSource: 'explicit',
+      completionWindow: { sessions: 0, normalized: 'same_session' },
+      postPartialDeadlineSessions: 0,
+      executionWindowMinutes: 30,
+      trailingActivation: 'after_partial',
+      trailingActivationSource: 'trailing_ma',
+      available: { partialTrigger: true, partialTarget: true, completionWindow: true, postPartialDeadline: true, executionWindow: true, trailing: true }
+    },
+    quantityUnit: { known: true, unit: 1 },
+    tickSize: { known: false, tickSize: null },
     stopHistory: { available: false, reason: 'no stop-order lifecycle' },
-    trailing: { selectedPeriod: null, signal: null, superseded: false, execution: null },
-    be: { deadlineEpoch: null, nextSessionCloseEpoch: null },
-    tickSize: 0.01,
+    stopExecutionClassification: { available: false },
+    partialTrigger: { status: 'triggered', triggered: true, dueDay: 3, dueSessionDate: '2026-03-12', dueSessionIndex: 2, dueSessionCompleted: true, firstReachDay: 1 },
+    partialCompletion: {
+      completed: true,
+      achievedQty: 100,
+      achievedFraction: 0.5,
+      achievedPct: 50,
+      observedQty: 100,
+      observedFraction: 0.5,
+      sessionsAfterTrigger: 0,
+      timingOutcome: 'same_trigger_session',
+      rounding: { resolved: true, requiredQty: 100, unit: 1, rounded: false }
+    },
+    partialExit: { closedBeforeDue: false, outcome: 'none', closeSessionDate: null, closeTimeEpoch: null },
+    prematureReduction: { outcome: 'none', prematureQty: 0, prematureFraction: 0, excludedQty: 0, ambiguousQty: 0, boundarySessionDate: '2026-03-12', classificationAvailable: false, classificationComplete: false },
+    trailing: { activation: 'after_partial', active: true, activationResolved: true, activationSessionIndex: 2, signal: null, signalReason: null, supersession: { outcome: 'none' }, execution: null, executionReason: null },
+    be: { deadlineEpoch: 200, nextSessionCloseEpoch: 300 },
     ...overrides
   };
 }
 
-const timingCriterion = { key: 'partial_timing', parameters: { earliest_day: 3, latest_day: 5, minimum_mfe_r: 1.0, completion_window: 'same_session' } };
-const sizingCriterion = { key: 'partial_sizing', parameters: { target_pct: 50, target_tolerance_pct: 2 } };
-const ratchetCriterion = { key: 'stop_ratchet', parameters: { downward_tolerance_ticks: 0 } };
-const beCriterion = { key: 'post_partial_breakeven', parameters: { minimum_stop: 'original_entry_basis', deadline: 'same_session' } };
-const trailingCriterion = { key: 'trailing_ma', parameters: { allowed_periods: [10, 20], execution_window_minutes: 30 } };
-
-describe('partial timing / sizing — Initial R unavailable', () => {
-  it('both become UNKNOWN when Initial R is unavailable', () => {
-    const s = state({ initialR: { available: false, r_per_share: null } });
-    expect(partialTiming.evaluate({ criterion: timingCriterion, managementState: s }).status).toBe(CRITERION_STATUS.UNKNOWN);
-    expect(partialSizing.evaluate({ criterion: sizingCriterion, managementState: s }).status).toBe(CRITERION_STATUS.UNKNOWN);
+describe('partial timing (F3/F7/F9)', () => {
+  it('UNKNOWN when Initial R is unavailable', () => {
+    expect(partialTiming.evaluate({ managementState: baseState({ initialR: { available: false } }) }).status).toBe(CRITERION_STATUS.UNKNOWN);
+  });
+  it('UNKNOWN when no partial-trigger policy is configured', () => {
+    const s = baseState({ policy: { ...baseState().policy, partialTrigger: null } });
+    expect(partialTiming.evaluate({ managementState: s }).status).toBe(CRITERION_STATUS.UNKNOWN);
+  });
+  it('NOT_APPLICABLE on never_reached, UNKNOWN on pending', () => {
+    expect(partialTiming.evaluate({ managementState: baseState({ partialTrigger: { status: 'never_reached' } }) }).status).toBe(CRITERION_STATUS.NOT_APPLICABLE);
+    expect(partialTiming.evaluate({ managementState: baseState({ partialTrigger: { status: 'pending' } }) }).status).toBe(CRITERION_STATUS.UNKNOWN);
+    expect(partialTiming.evaluate({ managementState: baseState({ partialTrigger: { status: 'insufficient_evidence' } }) }).status).toBe(CRITERION_STATUS.UNKNOWN);
+  });
+  it('PASS same trigger session and FAIL later', () => {
+    expect(partialTiming.evaluate({ managementState: baseState() }).status).toBe(CRITERION_STATUS.PASS);
+    const later = baseState({ partialCompletion: { ...baseState().partialCompletion, completed: false, sessionsAfterTrigger: 5, timingOutcome: 'later_or_not_completed' } });
+    expect(partialTiming.evaluate({ managementState: later }).status).toBe(CRITERION_STATUS.FAIL);
+  });
+  it('honours a next-session completion window', () => {
+    const s = baseState({
+      policy: { ...baseState().policy, completionWindow: { sessions: 1, normalized: 'next_session' } },
+      partialCompletion: { ...baseState().partialCompletion, sessionsAfterTrigger: 1, timingOutcome: 'next_session' }
+    });
+    expect(partialTiming.evaluate({ managementState: s }).status).toBe(CRITERION_STATUS.PASS);
+  });
+  it('superseded: protective => N/A, ambiguous => UNKNOWN, discretionary => FAIL', () => {
+    expect(partialTiming.evaluate({ managementState: baseState({ partialExit: { outcome: 'superseded_protective' } }) }).status).toBe(CRITERION_STATUS.NOT_APPLICABLE);
+    expect(partialTiming.evaluate({ managementState: baseState({ partialExit: { outcome: 'superseded_ambiguous' } }) }).status).toBe(CRITERION_STATUS.UNKNOWN);
+    expect(partialTiming.evaluate({ managementState: baseState({ partialExit: { outcome: 'superseded_discretionary' } }) }).status).toBe(CRITERION_STATUS.FAIL);
   });
 });
 
-describe('partial timing / sizing / post-BE — NOT_APPLICABLE', () => {
-  it('all three are NOT_APPLICABLE when +1R never reached', () => {
-    const s = state();
-    expect(partialTiming.evaluate({ criterion: timingCriterion, managementState: s }).status).toBe(CRITERION_STATUS.NOT_APPLICABLE);
-    expect(partialSizing.evaluate({ criterion: sizingCriterion, managementState: s }).status).toBe(CRITERION_STATUS.NOT_APPLICABLE);
-    expect(breakevenProtection.evaluate({ criterion: beCriterion, managementState: s }).status).toBe(CRITERION_STATUS.NOT_APPLICABLE);
+describe('partial sizing (F1/F8/F9)', () => {
+  it('PASS within tolerance and FAIL outside', () => {
+    expect(partialSizing.evaluate({ managementState: baseState() }).status).toBe(CRITERION_STATUS.PASS);
+    const far = baseState({ partialCompletion: { ...baseState().partialCompletion, achievedPct: 20 } });
+    expect(partialSizing.evaluate({ managementState: far }).status).toBe(CRITERION_STATUS.FAIL);
+  });
+  it('UNKNOWN when the tolerance cannot be resolved', () => {
+    const s = baseState({ policy: { ...baseState().policy, partialTarget: { target_pct: 50, target_tolerance_pct: null } } });
+    expect(partialSizing.evaluate({ managementState: s }).status).toBe(CRITERION_STATUS.UNKNOWN);
+  });
+  it('UNKNOWN when quantity rounding is unresolved', () => {
+    const s = baseState({ partialCompletion: { ...baseState().partialCompletion, rounding: { resolved: false, reason: 'quantity_unit_unknown' } } });
+    expect(partialSizing.evaluate({ managementState: s }).status).toBe(CRITERION_STATUS.UNKNOWN);
   });
 });
 
-describe('partial timing', () => {
-  it('PASS when completed during the trigger session', () => {
-    const s = state({
-      partialTrigger: { triggered: true, dueDay: 3, dueSessionDate: '2026-03-05' },
-      partialCompletion: { completed: true, achievedPct: 50, timingOutcome: 'same_trigger_session', completionSessionDate: '2026-03-05' }
-    });
-    const r = partialTiming.evaluate({ criterion: timingCriterion, managementState: s });
-    expect(r.status).toBe(CRITERION_STATUS.PASS);
-    expect(r.scoring_value).toBe('same_trigger_session');
-  });
-
-  it('FAIL when completed later', () => {
-    const s = state({
-      partialTrigger: { triggered: true, dueDay: 3, dueSessionDate: '2026-03-05' },
-      partialCompletion: { completed: true, achievedPct: 50, timingOutcome: 'later_or_not_completed', completionSessionDate: '2026-03-08' }
-    });
-    expect(partialTiming.evaluate({ criterion: timingCriterion, managementState: s }).status).toBe(CRITERION_STATUS.FAIL);
+describe('no premature reduction (F4)', () => {
+  it('PASS with none, UNKNOWN with ambiguous, FAIL with discretionary', () => {
+    expect(prematureReduction.evaluate({ managementState: baseState() }).status).toBe(CRITERION_STATUS.PASS);
+    const ambiguous = baseState({ prematureReduction: { outcome: 'ambiguous', ambiguousQty: 40, boundarySessionDate: '2026-03-12' } });
+    expect(prematureReduction.evaluate({ managementState: ambiguous }).status).toBe(CRITERION_STATUS.UNKNOWN);
+    const discretionary = baseState({ prematureReduction: { outcome: 'discretionary', prematureQty: 40, prematureFraction: 0.2, boundarySessionDate: '2026-03-12' } });
+    const result = prematureReduction.evaluate({ managementState: discretionary });
+    expect(result.status).toBe(CRITERION_STATUS.FAIL);
+    expect(result.scoring_value).toBeCloseTo(0.2);
   });
 });
 
-describe('partial sizing', () => {
-  it('PASS within tolerance and FAIL outside it', () => {
-    const s = state({
-      partialTrigger: { triggered: true, dueDay: 3, dueSessionDate: '2026-03-05' },
-      partialCompletion: { completed: true, achievedPct: 48, timingOutcome: 'same_trigger_session' }
+describe('stop ratchet (F8)', () => {
+  it('UNKNOWN without stop history', () => {
+    expect(stopRatchet.evaluate({ criterion: { parameters: { downward_tolerance_ticks: 0 } }, managementState: baseState() }).status).toBe(CRITERION_STATUS.UNKNOWN);
+  });
+  it('UNKNOWN when a positive tolerance needs a missing tick', () => {
+    const s = baseState({
+      stopHistory: { available: true, modifications: [{ epoch: 1, price: 69 }, { epoch: 2, price: 68 }] },
+      tickSize: { known: false, tickSize: null }
     });
-    expect(partialSizing.evaluate({ criterion: sizingCriterion, managementState: s }).status).toBe(CRITERION_STATUS.PASS);
-
-    const far = state({
-      partialTrigger: { triggered: true, dueDay: 3, dueSessionDate: '2026-03-05' },
-      partialCompletion: { completed: true, achievedPct: 20, timingOutcome: 'same_trigger_session' }
-    });
-    expect(partialSizing.evaluate({ criterion: sizingCriterion, managementState: far }).status).toBe(CRITERION_STATUS.FAIL);
+    expect(stopRatchet.evaluate({ criterion: { parameters: { downward_tolerance_ticks: 1 } }, managementState: s }).status).toBe(CRITERION_STATUS.UNKNOWN);
   });
-});
-
-describe('no premature reduction', () => {
-  it('PASS with 0% premature and FAIL with >0%', () => {
-    const s = state({ prematureReduction: { prematureQty: 0, prematureFraction: 0, excludedQty: 0 } });
-    expect(prematureReduction.evaluate({ criterion: { key: 'no_premature_reduction', parameters: {} }, managementState: s }).status).toBe(CRITERION_STATUS.PASS);
-
-    const p = state({ prematureReduction: { prematureQty: 20, prematureFraction: 0.1, excludedQty: 0 } });
-    const r = prematureReduction.evaluate({ criterion: { key: 'no_premature_reduction', parameters: {} }, managementState: p });
-    expect(r.status).toBe(CRITERION_STATUS.FAIL);
-    expect(r.scoring_value).toBeCloseTo(0.1);
-  });
-
-  it('is UNKNOWN when Initial R is unavailable', () => {
-    const s = state({ initialR: { available: false } });
-    expect(prematureReduction.evaluate({ criterion: { key: 'no_premature_reduction', parameters: {} }, managementState: s }).status).toBe(CRITERION_STATUS.UNKNOWN);
-  });
-});
-
-describe('stop ratchet', () => {
-  it('UNKNOWN when no trustworthy stop history', () => {
-    const r = stopRatchet.evaluate({ criterion: ratchetCriterion, managementState: state() });
-    expect(r.status).toBe(CRITERION_STATUS.UNKNOWN);
-  });
-
-  it('FAIL when a real downward move exists in trustworthy history', () => {
-    const s = state({
-      stopHistory: {
-        available: true,
-        source: 'broker',
-        modifications: [
-          { epoch: 100, price: 69.3 },
-          { epoch: 200, price: 71.0 },
-          { epoch: 300, price: 70.5 }
-        ]
-      }
-    });
-    expect(stopRatchet.evaluate({ criterion: ratchetCriterion, managementState: s }).status).toBe(CRITERION_STATUS.FAIL);
-  });
-
-  it('PASS when the history is non-decreasing', () => {
-    const s = state({
-      stopHistory: {
-        available: true,
-        source: 'broker',
-        modifications: [
-          { epoch: 100, price: 69.3 },
-          { epoch: 200, price: 71.0 }
-        ]
-      }
-    });
-    expect(stopRatchet.evaluate({ criterion: ratchetCriterion, managementState: s }).status).toBe(CRITERION_STATUS.PASS);
+  it('FAIL on a downward move and PASS when non-decreasing (zero tolerance, no tick needed)', () => {
+    const down = baseState({ stopHistory: { available: true, modifications: [{ epoch: 1, price: 71 }, { epoch: 2, price: 70.5 }] } });
+    expect(stopRatchet.evaluate({ criterion: { parameters: { downward_tolerance_ticks: 0 } }, managementState: down }).status).toBe(CRITERION_STATUS.FAIL);
+    const up = baseState({ stopHistory: { available: true, modifications: [{ epoch: 1, price: 69 }, { epoch: 2, price: 71 }] } });
+    expect(stopRatchet.evaluate({ criterion: { parameters: { downward_tolerance_ticks: 0 } }, managementState: up }).status).toBe(CRITERION_STATUS.PASS);
   });
 });
 
 describe('post-partial breakeven', () => {
-  it('UNKNOWN without stop history', () => {
-    const s = state({
-      partialTrigger: { triggered: true, dueDay: 3, dueSessionDate: '2026-03-05' },
-      partialCompletion: { completed: true, completionTimeEpoch: 100 }
+  it('N/A on never_reached, UNKNOWN without stop history, PASS when reached', () => {
+    expect(breakevenProtection.evaluate({ managementState: baseState({ partialTrigger: { status: 'never_reached' } }) }).status).toBe(CRITERION_STATUS.NOT_APPLICABLE);
+    expect(breakevenProtection.evaluate({ managementState: baseState() }).status).toBe(CRITERION_STATUS.UNKNOWN);
+    const s = baseState({
+      partialCompletion: { ...baseState().partialCompletion, completionTimeEpoch: 100 },
+      stopHistory: { available: true, modifications: [{ epoch: 50, price: 90 }, { epoch: 150, price: 100 }] }
     });
-    expect(breakevenProtection.evaluate({ criterion: beCriterion, managementState: s }).status).toBe(CRITERION_STATUS.UNKNOWN);
-  });
-
-  it('PASS when the stop reaches the entry basis during the same session', () => {
-    const s = state({
-      partialTrigger: { triggered: true, dueDay: 3, dueSessionDate: '2026-03-05' },
-      partialCompletion: { completed: true, completionTimeEpoch: 100 },
-      stopHistory: {
-        available: true,
-        source: 'broker',
-        modifications: [
-          { epoch: 50, price: 90 },
-          { epoch: 150, price: 100 }
-        ]
-      },
-      be: { deadlineEpoch: 200, nextSessionCloseEpoch: 300 }
-    });
-    const r = breakevenProtection.evaluate({ criterion: beCriterion, managementState: s });
-    expect(r.status).toBe(CRITERION_STATUS.PASS);
-    expect(r.scoring_value).toBe('same_session_at_or_above_be');
+    expect(breakevenProtection.evaluate({ managementState: s }).status).toBe(CRITERION_STATUS.PASS);
   });
 });
 
-describe('trailing MA', () => {
-  it('UNKNOWN without a selected period', () => {
-    const r = trailingMA.evaluate({ criterion: trailingCriterion, managementState: state(), userInputs: {} });
-    expect(r.status).toBe(CRITERION_STATUS.UNKNOWN);
+describe('trailing MA (F5/F6)', () => {
+  const criterion = { parameters: { allowed_periods: [10, 20], execution_window_minutes: 30 } };
+
+  it('UNKNOWN when activation is unresolved, N/A when inactive, UNKNOWN when no period', () => {
+    expect(trailingMA.evaluate({ criterion, managementState: baseState({ trailing: { activation: 'explicit', active: false, activationResolved: false } }), userInputs: { trailing_ma_period: 20 } }).status).toBe(CRITERION_STATUS.UNKNOWN);
+    expect(trailingMA.evaluate({ criterion, managementState: baseState({ trailing: { activation: 'after_partial', active: false, activationResolved: true, inactiveReason: 'partial_never_triggered' } }), userInputs: { trailing_ma_period: 20 } }).status).toBe(CRITERION_STATUS.NOT_APPLICABLE);
+    expect(trailingMA.evaluate({ criterion, managementState: baseState(), userInputs: {} }).status).toBe(CRITERION_STATUS.UNKNOWN);
   });
 
-  it('NOT_APPLICABLE when superseded by a protective-stop exit before the signal', () => {
-    const s = state({
-      daily: { authoritative: true, bars: [], entryIndex: 2 },
-      trailing: { selectedPeriod: 20, signal: null, superseded: true, supersededReason: 'position closed before signal', execution: null }
-    });
-    const r = trailingMA.evaluate({ criterion: trailingCriterion, managementState: s, userInputs: { trailing_ma_period: 20 } });
-    expect(r.status).toBe(CRITERION_STATUS.NOT_APPLICABLE);
+  it('N/A for a proven protective supersession, UNKNOWN for an ambiguous one', () => {
+    const protective = baseState({ trailing: { ...baseState().trailing, signal: null, supersession: { outcome: 'superseded_protective' } } });
+    expect(trailingMA.evaluate({ criterion, managementState: protective, userInputs: { trailing_ma_period: 20 } }).status).toBe(CRITERION_STATUS.NOT_APPLICABLE);
+    const ambiguous = baseState({ trailing: { ...baseState().trailing, signal: null, supersession: { outcome: 'superseded_ambiguous' } } });
+    expect(trailingMA.evaluate({ criterion, managementState: ambiguous, userInputs: { trailing_ma_period: 20 } }).status).toBe(CRITERION_STATUS.UNKNOWN);
   });
 
-  it('PASS when exited within the window and FAIL otherwise', () => {
-    const signal = { sessionIndex: 4, date: '2026-03-06', close: 99, sma: 100 };
-    const pass = state({
-      daily: { authoritative: true, bars: [], entryIndex: 2 },
-      trailing: { selectedPeriod: 20, signal, superseded: false, execution: { outcome: 'within_window' } }
-    });
-    expect(trailingMA.evaluate({ criterion: trailingCriterion, managementState: pass, userInputs: { trailing_ma_period: 20 } }).status).toBe(CRITERION_STATUS.PASS);
-
-    const fail = state({
-      daily: { authoritative: true, bars: [], entryIndex: 2 },
-      trailing: { selectedPeriod: 20, signal, superseded: false, execution: { outcome: 'later_or_ignored' } }
-    });
-    const r = trailingMA.evaluate({ criterion: trailingCriterion, managementState: fail, userInputs: { trailing_ma_period: 20 } });
-    expect(r.status).toBe(CRITERION_STATUS.FAIL);
-    expect(r.scoring_value).toBe('later_or_ignored');
+  it('PASS within window and FAIL otherwise', () => {
+    const signal = { sessionIndex: 4, date: '2026-03-13', close: 99, sma: 100 };
+    const pass = baseState({ trailing: { ...baseState().trailing, signal, execution: { outcome: 'within_window' } } });
+    expect(trailingMA.evaluate({ criterion, managementState: pass, userInputs: { trailing_ma_period: 20 } }).status).toBe(CRITERION_STATUS.PASS);
+    const fail = baseState({ trailing: { ...baseState().trailing, signal, execution: { outcome: 'later_or_ignored' } } });
+    const result = trailingMA.evaluate({ criterion, managementState: fail, userInputs: { trailing_ma_period: 20 } });
+    expect(result.status).toBe(CRITERION_STATUS.FAIL);
+    expect(result.scoring_value).toBe('later_or_ignored');
   });
 });

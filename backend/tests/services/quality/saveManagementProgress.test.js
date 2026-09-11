@@ -205,6 +205,45 @@ describe('saveManagementProgress — CAS (Setup + Entry + trailing MA)', () => {
   });
 });
 
+describe('saveManagementProgress — trailing phase immutability (F6)', () => {
+  test('establishes the trailing phase once with honest post-trade provenance', async () => {
+    installSuccessfulUpdate();
+    await evaluationService.saveManagementProgress('eval-1', 'user-1', passingManagementPayload({
+      trailingPhase: { mode: 'establish', value: 'activated' }
+    }));
+    expect(updateParams[4].trailing_phase).toBe('activated');
+    expect(updateParams[4].immutable_semantic_context.trailing_phase).toEqual(
+      expect.objectContaining({ value: 'activated', source: 'user_asserted', timing: 'post_trade', asserted_at: expect.any(String) })
+    );
+    expect(updateParams).toHaveLength(13);
+    expect(updateSql).toContain("COALESCE(user_inputs->>'trailing_phase', '') = ''");
+  });
+
+  test('rejects a conflicting phase assertion (TRAILING_PHASE_IMMUTABLE)', async () => {
+    db.query.mockResolvedValueOnce({
+      rows: [lookupRow({ user_inputs: { leader_confirmed: true, trailing_phase: 'not_activated' } })]
+    });
+    await expect(
+      evaluationService.saveManagementProgress('eval-1', 'user-1', passingManagementPayload({
+        trailingPhase: { mode: 'establish', value: 'activated' }
+      }))
+    ).rejects.toMatchObject({ code: 'TRAILING_PHASE_IMMUTABLE' });
+    expect(db.query).toHaveBeenCalledTimes(1);
+  });
+
+  test('preserve binds $14 for the phase when no trailing MA is preserved', async () => {
+    installSuccessfulUpdate({
+      row: lookupRow({ user_inputs: { leader_confirmed: true, trailing_phase: 'activated' } })
+    });
+    await evaluationService.saveManagementProgress('eval-1', 'user-1', passingManagementPayload({
+      trailingPhase: { mode: 'preserve', value: 'activated' }
+    }));
+    expect(updateSql).toContain("user_inputs->>'trailing_phase', '') = $14");
+    expect(updateParams).toHaveLength(14);
+    expect(updateParams[13]).toBe('activated');
+  });
+});
+
 describe('saveManagementProgress — SQL placeholder/parameter parity', () => {
   test('mode none: highest $N equals params.length', async () => {
     installSuccessfulUpdate();

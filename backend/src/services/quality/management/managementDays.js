@@ -1,6 +1,6 @@
 'use strict';
 
-// Management day count and cumulative MFE-in-R helpers
+// Management day count, cumulative MFE-in-R, and partial-trigger maturity
 // (docs/QUALITY_PROFILES_REQUIREMENT.md sections 34, 35, 36).
 //
 // Pure functions; no database access. Session sequencing is EXACT: management
@@ -9,15 +9,22 @@
 //   Day 1 = the session containing the initial entry (entryIndex).
 //   Day N = bars[entryIndex + (N - 1)].
 //
-// A "session" is one normalized daily bar. Weekends and exchange holidays never
-// appear as bars, so they can never increment the management day count.
+// Point-in-time discipline (hardening):
+//   - Day 1's high must only include price evidence observable AFTER the actual
+//     initial-entry timestamp. The orchestrator supplies the post-entry Day-1
+//     high (intraday-derived or, when the entry is at/after the open, the
+//     completed daily bar). Day 1 is never assumed to equal the daily high.
+//   - Days 2..latest are fully after the entry session, so their daily high is
+//     valid for "highest since entry".
+//   - Trigger maturity is explicit: `never_reached` is only valid once every
+//     required regular session through latest_day has completed; before that
+//     the trigger is `pending`.
 
 function isFiniteNumber(value) {
   return typeof value === 'number' && Number.isFinite(value);
 }
 
 // One-based management day for a session index relative to the entry index.
-// Returns null when the session is before the entry session.
 function managementDayForSession(entryIndex, sessionIndex) {
   if (!Number.isInteger(entryIndex) || !Number.isInteger(sessionIndex) || sessionIndex < entryIndex) {
     return null;
@@ -26,118 +33,250 @@ function managementDayForSession(entryIndex, sessionIndex) {
 }
 
 /**
- * Cumulative MFE (highest price since entry) in R for each management day up to
- * `maxDay`. MFE is cumulative and never resets by session.
+ * Builds raw per-day evidence from normalized daily bars. Day 1 is flagged
+ * `requiresEntryAdjustment` because its daily high includes pre-entry action;
+ * the orchestrator must replace it with post-entry evidence before trigger
+ * resolution.
  *
  * @param {object} params
- * @param {Array} params.bars - normalized daily bars (ascending by date).
- * @param {number} params.entryIndex - index of the entry session bar.
- * @param {number} params.entryBasis - immutable entry basis.
- * @param {number} params.rPerShare - immutable R per share (> 0).
- * @param {number} [params.maxDay=5] - inclusive upper management day.
- * @returns {Array<{day, sessionDate, sessionIndex, high, mfeR}>} one entry per
- *   management day present in the bars, cumulatively increasing mfeR.
+ * @param {Array} params.bars - normalized daily bars (ascending).
+ * @param {number} params.entryIndex - entry session bar index.
+ * @param {number} params.latestDay - inclusive upper management day.
+ * @param {Function} params.isSessionCompleted - sessionDate -> boolean.
+ * @returns {Array<object>}
  */
-function cumulativeMfeInR({ bars, entryIndex, entryBasis, rPerShare, maxDay = 5 }) {
-  if (!Array.isArray(bars) || !Number.isInteger(entryIndex) || entryIndex < 0) return [];
-  if (!isFiniteNumber(entryBasis) || !isFiniteNumber(rPerShare) || rPerShare <= 0) return [];
-  if (!Number.isInteger(maxDay) || maxDay < 1) return [];
-
-  const rows = [];
-  let highest = -Infinity;
-  for (let day = 1; day <= maxDay; day += 1) {
+function buildDayEvidence({ bars, entryIndex, latestDay, isSessionCompleted }) {
+  const days = [];
+  if (!Array.isArray(bars) || !Number.isInteger(entryIndex) || entryIndex < 0) return days;
+  for (let day = 1; day <= latestDay; day += 1) {
     const sessionIndex = entryIndex + (day - 1);
     if (sessionIndex >= bars.length) break;
     const bar = bars[sessionIndex];
-    highest = highest === -Infinity ? bar.high : Math.max(highest, bar.high);
-    rows.push({
+    const completed = typeof isSessionCompleted === 'function'
+      ? isSessionCompleted(bar.date) === true
+      : false;
+    days.push({
       day,
-      sessionDate: bar.date,
       sessionIndex,
-      high: bar.high,
-      highestSinceEntry: highest,
-      mfeR: (highest - entryBasis) / rPerShare
+      sessionDate: bar.date,
+      // Whole-session high; valid for "highest since entry" only for day >= 2.
+      high: isFiniteNumber(bar.high) ? bar.high : null,
+      highKnown: isFiniteNumber(bar.high),
+      source: 'daily_bar',
+      precision: 'daily_bar',
+      sessionCompleted: completed,
+      requiresEntryAdjustment: day === 1,
+      // Set by the orchestrator for day 1 when post-entry evidence is missing
+      // but the daily upper bound already proves/denies a possible crossing.
+      possibleX: false
     });
   }
-  return rows;
+  return days;
 }
 
 /**
- * Resolves the canonical partial trigger (section 36).
- *
- *   - cumulative MFE reaches >= minimum_mfe_r before earliest_day -> partial
- *     becomes due on earliest_day (no second touch required);
- *   - first reaches >= minimum_mfe_r on earliest_day..latest_day -> due that
- *     same session;
- *   - first reaches on latest_day+1 or later -> no canonical partial trigger;
- *   - never reaches through latest_day -> no trigger.
+ * Resolves the canonical partial trigger with point-in-time precision and
+ * explicit observation maturity.
  *
  * @param {object} params
- * @param {Array} params.bars - normalized daily bars.
- * @param {number} params.entryIndex
+ * @param {Array} params.dayEvidence - day 1..latest_day with adjusted high.
  * @param {number} params.entryBasis
  * @param {number} params.rPerShare
  * @param {object} params.parameters - { earliest_day, latest_day, minimum_mfe_r }.
- * @returns {object|null} trigger info or null when unavailable/no-trigger:
- *   { triggered, dueDay, dueSessionDate, dueSessionIndex, firstReachDay,
- *     firstReachSessionDate, reachedEarly, mfeByDay }
+ * @returns {object} trigger state:
+ *   { status: 'triggered'|'never_reached'|'pending'|'insufficient_evidence',
+ *     crossed, triggered, dueDay, dueSessionIndex, dueSessionDate,
+ *     dueSessionCompleted, firstReachDay, firstReachSessionIndex,
+ *     firstReachSessionDate, reachedEarly, horizonComplete, observedDays,
+ *     day1Uncertain, reason, mfeByDay }
  */
-function resolvePartialTrigger({ bars, entryIndex, entryBasis, rPerShare, parameters }) {
+function resolvePartialTrigger({ dayEvidence, entryBasis, rPerShare, parameters }) {
   const earliestDay = parameters ? parameters.earliest_day : null;
   const latestDay = parameters ? parameters.latest_day : null;
   const minimumMfeR = parameters ? parameters.minimum_mfe_r : null;
 
+  const base = {
+    crossed: false,
+    triggered: false,
+    dueDay: null,
+    dueSessionIndex: null,
+    dueSessionDate: null,
+    dueSessionCompleted: false,
+    firstReachDay: null,
+    firstReachSessionIndex: null,
+    firstReachSessionDate: null,
+    reachedEarly: false,
+    horizonComplete: false,
+    observedDays: 0,
+    day1Uncertain: false,
+    reason: null,
+    mfeByDay: []
+  };
+
   if (!Number.isInteger(earliestDay) || !Number.isInteger(latestDay) || earliestDay < 1 || latestDay < earliestDay) {
-    return { triggered: false, dueDay: null, reason: 'partial_trigger_parameters_invalid', mfeByDay: [] };
+    return { ...base, status: 'insufficient_evidence', reason: 'partial_trigger_parameters_invalid' };
   }
-  if (!isFiniteNumber(minimumMfeR) || minimumMfeR <= 0) {
-    return { triggered: false, dueDay: null, reason: 'partial_trigger_parameters_invalid', mfeByDay: [] };
+  if (!isFiniteNumber(minimumMfeR) || minimumMfeR <= 0 || !isFiniteNumber(entryBasis) || !isFiniteNumber(rPerShare) || rPerShare <= 0) {
+    return { ...base, status: 'insufficient_evidence', reason: 'partial_trigger_parameters_invalid' };
+  }
+  if (!Array.isArray(dayEvidence) || dayEvidence.length === 0) {
+    return { ...base, status: 'pending', reason: 'no_observed_sessions' };
   }
 
-  const mfeByDay = cumulativeMfeInR({ bars, entryIndex, entryBasis, rPerShare, maxDay: latestDay });
-
+  const thresholdPrice = entryBasis + minimumMfeR * rPerShare;
+  // Only sessions within the configured partial window participate.
+  const scoped = dayEvidence.filter((day) => Number.isInteger(day.day) && day.day <= latestDay);
+  const mfeByDay = [];
+  let highest = -Infinity;
   let firstReachDay = null;
-  let firstReachSessionDate = null;
-  for (const row of mfeByDay) {
-    if (row.mfeR >= minimumMfeR) {
-      firstReachDay = row.day;
-      firstReachSessionDate = row.sessionDate;
-      break;
+
+  for (const day of scoped) {
+    if (day.highKnown && isFiniteNumber(day.high)) {
+      highest = highest === -Infinity ? day.high : Math.max(highest, day.high);
+    }
+    const mfeR = highest === -Infinity ? null : (highest - entryBasis) / rPerShare;
+    mfeByDay.push({
+      day: day.day,
+      sessionDate: day.sessionDate,
+      high: day.high,
+      highKnown: day.highKnown === true,
+      source: day.source || null,
+      precision: day.precision || null,
+      mfeR
+    });
+    if (firstReachDay === null && day.highKnown && isFiniteNumber(day.high) && highest >= thresholdPrice) {
+      firstReachDay = day.day;
     }
   }
 
-  if (firstReachDay === null) {
-    return {
-      triggered: false,
-      dueDay: null,
-      dueSessionDate: null,
-      dueSessionIndex: null,
-      firstReachDay: null,
-      firstReachSessionDate: null,
-      reachedEarly: false,
-      reason: 'never_reached_minimum_mfe',
+  // Leading contiguous completed sessions.
+  let observedDays = 0;
+  for (const day of scoped) {
+    if (day.sessionCompleted) observedDays = day.day;
+    else break;
+  }
+  const horizonComplete = observedDays >= latestDay;
+
+  const day1 = scoped.find((day) => day.day === 1);
+  const day1Uncertain =
+    !!day1 && day1.highKnown !== true && day1.possibleX === true;
+  const anyUnknownHigh = scoped.some(
+    (day) => day.highKnown !== true && day.possibleX !== true
+  );
+
+  if (firstReachDay !== null) {
+    const firstDay = scoped.find((day) => day.day === firstReachDay);
+    const reachedEarly = firstReachDay < earliestDay;
+    const dueDay = reachedEarly ? earliestDay : firstReachDay;
+    const dueEntry = scoped.find((day) => day.day === dueDay);
+
+    const result = {
+      ...base,
+      crossed: true,
+      reachedEarly,
+      firstReachDay,
+      firstReachSessionIndex: firstDay ? firstDay.sessionIndex : null,
+      firstReachSessionDate: firstDay ? firstDay.sessionDate : null,
+      dueDay,
+      dueSessionIndex: dueEntry ? dueEntry.sessionIndex : null,
+      dueSessionDate: dueEntry ? dueEntry.sessionDate : null,
+      dueSessionCompleted: !!(dueEntry && dueEntry.sessionCompleted),
+      horizonComplete,
+      observedDays,
+      day1Uncertain,
       mfeByDay
     };
+
+    if (day1Uncertain && firstReachDay > earliestDay) {
+      // The true first crossing could be Day 1 (unknown) or firstReachDay, so
+      // the due session cannot be established honestly. When firstReachDay is
+      // at or before earliest_day the due session is earliest_day either way,
+      // so no ambiguity exists.
+      return { ...result, status: 'insufficient_evidence', reason: 'day1_post_entry_evidence_unavailable' };
+    }
+    if (!dueEntry || !dueEntry.sessionCompleted) {
+      // The partial is due on a session that has not completed yet.
+      return { ...result, status: 'pending', reason: 'due_session_not_observed' };
+    }
+    return { ...result, status: 'triggered', triggered: true, reason: null };
   }
 
-  const reachedEarly = firstReachDay < earliestDay;
-  const dueDay = reachedEarly ? earliestDay : firstReachDay;
+  const common = { ...base, horizonComplete, observedDays, day1Uncertain, mfeByDay };
+  if (!horizonComplete) {
+    return { ...common, status: 'pending', reason: 'horizon_not_elapsed' };
+  }
+  if (day1Uncertain || anyUnknownHigh) {
+    return { ...common, status: 'insufficient_evidence', reason: 'incomplete_point_in_time_evidence' };
+  }
+  return { ...common, status: 'never_reached', reason: 'never_reached_minimum_mfe' };
+}
 
-  return {
-    triggered: true,
-    dueDay,
-    dueSessionIndex: entryIndex + (dueDay - 1),
-    dueSessionDate: mfeByDay[dueDay - 1] ? mfeByDay[dueDay - 1].sessionDate : null,
-    firstReachDay,
-    firstReachSessionDate,
-    reachedEarly,
-    reason: null,
-    mfeByDay
-  };
+/**
+ * Finds the first moment within a session's intraday bars at which the
+ * cumulative highest-since-entry reaches `thresholdPrice`. Only bars whose
+ * interval OPEN is at/after the entry (for the entry session) and within the
+ * regular session are considered; an observed execution print may also
+ * establish the crossing.
+ *
+ * @returns {{crossed:boolean, epoch:(number|null), price:(number|null),
+ *   precision:(string|null), source:(string|null), reason:(string|null)}}
+ */
+function findCrossingInSession({
+  bars,
+  priorHighest,
+  thresholdPrice,
+  entryEpoch,
+  sessionOpenEpoch,
+  sessionCloseEpoch,
+  observations = []
+}) {
+  let highest = isFiniteNumber(priorHighest) ? priorHighest : -Infinity;
+  const scoped = (bars || [])
+    .filter((bar) => isFiniteNumber(bar.time))
+    .filter((bar) => !isFiniteNumber(sessionOpenEpoch) || bar.time >= sessionOpenEpoch)
+    .filter((bar) => !isFiniteNumber(sessionCloseEpoch) || bar.time < sessionCloseEpoch)
+    .filter((bar) => !isFiniteNumber(entryEpoch) || bar.time >= entryEpoch)
+    .sort((a, b) => a.time - b.time);
+
+  const obs = (observations || [])
+    .filter((o) => isFiniteNumber(o.epoch) && isFiniteNumber(o.price) && o.price > 0)
+    // Point-in-time: an execution print may only establish a crossing when it
+    // is observable within this regular session and (for Day 1) at/after the
+    // actual entry. Entry-day prints must never establish a later-day crossing.
+    .filter((o) => !isFiniteNumber(sessionOpenEpoch) || o.epoch >= sessionOpenEpoch)
+    .filter((o) => !isFiniteNumber(sessionCloseEpoch) || o.epoch < sessionCloseEpoch)
+    .filter((o) => !isFiniteNumber(entryEpoch) || o.epoch >= entryEpoch)
+    .sort((a, b) => a.epoch - b.epoch);
+
+  let obsIndex = 0;
+  for (const bar of scoped) {
+    while (obsIndex < obs.length && obs[obsIndex].epoch <= bar.time) {
+      highest = Math.max(highest, obs[obsIndex].price);
+      if (highest >= thresholdPrice) {
+        return { crossed: true, epoch: obs[obsIndex].epoch, price: obs[obsIndex].price, precision: 'execution_print', source: 'executions_jsonb', reason: null };
+      }
+      obsIndex += 1;
+    }
+    if (isFiniteNumber(bar.high)) {
+      highest = Math.max(highest, bar.high);
+      if (highest >= thresholdPrice) {
+        return { crossed: true, epoch: bar.time, price: bar.high, precision: '1min_bar', source: 'intraday_cache', reason: null };
+      }
+    }
+  }
+  while (obsIndex < obs.length) {
+    highest = Math.max(highest, obs[obsIndex].price);
+    if (highest >= thresholdPrice) {
+      return { crossed: true, epoch: obs[obsIndex].epoch, price: obs[obsIndex].price, precision: 'execution_print', source: 'executions_jsonb', reason: null };
+    }
+    obsIndex += 1;
+  }
+  return { crossed: false, epoch: null, price: null, precision: null, source: null, reason: null };
 }
 
 module.exports = {
   managementDayForSession,
-  cumulativeMfeInR,
-  resolvePartialTrigger
+  buildDayEvidence,
+  resolvePartialTrigger,
+  findCrossingInSession
 };

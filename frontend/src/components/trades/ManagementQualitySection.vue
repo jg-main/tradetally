@@ -80,6 +80,43 @@
         than a fabricated PASS/FAIL.
       </p>
 
+      <!-- Trailing phase activation -->
+      <div v-if="requiresActivationAssertion" class="mb-3 rounded-md bg-gray-50 px-3 py-2 dark:bg-gray-800">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-medium text-gray-700 dark:text-gray-300">Trailing phase activated?</span>
+          <span class="px-2 inline-flex text-xs font-semibold rounded-full bg-purple-100 text-purple-800 dark:bg-purple-900/20 dark:text-purple-400">
+            User asserted (post-trade)
+          </span>
+        </div>
+        <div v-if="phaseLocked" class="mt-2" data-testid="mgmt-phase-locked">
+          <span class="rounded-md border border-gray-300 bg-gray-100 px-2 py-1 text-xs font-semibold text-gray-800 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200">
+            {{ trailingPhase === 'activated' ? 'Activated' : 'Not activated' }}
+          </span>
+        </div>
+        <select
+          v-else
+          v-model="trailingPhase"
+          class="mt-2 rounded-md border border-gray-300 bg-white px-2 py-1 text-xs text-gray-800 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200"
+          data-testid="mgmt-phase-select"
+        >
+          <option value="">Select…</option>
+          <option value="activated">Activated</option>
+          <option value="not_activated">Not activated</option>
+        </select>
+        <p class="mt-1 text-[10px] text-gray-400">
+          The trailing phase is applicable only if it activated. If it never activated, the trailing MA
+          exit is NOT_APPLICABLE and no MA selection is required.
+        </p>
+      </div>
+      <p
+        v-else-if="trailingActivation === 'after_partial'"
+        class="mb-3 text-[11px] text-gray-500 dark:text-gray-400"
+        data-testid="mgmt-activation-after-partial"
+      >
+        Trailing phase activates only after the canonical partial is completed; a close below the MA
+        before activation is irrelevant.
+      </p>
+
       <!-- Trailing MA selection -->
       <div v-if="requiresTrailingMa" class="mb-3 rounded-md bg-gray-50 px-3 py-2 dark:bg-gray-800">
         <div class="flex items-center justify-between">
@@ -203,6 +240,7 @@ const store = useQualityManagementStore()
 const prepared = ref(null)
 const evaluation = ref(null)
 const trailingPeriod = ref('')
+const trailingPhase = ref('')
 
 const CRITERION_LABELS = {
   partial_timing: 'Partial Timing',
@@ -277,9 +315,38 @@ const trailingLocked = computed(() => {
   return !!(detected && detected.management && detected.management.trailing_ma && detected.management.trailing_ma.value)
 })
 
+const trailingActivation = computed(() => {
+  if (prepared.value && prepared.value.policy && prepared.value.policy.trailingActivation) {
+    return prepared.value.policy.trailingActivation
+  }
+  const evidence = evaluation.value?.evidence_snapshot?.management
+  return (evidence && evidence.policy && evidence.policy.trailing_activation) || null
+})
+
+const requiresActivationAssertion = computed(() => trailingActivation.value === 'explicit')
+
+const phaseLocked = computed(() => {
+  const prep = prepared.value && prepared.value.trailingMa
+  if (prep && prep.phaseEstablished) return true
+  const inputs = evaluation.value && evaluation.value.user_inputs
+  if (inputs && (inputs.trailing_phase === 'activated' || inputs.trailing_phase === 'not_activated')) return true
+  const detected = evaluation.value && evaluation.value.detected_context
+  return !!(detected && detected.management && detected.management.trailing_phase && detected.management.trailing_phase.value)
+})
+
+const phaseNotActivated = computed(() => trailingPhase.value === 'not_activated')
+
 const canEvaluate = computed(() => {
   if (!entryReady.value) return false
-  if (requiresTrailingMa.value && !trailingLocked.value && !trailingPeriod.value) return false
+  if (requiresActivationAssertion.value && !phaseLocked.value && !trailingPhase.value) return false
+  if (
+    requiresTrailingMa.value &&
+    !trailingLocked.value &&
+    !trailingPeriod.value &&
+    !phaseNotActivated.value
+  ) {
+    return false
+  }
   return true
 })
 
@@ -338,27 +405,32 @@ function hydrateFromEvaluation(value) {
   const inputs = value.user_inputs || {}
   if (typeof inputs.trailing_ma_period === 'number' && inputs.trailing_ma_period) {
     trailingPeriod.value = inputs.trailing_ma_period
-    return
+  }
+  if (inputs.trailing_phase === 'activated' || inputs.trailing_phase === 'not_activated') {
+    trailingPhase.value = inputs.trailing_phase
   }
   const detected = value.detected_context
-  if (detected && detected.management && detected.management.trailing_ma) {
+  if (!trailingPeriod.value && detected && detected.management && detected.management.trailing_ma) {
     trailingPeriod.value = detected.management.trailing_ma.value
+  }
+  if (!trailingPhase.value && detected && detected.management && detected.management.trailing_phase) {
+    trailingPhase.value = detected.management.trailing_phase.value
   }
 }
 
 function hydrateFromPrepared(value) {
   if (value.trailingMa && value.trailingMa.established) {
     trailingPeriod.value = value.trailingMa.value
-    return
+  }
+  if (value.trailingMa && value.trailingMa.phase) {
+    trailingPhase.value = value.trailingMa.phase
   }
   const inputs = value.evaluation && value.evaluation.user_inputs
-  if (inputs && typeof inputs.trailing_ma_period === 'number') {
+  if (!trailingPeriod.value && inputs && typeof inputs.trailing_ma_period === 'number') {
     trailingPeriod.value = inputs.trailing_ma_period
-    return
   }
-  const detected = value.evaluation && value.evaluation.detected_context
-  if (detected && detected.management && detected.management.trailing_ma) {
-    trailingPeriod.value = detected.management.trailing_ma.value
+  if (!trailingPhase.value && inputs && (inputs.trailing_phase === 'activated' || inputs.trailing_phase === 'not_activated')) {
+    trailingPhase.value = inputs.trailing_phase
   }
 }
 
@@ -382,7 +454,10 @@ async function runEvaluate() {
     return
   }
   const userInputs = {}
-  if (requiresTrailingMa.value) userInputs.trailing_ma_period = trailingPeriod.value
+  if (requiresActivationAssertion.value && trailingPhase.value) userInputs.trailing_phase = trailingPhase.value
+  if (requiresTrailingMa.value && trailingPeriod.value && !phaseNotActivated.value) {
+    userInputs.trailing_ma_period = trailingPeriod.value
+  }
   try {
     const payload = await store.evaluate(props.trade.id, { evaluationId, userInputs })
     evaluation.value = payload.evaluation

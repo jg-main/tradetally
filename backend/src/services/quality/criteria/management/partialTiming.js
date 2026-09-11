@@ -2,23 +2,26 @@
 
 // Partial Timing criterion (docs/QUALITY_PROFILES_REQUIREMENT.md section 38).
 //
-// Timing is evaluated against the canonical partial trigger (sections 36):
+// Timing is evaluated against the canonical partial trigger (section 36):
 //   completed during trigger session        -> same_trigger_session (100)
 //   completed next regular session          -> next_session (50)
 //   later / not completed                   -> later_or_not_completed (0)
 //
-// Compliance requires completion during the trigger session. The criterion is
-// NOT_APPLICABLE when the partial rule never triggered (+1R never reached by
-// latest_day) and UNKNOWN when Initial R / daily evidence / fills are missing.
+// Compliance requires completion within the configured completion window.
+// NOT_APPLICABLE only when the configured partial window has actually elapsed
+// without a trigger (or a PROVEN protective-stop exit superseded the partial);
+// a pending/insufficient horizon is UNKNOWN, never NOT_APPLICABLE.
 
 const { CRITERION_STATUS } = require('../../constants');
 const { unknownResult, notApplicableResult } = require('./common');
 
-function evaluate({ criterion = {}, managementState = {} }) {
+function evaluate({ managementState = {} }) {
   const initialR = managementState.initialR || {};
   const daily = managementState.daily || {};
+  const policy = managementState.policy || {};
   const partialTrigger = managementState.partialTrigger || {};
   const partialCompletion = managementState.partialCompletion || {};
+  const partialExit = managementState.partialExit || {};
 
   if (!initialR.available) {
     return unknownResult(
@@ -32,16 +35,47 @@ function evaluate({ criterion = {}, managementState = {} }) {
       { daily_authoritative: false, daily_reason: daily.reason || null }
     );
   }
-  if (!partialTrigger.triggered || partialTrigger.supersededByExit) {
+  if (!policy.partialTrigger || !policy.completionWindow) {
+    return unknownResult(
+      'No explicit partial-trigger/completion-window policy is configured for this profile version; Partial Timing is UNKNOWN.',
+      { policy_available: policy.available || null }
+    );
+  }
+
+  if (partialExit.outcome === 'superseded_protective') {
     return notApplicableResult(
-      partialTrigger.supersededByExit
-        ? 'The position was fully closed before the partial became due; the partial rule is NOT_APPLICABLE.'
-        : 'Cumulative MFE never reached the configured minimum through the partial window; the partial rule is NOT_APPLICABLE.',
-      {
-        first_reach_day: partialTrigger.firstReachDay || null,
-        reason: partialTrigger.supersededByExit ? 'superseded_by_exit' : partialTrigger.reason || 'never_reached_minimum_mfe',
-        mfe_by_day: partialTrigger.mfeByDay || []
-      }
+      'A proven protective-stop exit closed the position before the partial became due; Partial Timing is NOT_APPLICABLE.',
+      { reason: 'superseded_protective', close_session: partialExit.closeSessionDate || null }
+    );
+  }
+  if (partialExit.outcome === 'superseded_discretionary') {
+    return {
+      status: CRITERION_STATUS.FAIL,
+      scoring_value: 'later_or_not_completed',
+      raw_value: 'superseded_discretionary',
+      evidence: { reason: 'superseded_discretionary', close_session: partialExit.closeSessionDate || null },
+      message: 'The position was fully closed before the partial became due without evidence of a protective stop.'
+    };
+  }
+  if (partialExit.outcome === 'superseded_ambiguous') {
+    return unknownResult(
+      'The position was fully closed before the partial became due and TradeTally cannot classify the exit as protective; Partial Timing is UNKNOWN.',
+      { reason: 'superseded_ambiguous', close_session: partialExit.closeSessionDate || null }
+    );
+  }
+
+  if (partialTrigger.status === 'never_reached') {
+    return notApplicableResult(
+      'Cumulative MFE never reached the configured minimum through the partial window; the partial rule is NOT_APPLICABLE.',
+      { reason: partialTrigger.reason || 'never_reached_minimum_mfe', mfe_by_day: partialTrigger.mfeByDay || [] }
+    );
+  }
+  if (partialTrigger.status !== 'triggered') {
+    return unknownResult(
+      partialTrigger.status === 'pending'
+        ? 'The partial window has not yet fully elapsed (the trigger is pending); Partial Timing is UNKNOWN.'
+        : 'The point-in-time +1R trigger could not be established from trustworthy evidence; Partial Timing is UNKNOWN.',
+      { trigger_status: partialTrigger.status, reason: partialTrigger.reason || null }
     );
   }
   if (!managementState.fills || !managementState.fills.available) {
@@ -50,27 +84,39 @@ function evaluate({ criterion = {}, managementState = {} }) {
       { partial_trigger_due_session: partialTrigger.dueSessionDate || null }
     );
   }
+  if (partialCompletion.rounding && partialCompletion.rounding.resolved === false) {
+    return unknownResult(
+      'The required partial quantity could not be resolved without fabricating a tradable unit; Partial Timing is UNKNOWN.',
+      { rounding_reason: partialCompletion.rounding.reason || null }
+    );
+  }
 
+  const windowSessions = policy.completionWindow.sessions;
+  const completed = partialCompletion.completed === true;
+  const sessionsLate = partialCompletion.sessionsAfterTrigger;
+  const withinWindow = completed && Number.isInteger(sessionsLate) && sessionsLate <= windowSessions;
   const outcome = partialCompletion.timingOutcome || 'later_or_not_completed';
-  const passed = outcome === 'same_trigger_session';
 
   return {
-    status: passed ? CRITERION_STATUS.PASS : CRITERION_STATUS.FAIL,
+    status: withinWindow ? CRITERION_STATUS.PASS : CRITERION_STATUS.FAIL,
     scoring_value: outcome,
     raw_value: outcome,
     evidence: {
       partial_trigger_due_session: partialTrigger.dueSessionDate || null,
       partial_trigger_due_day: partialTrigger.dueDay || null,
       first_reach_day: partialTrigger.firstReachDay || null,
-      completion_session: partialCompletion.completionSessionDate || null,
-      completion_time: partialCompletion.completionTimeEpoch
-        ? new Date(partialCompletion.completionTimeEpoch * 1000).toISOString()
+      trigger_crossing_time: partialTrigger.crossing && partialTrigger.crossing.epoch
+        ? new Date(partialTrigger.crossing.epoch * 1000).toISOString()
         : null,
+      trigger_crossing_precision: partialTrigger.crossing ? partialTrigger.crossing.precision : null,
+      completion_session: partialCompletion.completionSessionDate || null,
+      sessions_after_trigger: sessionsLate,
+      completion_window_sessions: windowSessions,
       timing_outcome: outcome
     },
-    message: passed
-      ? `The 50% partial was completed during the trigger session ${partialTrigger.dueSessionDate}.`
-      : `The 50% partial was not completed during the trigger session (outcome: ${outcome}).`
+    message: withinWindow
+      ? `The partial was completed within the configured completion window (${sessionsLate} session(s) after the trigger).`
+      : `The partial was not completed within the configured completion window (outcome: ${outcome}).`
   };
 }
 

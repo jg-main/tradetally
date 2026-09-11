@@ -172,6 +172,7 @@ describe('Canonical BO seed configuration', () => {
     expect(byKey.trailing_ma.parameters.allowed_periods).toEqual([10, 20]);
     expect(byKey.trailing_ma.parameters.exit_signal).toBe('first_daily_close_below_selected_ma');
     expect(byKey.trailing_ma.parameters.execution_window_minutes).toBe(30);
+    expect(byKey.trailing_ma.parameters.activation).toBe('after_partial');
   });
 
   it('returns an editable deep copy that never mutates the frozen canonical default', () => {

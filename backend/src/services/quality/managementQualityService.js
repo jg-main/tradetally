@@ -1,32 +1,22 @@
 'use strict';
 
 // Management Quality orchestration service (Phase 4 of
-// docs/QUALITY_PROFILES_REQUIREMENT.md, sections 33-46, 49, 57, 63).
+// docs/QUALITY_PROFILES_REQUIREMENT.md, sections 33-46, 49, 57, 63; hardened).
 //
-// Prepare -> Select trailing MA -> Evaluate -> Finalize workflow:
-//   - prepare(): operates on an EXISTING non-terminal evaluation created by
-//     Setup + Entry. It reports the semantic Management input still required
-//     (the trailing MA period) plus evidence availability, WITHOUT mutating the
-//     evaluation beyond confirming upstream state.
-//   - evaluate(): runs exactly the enabled Management criteria of the immutable
-//     profile version against point-in-time evidence and persists NON-TERMINAL
-//     Management progress while preserving the valid Setup and Entry results.
-//   - finalize(): marks an evaluation with complete Setup + Entry + Management
-//     results `completed` (terminal, immutable), via the Phase 1 saveResult
-//     contract.
+// Prepare -> Select trailing MA/activation -> Evaluate -> Finalize workflow.
 //
-// Management dependencies:
-//   - immutable Initial R and Entry Basis from Entry Quality;
-//   - the actual entry session (Day 1) and subsequent regular sessions from
-//     VERIFIED daily bars (never calendar arithmetic);
-//   - the full execution fill list (for reductions/partials/premature);
-//   - a user-asserted trailing MA selection (SMA10/SMA20) with honest
-//     post-trade provenance.
-//
-// Stop-history capability: TradeTally has no trustworthy complete stop-order
-// lifecycle (see management/stopHistory.js), so Stop Ratchet and Post-Partial
-// Breakeven resolve to UNKNOWN in production — never fabricated from the
-// current/final trade.stop_loss.
+// Point-in-time and evidence discipline:
+//   - Day 1's MFE uses only post-entry evidence (intraday where the entry is
+//     not at the open); Days 2+ daily highs are fully post-entry.
+//   - The +1R crossing session/timestamp is resolved from trustworthy intraday
+//     evidence where available, with explicit precision and provenance.
+//   - Observation maturity is explicit: never_reached only after the partial
+//     window has completed; otherwise the trigger is pending/insufficient.
+//   - Protective-stop classification is never fabricated: when TradeTally
+//     cannot distinguish a discretionary reduction from a protective-stop
+//     execution, the affected criteria are UNKNOWN.
+//   - No hidden canonical policy: every shared policy value is resolved from
+//     the immutable profile version.
 
 const { CRITERION_STATUS, EVALUATION_STATUS } = require('./constants');
 const { deriveScoreForCriterion } = require('./scoring');
@@ -38,18 +28,26 @@ const {
 } = require('./evaluationService');
 const { normalizeDailyBars, indexByDate, addCalendarDays } = require('./dailyEvidence');
 const { loadDailyEvidence } = require('./marketEvidenceService');
+const { loadSessionIntradayBars } = require('./intradayEvidenceService');
 const { setupDependencyFingerprint, entryDependencyFingerprint } = require('./dependencyFingerprint');
 const {
   reconstructManagementFills,
   reconstructReductions
 } = require('./management/executionFills');
-const { resolveStopHistory } = require('./management/stopHistory');
-const { resolvePartialTrigger } = require('./management/managementDays');
-const { resolvePartialCompletion, resolvePrematureReduction } = require('./management/partial');
+const { resolveStopHistory, resolveStopExecutionClassification } = require('./management/stopHistory');
 const {
-  findTrailingSignal,
-  classifyTrailingExecution
-} = require('./management/trailingMa');
+  buildDayEvidence,
+  resolvePartialTrigger,
+  findCrossingInSession
+} = require('./management/managementDays');
+const {
+  resolvePartialCompletion,
+  resolvePrematureReduction,
+  resolvePartialExitSupersession
+} = require('./management/partial');
+const { findTrailingSignal, classifyTrailingExecution } = require('./management/trailingMa');
+const { resolveManagementPolicy } = require('./management/policy');
+const { resolveQuantityUnit, resolveTickSize } = require('./management/quantityUnit');
 const { regularSessionBounds, sessionDateInZone } = require('./entry/sessionTime');
 const { validateManagementCriteria, SUPPORTED_TRAILING_PERIODS } = require('./criteria/management/parameterSchemas');
 const { MANAGEMENT_CRITERION_KEYS, evaluateManagementCriterion } = require('./managementCriterionRegistry');
@@ -58,7 +56,7 @@ const { getDateInTimezone } = require('../../utils/timezone');
 const MARKET_TZ = 'America/New_York';
 const TERMINAL_STATUSES = Object.freeze(['completed', 'insufficient_data']);
 const PRIOR_CALENDAR_DAYS = 45;
-const FORWARD_CALENDAR_DAYS = 120;
+const FORWARD_CALENDAR_DAYS = 10;
 
 class ManagementQualityInputError extends Error {
   constructor(message, code = 'INVALID_INPUT', details = null) {
@@ -88,6 +86,10 @@ function parseJsonField(value) {
 
 function isFiniteNumber(value) {
   return typeof value === 'number' && Number.isFinite(value);
+}
+
+function nowEpochSeconds() {
+  return Math.floor(Date.now() / 1000);
 }
 
 function toFrontendEvaluation(row) {
@@ -124,25 +126,17 @@ function getManagementDimensionConfig(configuration) {
     !configuration.dimensions ||
     !configuration.dimensions.management
   ) {
-    throw new ManagementQualityInputError(
-      'Profile version has no management dimension configuration.',
-      'PROFILE_CONFIG_INVALID'
-    );
+    throw new ManagementQualityInputError('Profile version has no management dimension configuration.', 'PROFILE_CONFIG_INVALID');
   }
   const managementConfig = configuration.dimensions.management;
   if (!Array.isArray(managementConfig.criteria)) {
-    throw new ManagementQualityInputError(
-      'Profile version management dimension has no criteria.',
-      'PROFILE_CONFIG_INVALID'
-    );
+    throw new ManagementQualityInputError('Profile version management dimension has no criteria.', 'PROFILE_CONFIG_INVALID');
   }
   return managementConfig;
 }
 
 function enabledManagementCriteria(managementConfig) {
-  return managementConfig.criteria.filter(
-    (criterion) => criterion.enabled === undefined || criterion.enabled === true
-  );
+  return managementConfig.criteria.filter((criterion) => criterion.enabled === undefined || criterion.enabled === true);
 }
 
 function enabledCriterion(managementConfig, key) {
@@ -162,16 +156,20 @@ function assertValidManagementConfiguration(managementConfig) {
     .map((criterion) => criterion.key);
   if (unsupportedEnabled.length > 0) {
     throw new ManagementQualityInputError(
-      `Unsupported enabled Management criterion key(s): ${unsupportedEnabled.join(', ')}. ` +
-        'No evaluator is implemented for them in Phase 4.',
+      `Unsupported enabled Management criterion key(s): ${unsupportedEnabled.join(', ')}.`,
       'PROFILE_CONFIG_INVALID'
     );
   }
 }
 
 function requiredManagementUserInputsFromConfig(managementConfig) {
-  const enabledKeys = enabledManagementCriteria(managementConfig).map((criterion) => criterion.key);
-  return enabledKeys.includes('trailing_ma') ? ['trailing_ma_period'] : [];
+  const trailing = enabledCriterion(managementConfig, 'trailing_ma');
+  if (!trailing) return [];
+  const policy = resolveManagementPolicy(managementConfig);
+  if (policy.trailingActivation === 'explicit') {
+    return ['trailing_ma_period', 'trailing_phase'];
+  }
+  return ['trailing_ma_period'];
 }
 
 function allowedTrailingPeriodsFromConfig(managementConfig) {
@@ -204,10 +202,7 @@ async function resolveEvaluationForManagement(userId, tradeId, evaluationId) {
   if (evaluationId) {
     const evaluation = await getEvaluation(evaluationId, userId);
     if (!evaluation || String(evaluation.trade_id) !== String(tradeId)) {
-      throw new ManagementQualityInputError(
-        'Evaluation not found or not owned by this user/trade.',
-        'EVALUATION_NOT_FOUND'
-      );
+      throw new ManagementQualityInputError('Evaluation not found or not owned by this user/trade.', 'EVALUATION_NOT_FOUND');
     }
     if (TERMINAL_STATUSES.includes(evaluation.status)) {
       throw new ManagementQualityInputError(
@@ -242,7 +237,6 @@ async function resolveEvaluationForManagement(userId, tradeId, evaluationId) {
   return result.rows[0];
 }
 
-// Extracts the immutable Entry-owned state Management depends on.
 function getEntryContext(evaluation) {
   const results = parseJsonField(evaluation.results);
   const evidence = parseJsonField(evaluation.evidence_snapshot) || {};
@@ -257,10 +251,11 @@ function getEntryContext(evaluation) {
   const initialR = entryEvidence.initial_r || null;
 
   const entryBasis = isFiniteNumber(execution.entry_basis) ? execution.entry_basis : null;
-  const originalPositionQty = isFiniteNumber(execution.original_position_qty)
-    ? execution.original_position_qty
-    : null;
+  const originalPositionQty = isFiniteNumber(execution.original_position_qty) ? execution.original_position_qty : null;
   const actualEntrySession = execution.actual_entry_session || null;
+  const entryEpoch = isFiniteNumber(execution.initial_entry_fill_epoch)
+    ? execution.initial_entry_fill_epoch
+    : (execution.initial_entry_time ? Math.floor(Date.parse(execution.initial_entry_time) / 1000) : null);
 
   if (!entryBasis || !originalPositionQty || !actualEntrySession) {
     throw new ManagementQualityInputError(
@@ -273,26 +268,48 @@ function getEntryContext(evaluation) {
     entryBasis,
     originalPositionQty,
     actualEntrySession,
+    entryEpoch,
     initialR: initialR && typeof initialR === 'object' ? initialR : null
   };
 }
 
-function fallbackEntrySession(trade) {
-  if (!trade || !trade.entry_time) return null;
-  return getDateInTimezone(trade.entry_time, MARKET_TZ, false);
+function isSessionCompleted(sessionDate, nowEpoch) {
+  const bounds = regularSessionBounds(sessionDate);
+  if (!bounds || !isFiniteNumber(bounds.closeEpoch)) return false;
+  return bounds.closeEpoch <= nowEpoch;
 }
 
-async function resolveManagementDailyEvidence({ symbol, userId, entrySession }) {
+function lastCompletedIndex(bars, nowEpoch) {
+  let index = -1;
+  for (let i = 0; i < bars.length; i += 1) {
+    if (isSessionCompleted(bars[i].date, nowEpoch)) index = i;
+  }
+  return index;
+}
+
+function todayInMarket() {
+  return getDateInTimezone(new Date(), MARKET_TZ, false);
+}
+
+async function resolveManagementDailyEvidence({ symbol, userId, entrySession, anchorSession, nowEpoch }) {
   const fromDate = addCalendarDays(entrySession, -PRIOR_CALENDAR_DAYS);
-  const toDate = addCalendarDays(entrySession, FORWARD_CALENDAR_DAYS);
+  const anchor = anchorSession || todayInMarket();
+  let toDate = addCalendarDays(anchor, FORWARD_CALENDAR_DAYS);
+  // Always cover the partial window with margin even for a very young trade.
+  const partialWindowEnd = addCalendarDays(entrySession, 14);
+  if (toDate < partialWindowEnd) toDate = partialWindowEnd;
+
   const loaded = await loadDailyEvidence({ symbol, userId, fromDate, toDate });
   const bars = normalizeDailyBars(loaded.bars);
   const indexMap = indexByDate(bars);
   const entryIndex = indexMap.has(entrySession) ? indexMap.get(entrySession) : -1;
+  const completedThroughIndex = lastCompletedIndex(bars, nowEpoch);
   const authoritative = loaded.completeness === 'verified' && entryIndex >= 0;
   return {
     bars,
     entryIndex,
+    completedThroughIndex,
+    indexMap,
     authoritative,
     source: loaded.source,
     completeness: loaded.completeness || 'unverified',
@@ -304,10 +321,7 @@ async function resolveManagementDailyEvidence({ symbol, userId, entrySession }) 
 function parseTrailingPeriod(rawValue, { required, allowedPeriods }) {
   if (rawValue === undefined || rawValue === null || rawValue === '') {
     if (required) {
-      throw new ManagementQualityInputError(
-        'trailing_ma_period is required by the active Trailing MA criterion.',
-        'INPUT_REQUIRED'
-      );
+      throw new ManagementQualityInputError('trailing_ma_period is required by the active Trailing MA criterion.', 'INPUT_REQUIRED');
     }
     return null;
   }
@@ -322,156 +336,135 @@ function parseTrailingPeriod(rawValue, { required, allowedPeriods }) {
   return period;
 }
 
-function tickSizeFor(trade) {
-  const stored = Number(trade && trade.tick_size);
-  if (Number.isFinite(stored) && stored > 0) return stored;
-  return 0.01;
+function parseTrailingPhase(rawValue) {
+  if (rawValue === undefined || rawValue === null || rawValue === '') return null;
+  if (rawValue === 'activated' || rawValue === 'not_activated') return rawValue;
+  throw new ManagementQualityInputError(
+    `trailing_phase must be one of activated, not_activated; got ${JSON.stringify(rawValue)}.`,
+    'INVALID_TRAILING_PHASE'
+  );
 }
 
-// Builds the shared, deterministic Management state consumed by every
-// Management criterion evaluator. All point-in-time decisions use only
-// evidence observable at the relevant historical time.
+// Day 1 post-entry high. Never uses the whole daily bar when the entry is not
+// at/after the session open.
+async function resolveDayOnePostEntryHigh({
+  day1Bar,
+  entryEpoch,
+  entryBasis,
+  rPerShare,
+  minimumMfeR,
+  symbol,
+  userId,
+  observations
+}) {
+  const bounds = day1Bar ? regularSessionBounds(day1Bar.date) : null;
+  const thresholdPrice = isFiniteNumber(entryBasis) && isFiniteNumber(rPerShare)
+    ? entryBasis + minimumMfeR * rPerShare
+    : null;
+  if (!day1Bar || !bounds) {
+    return { available: false, high: null, precision: null, source: null, possibleX: false, reason: 'day1_session_unknown' };
+  }
+  if (isFiniteNumber(entryEpoch) && entryEpoch <= bounds.openEpoch + 60) {
+    // The entire regular session is at/after the entry; the daily high is valid.
+    return {
+      available: true,
+      high: day1Bar.high,
+      precision: 'daily_bar',
+      source: 'daily_bar',
+      possibleX: false,
+      reason: null
+    };
+  }
+  try {
+    const intraday = await loadSessionIntradayBars(symbol, day1Bar.date, userId);
+    if (intraday && intraday.available && intraday.bars.length > 0) {
+      const scoped = intraday.bars.filter((bar) => !isFiniteNumber(entryEpoch) || bar.time >= entryEpoch);
+      let high = -Infinity;
+      for (const bar of scoped) if (isFiniteNumber(bar.high)) high = Math.max(high, bar.high);
+      for (const obs of observations || []) {
+        if (isFiniteNumber(obs.price) && obs.price > 0) high = Math.max(high, obs.price);
+      }
+      if (high !== -Infinity) {
+        return {
+          available: true,
+          high,
+          precision: '1min_bar',
+          source: intraday.source || 'intraday_cache',
+          possibleX: false,
+          reason: null
+        };
+      }
+    }
+  } catch (error) {
+    // Fall through to the unknown state; never fabricate.
+  }
+  return {
+    available: false,
+    high: null,
+    precision: null,
+    source: null,
+    possibleX: thresholdPrice !== null && isFiniteNumber(day1Bar.high) && day1Bar.high >= thresholdPrice,
+    upperBound: isFiniteNumber(day1Bar.high) ? day1Bar.high : null,
+    reason: 'day1_post_entry_evidence_unavailable'
+  };
+}
+
 function buildManagementState({
   trade,
   entryContext,
   daily,
   fills,
+  policy,
+  quantityUnit,
+  tickSize,
   stopHistory,
-  trailingPeriod,
-  partialTriggerParameters,
-  targetPct,
-  executionWindowMinutes,
-  protectiveStopExecutions = []
+  stopExecutionClassification,
+  partialTrigger,
+  partialCompletion,
+  partialExit,
+  prematureReduction,
+  trailing,
+  be,
+  nowEpoch
 }) {
   const initialR = entryContext.initialR && entryContext.initialR.available
     ? entryContext.initialR
     : { available: false, r_per_share: null, reason: entryContext.initialR ? entryContext.initialR.reason : 'Initial R unavailable.' };
 
-  const rPerShare = initialR.available ? initialR.r_per_share : null;
-  const entryBasis = entryContext.entryBasis;
-  const entryIndex = daily.entryIndex;
-
-  // Partial trigger (requires Initial R + verified daily sessions).
-  let partialTrigger = null;
-  if (initialR.available && daily.authoritative && rPerShare > 0) {
-    partialTrigger = resolvePartialTrigger({
-      bars: daily.bars,
-      entryIndex,
-      entryBasis,
-      rPerShare,
-      parameters: partialTriggerParameters
-    });
-  } else if (initialR.available && daily.authoritative) {
-    partialTrigger = { triggered: false, reason: 'invalid_r', mfeByDay: [] };
-  }
-
-  // If the position was fully closed before the partial became due, the partial
-  // rule is superseded (there is no position to take a partial of).
-  if (
-    partialTrigger &&
-    partialTrigger.triggered &&
-    fills.available &&
-    fills.positionClosed &&
-    fills.lastClosingSessionDate &&
-    partialTrigger.dueSessionDate &&
-    fills.lastClosingSessionDate < partialTrigger.dueSessionDate
-  ) {
-    partialTrigger = { ...partialTrigger, supersededByExit: true };
-  }
-
-  // Reductions and partial/premature resolution.
-  const reductions = fills && fills.available ? fills.reductions : [];
-  const partialCompletion = partialTrigger && partialTrigger.triggered
-    ? resolvePartialCompletion({
-        reductions,
-        originalPositionQty: entryContext.originalPositionQty,
-        targetPct: targetPct || 50,
-        triggerDueSessionDate: partialTrigger.dueSessionDate || null,
-        nextSessionDate: partialTrigger.dueSessionIndex !== null && partialTrigger.dueSessionIndex + 1 < daily.bars.length
-          ? daily.bars[partialTrigger.dueSessionIndex + 1].date
-          : null
-      })
-    : { completed: false, achievedFraction: null, achievedPct: null, timingOutcome: 'later_or_not_completed' };
-
-  const boundarySessionDate = partialTrigger && partialTrigger.triggered
-    ? partialTrigger.dueSessionDate
-    : (fills.available && fills.positionClosed ? fills.lastClosingSessionDate : null);
-  const prematureReduction = resolvePrematureReduction({
-    reductions,
-    originalPositionQty: entryContext.originalPositionQty,
-    boundarySessionDate,
-    protectiveStopExecutions
-  });
-  prematureReduction.boundarySessionDate = boundarySessionDate;
-  prematureReduction.protectiveStopEvidenceAvailable = protectiveStopExecutions.length > 0;
-
-  // Trailing MA resolution.
-  const trailing = { selectedPeriod: trailingPeriod, signal: null, signalReason: null, superseded: false, supersededReason: null, execution: null };
-  if (trailingPeriod && daily.authoritative) {
-    const signal = findTrailingSignal(daily.bars, trailingPeriod, entryIndex);
-    if (!signal) {
-      if (fills.available && fills.positionClosed) {
-        trailing.superseded = true;
-        trailing.supersededReason = 'position closed before any selected-MA close signal';
-      } else {
-        trailing.signalReason = 'no selected-MA close signal within the available daily evidence';
-      }
-    } else if (fills.available && fills.positionClosed && fills.lastClosingSessionDate && fills.lastClosingSessionDate < signal.date) {
-      trailing.superseded = true;
-      trailing.supersededReason = 'position closed before the selected-MA close signal';
-    } else if (fills.available && fills.positionClosed) {
-      trailing.execution = classifyTrailingExecution({
-        signal,
-        bars: daily.bars,
-        actualExitEpoch: fills.lastClosingTimeEpoch,
-        regularSessionBounds,
-        executionWindowMinutes: Number.isInteger(executionWindowMinutes) && executionWindowMinutes > 0
-          ? executionWindowMinutes
-          : 30
-      });
-    } else {
-      trailing.signalReason = 'position not fully closed; trailing exit cannot be determined';
-    }
-  }
-
-  // Breakeven deadline context (only meaningful with trustworthy stop history).
-  const be = { deadlineEpoch: null, nextSessionCloseEpoch: null };
-  if (partialCompletion.completionSessionDate) {
-    const completionIndex = daily.bars.findIndex((bar) => bar.date === partialCompletion.completionSessionDate);
-    if (completionIndex !== -1) {
-      const completionBounds = regularSessionBounds(partialCompletion.completionSessionDate);
-      be.deadlineEpoch = completionBounds ? completionBounds.closeEpoch : null;
-      if (completionIndex + 1 < daily.bars.length) {
-        const nextBounds = regularSessionBounds(daily.bars[completionIndex + 1].date);
-        be.nextSessionCloseEpoch = nextBounds ? nextBounds.closeEpoch : null;
-      }
-    }
-  }
+  const horizon = {
+    observedDays: partialTrigger ? partialTrigger.observedDays : 0,
+    horizonComplete: partialTrigger ? partialTrigger.horizonComplete : false,
+    latestDay: policy.partialTrigger ? policy.partialTrigger.latest_day : null,
+    completedThroughIndex: daily.completedThroughIndex,
+    nowEpoch
+  };
 
   return {
     direction: 'long',
-    entryBasis,
+    entryBasis: entryContext.entryBasis,
     originalPositionQty: entryContext.originalPositionQty,
     initialR,
     daily,
     fills,
+    policy,
+    quantityUnit,
+    tickSize: tickSize || { known: false, tickSize: null },
+    stopHistory,
+    stopExecutionClassification,
     partialTrigger,
     partialCompletion,
+    partialExit,
     prematureReduction,
-    stopHistory,
     trailing,
     be,
-    tickSize: tickSizeFor(trade)
+    horizon
   };
 }
 
 function buildManagementCriterionRows(managementConfig, managementState, userInputs) {
   const rows = [];
   for (const criterionConfig of enabledManagementCriteria(managementConfig)) {
-    const fragment = evaluateManagementCriterion(criterionConfig, {
-      managementState,
-      userInputs
-    });
+    const fragment = evaluateManagementCriterion(criterionConfig, { managementState, userInputs });
     const row = {
       key: criterionConfig.key,
       status: fragment.status,
@@ -503,15 +496,33 @@ function buildManagementCriterionRows(managementConfig, managementState, userInp
   return rows;
 }
 
-function buildManagementEvidenceBlock({ daily, fills, stopHistory, partialTrigger, partialCompletion, prematureReduction, trailing, entryContext }) {
+function buildManagementEvidenceBlock({
+  daily, fills, stopHistory, stopExecutionClassification, policy, quantityUnit, tickSize,
+  partialTrigger, partialCompletion, partialExit, prematureReduction, trailing, entryContext, nowEpoch
+}) {
   return {
     preparedAt: new Date().toISOString(),
+    policy: {
+      partial_trigger: policy.partialTrigger,
+      partial_trigger_source: policy.partialTriggerSource,
+      partial_target: policy.partialTarget,
+      partial_target_source: policy.partialTargetSource,
+      partial_tolerance_source: policy.partialToleranceSource,
+      completion_window: policy.completionWindow,
+      post_partial_deadline_sessions: policy.postPartialDeadlineSessions,
+      execution_window_minutes: policy.executionWindowMinutes,
+      trailing_activation: policy.trailingActivation,
+      trailing_activation_source: policy.trailingActivationSource,
+      available: policy.available
+    },
     entry_dependency: {
       entry_basis: entryContext.entryBasis,
       original_position_qty: entryContext.originalPositionQty,
       actual_entry_session: entryContext.actualEntrySession,
       initial_r: entryContext.initialR || null
     },
+    quantity_unit: quantityUnit,
+    tick_size: tickSize,
     daily: daily
       ? {
           source: daily.source,
@@ -520,6 +531,7 @@ function buildManagementEvidenceBlock({ daily, fills, stopHistory, partialTrigge
           requested_window: daily.window || null,
           entry_session: entryContext.actualEntrySession,
           entry_index: daily.entryIndex,
+          completed_through_index: daily.completedThroughIndex,
           bars: daily.bars ? daily.bars.length : 0,
           error: daily.reason || null
         }
@@ -530,9 +542,8 @@ function buildManagementEvidenceBlock({ daily, fills, stopHistory, partialTrigge
           reductions: fills.reductions || [],
           total_reduction_qty: fills.totalReductionQty,
           position_closed: fills.positionClosed,
-          last_closing_time: fills.lastClosingTimeEpoch
-            ? new Date(fills.lastClosingTimeEpoch * 1000).toISOString()
-            : null,
+          last_closing_time: fills.lastClosingTimeEpoch ? new Date(fills.lastClosingTimeEpoch * 1000).toISOString() : null,
+          last_closing_price: fills.lastClosingPrice ?? null,
           last_closing_session: fills.lastClosingSessionDate
         }
       : null,
@@ -544,14 +555,28 @@ function buildManagementEvidenceBlock({ daily, fills, stopHistory, partialTrigge
           reason: stopHistory.reason || null
         }
       : null,
+    stop_execution_classification: {
+      available: !!(stopExecutionClassification && stopExecutionClassification.available),
+      complete: !!(stopExecutionClassification && stopExecutionClassification.complete),
+      reason: stopExecutionClassification ? stopExecutionClassification.reason || null : null
+    },
     partial_trigger: partialTrigger
       ? {
-          triggered: partialTrigger.triggered,
+          status: partialTrigger.status,
+          triggered: partialTrigger.triggered === true,
           due_day: partialTrigger.dueDay || null,
           due_session: partialTrigger.dueSessionDate || null,
+          due_session_completed: partialTrigger.dueSessionCompleted === true,
           first_reach_day: partialTrigger.firstReachDay || null,
-          reached_early: partialTrigger.reachedEarly || false,
-          superseded_by_exit: partialTrigger.supersededByExit || false,
+          first_reach_session: partialTrigger.firstReachSessionDate || null,
+          reached_early: partialTrigger.reachedEarly === true,
+          horizon_complete: partialTrigger.horizonComplete === true,
+          observed_days: partialTrigger.observedDays,
+          crossing_time: partialTrigger.crossing && partialTrigger.crossing.epoch
+            ? new Date(partialTrigger.crossing.epoch * 1000).toISOString()
+            : null,
+          crossing_precision: partialTrigger.crossing ? partialTrigger.crossing.precision : null,
+          crossing_source: partialTrigger.crossing ? partialTrigger.crossing.source : null,
           reason: partialTrigger.reason || null,
           mfe_by_day: partialTrigger.mfeByDay || []
         }
@@ -560,34 +585,41 @@ function buildManagementEvidenceBlock({ daily, fills, stopHistory, partialTrigge
       ? {
           completed: partialCompletion.completed,
           achieved_pct: partialCompletion.achievedPct,
+          achieved_qty: partialCompletion.achievedQty,
+          required_qty: partialCompletion.rounding ? partialCompletion.rounding.requiredQty : null,
+          quantity_unit: partialCompletion.rounding ? partialCompletion.rounding.unit : null,
+          rounding_resolved: partialCompletion.rounding ? partialCompletion.rounding.resolved : null,
           completion_session: partialCompletion.completionSessionDate || null,
+          sessions_after_trigger: partialCompletion.sessionsAfterTrigger,
           timing_outcome: partialCompletion.timingOutcome || null
         }
       : null,
+    partial_exit: partialExit,
     premature_reduction: prematureReduction
       ? {
+          outcome: prematureReduction.outcome,
           premature_qty: prematureReduction.prematureQty,
           premature_fraction: prematureReduction.prematureFraction,
           excluded_qty: prematureReduction.excludedQty || 0,
+          ambiguous_qty: prematureReduction.ambiguousQty || 0,
           boundary_session_date: prematureReduction.boundarySessionDate || null
         }
       : null,
     trailing: trailing
       ? {
-          selected_period: trailing.selectedPeriod || null,
+          activation: trailing.activation,
+          activation_source: trailing.activationSource,
+          activation_resolved: trailing.activationResolved,
+          active: trailing.active,
+          activation_session_index: trailing.activationSessionIndex ?? null,
+          inactive_reason: trailing.inactiveReason || null,
           signal_date: trailing.signal ? trailing.signal.date : null,
           signal_close: trailing.signal ? trailing.signal.close : null,
           signal_ma_value: trailing.signal ? trailing.signal.sma : null,
-          superseded: trailing.superseded,
-          superseded_reason: trailing.supersededReason || null,
           signal_reason: trailing.signalReason || null,
-          execution: trailing.execution
-            ? {
-                outcome: trailing.execution.outcome,
-                next_session_date: trailing.execution.nextSessionDate || null,
-                actual_exit_epoch: trailing.execution.actualExitEpoch ?? null
-              }
-            : null
+          supersession: trailing.supersession || null,
+          execution: trailing.execution || null,
+          reason: trailing.executionReason || null
         }
       : null
   };
@@ -610,14 +642,9 @@ function computeManagementEntryDependencyFingerprint(evaluation) {
   });
 }
 
-/**
- * Prepares Management Quality for an existing draft evaluation (read-only).
- */
 async function prepare(userId, tradeId, { evaluationId } = {}) {
   const trade = await getTradeForUser(userId, tradeId);
-  if (!trade) {
-    throw new ManagementQualityInputError('Trade not found or not owned by this user.', 'TRADE_NOT_FOUND');
-  }
+  if (!trade) throw new ManagementQualityInputError('Trade not found or not owned by this user.', 'TRADE_NOT_FOUND');
   const evaluation = await resolveEvaluationForManagement(userId, tradeId, evaluationId);
   const version = await loadVersionForEvaluation(evaluation, userId);
   const managementConfig = getManagementDimensionConfig(version.configuration);
@@ -626,6 +653,7 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
   const entryContext = getEntryContext(evaluation);
   const prepareInputs = parseJsonField(evaluation.user_inputs) || {};
   const prepareDetected = parseJsonField(evaluation.detected_context) || {};
+  const policy = resolveManagementPolicy(managementConfig);
   const requiredInputs = requiredManagementUserInputsFromConfig(managementConfig);
 
   const immutableTrailing =
@@ -638,6 +666,17 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
     (immutableTrailing && immutableTrailing.value) ||
     (Number.isFinite(Number(prepareInputs.trailing_ma_period)) ? Number(prepareInputs.trailing_ma_period) : null) ||
     null;
+  const immutablePhase =
+    prepareInputs.immutable_semantic_context &&
+    prepareInputs.immutable_semantic_context.trailing_phase &&
+    typeof prepareInputs.immutable_semantic_context.trailing_phase.value === 'string'
+      ? prepareInputs.immutable_semantic_context.trailing_phase
+      : null;
+  const establishedPhase =
+    (immutablePhase && immutablePhase.value) ||
+    (prepareInputs.trailing_phase === 'activated' || prepareInputs.trailing_phase === 'not_activated'
+      ? prepareInputs.trailing_phase
+      : null);
 
   return {
     evaluation: toFrontendEvaluation(evaluation),
@@ -655,52 +694,50 @@ async function prepare(userId, tradeId, { evaluationId } = {}) {
       actualEntrySession: entryContext.actualEntrySession,
       initialR: entryContext.initialR
     },
+    policy: {
+      partialTrigger: policy.partialTrigger,
+      partialTriggerSource: policy.partialTriggerSource,
+      partialTarget: policy.partialTarget,
+      executionWindowMinutes: policy.executionWindowMinutes,
+      trailingActivation: policy.trailingActivation,
+      available: policy.available
+    },
     trailingMa: {
       value: establishedTrailing,
       established: !!establishedTrailing,
-      selectedAt:
-        (immutableTrailing && immutableTrailing.selected_at) ||
+      selectedAt: (immutableTrailing && immutableTrailing.selected_at) || null,
+      timing: (immutableTrailing && immutableTrailing.timing) || null,
+      phase: establishedPhase,
+      phaseEstablished: !!establishedPhase,
+      phaseAssertedAt:
+        (immutablePhase && immutablePhase.asserted_at) ||
         (prepareDetected.management &&
-          prepareDetected.management.trailing_ma &&
-          prepareDetected.management.trailing_ma.selectedAt) ||
-        null,
-      timing:
-        (immutableTrailing && immutableTrailing.timing) || null
+          prepareDetected.management.trailing_phase &&
+          prepareDetected.management.trailing_phase.assertedAt) ||
+        null
     },
-    allowedTrailingPeriods: requiredInputs.includes('trailing_ma_period')
-      ? allowedTrailingPeriodsFromConfig(managementConfig)
-      : [],
+    allowedTrailingPeriods: requiredInputs.includes('trailing_ma_period') ? allowedTrailingPeriodsFromConfig(managementConfig) : [],
     requiredManagementUserInputs: requiredInputs,
     managementCriterionKeys: enabledManagementCriteria(managementConfig).map((criterion) => criterion.key)
   };
 }
 
-/**
- * Evaluates and persists NON-TERMINAL Management progress, preserving the valid
- * Setup and Entry results.
- */
-async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInputs } = {}) {
-  if (!evaluationId) {
-    throw new ManagementQualityInputError('Run management prepare() first; evaluationId is required.', 'EVALUATION_REQUIRED');
-  }
+async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInputs, trustedStopHistory, trustedStopExecutionClassification } = {}) {
+  if (!evaluationId) throw new ManagementQualityInputError('Run management prepare() first; evaluationId is required.', 'EVALUATION_REQUIRED');
   const trade = await getTradeForUser(userId, tradeId);
-  if (!trade) {
-    throw new ManagementQualityInputError('Trade not found or not owned by this user.', 'TRADE_NOT_FOUND');
-  }
+  if (!trade) throw new ManagementQualityInputError('Trade not found or not owned by this user.', 'TRADE_NOT_FOUND');
   const evaluation = await resolveEvaluationForManagement(userId, tradeId, evaluationId);
   const version = await loadVersionForEvaluation(evaluation, userId);
   const managementConfig = getManagementDimensionConfig(version.configuration);
   assertValidManagementConfiguration(managementConfig);
 
   const entryContext = getEntryContext(evaluation);
+  const policy = resolveManagementPolicy(managementConfig);
   const requiredInputs = requiredManagementUserInputsFromConfig(managementConfig);
-  const allowedPeriods = requiredInputs.includes('trailing_ma_period')
-    ? allowedTrailingPeriodsFromConfig(managementConfig)
-    : [];
+  const allowedPeriods = requiredInputs.includes('trailing_ma_period') ? allowedTrailingPeriodsFromConfig(managementConfig) : [];
   const raw = rawUserInputs && typeof rawUserInputs === 'object' ? rawUserInputs : {};
 
-  // Trailing MA selection is a frozen semantic assertion for this evaluation:
-  // the first assertion wins (provenance user_asserted, post-trade timing).
+  // ---- Immutable semantic assertions (first assertion wins) ----------------
   const storedInputs = parseJsonField(evaluation.user_inputs) || {};
   const storedDetected = parseJsonField(evaluation.detected_context) || {};
   const storedImmutableTrailing =
@@ -710,20 +747,46 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       ? storedInputs.immutable_semantic_context.trailing_ma
       : null;
   const persistedTrailing =
-    storedImmutableTrailing && storedImmutableTrailing.value
-      ? storedImmutableTrailing.value
-      : (Number.isFinite(Number(storedInputs.trailing_ma_period)) ? Number(storedInputs.trailing_ma_period) : null);
+    (storedImmutableTrailing && storedImmutableTrailing.value) ||
+    (Number.isFinite(Number(storedInputs.trailing_ma_period)) ? Number(storedInputs.trailing_ma_period) : null);
+  const storedImmutablePhase =
+    storedInputs.immutable_semantic_context &&
+    storedInputs.immutable_semantic_context.trailing_phase &&
+    typeof storedInputs.immutable_semantic_context.trailing_phase.value === 'string'
+      ? storedInputs.immutable_semantic_context.trailing_phase
+      : null;
+  const persistedPhase =
+    (storedImmutablePhase && storedImmutablePhase.value) ||
+    (storedInputs.trailing_phase === 'activated' || storedInputs.trailing_phase === 'not_activated'
+      ? storedInputs.trailing_phase
+      : null);
+  const requestedPhase = parseTrailingPhase(raw.trailing_phase);
+  let trailingPhase = persistedPhase || null;
+  let phaseMode = 'none';
+  let phaseAssertedAt = null;
+  if (persistedPhase) {
+    if (requestedPhase !== null && requestedPhase !== persistedPhase) {
+      throw new ManagementQualityInputError(
+        `trailing_phase is immutable for this evaluation (already asserted as ${persistedPhase}).`,
+        'TRAILING_PHASE_IMMUTABLE'
+      );
+    }
+    phaseMode = 'preserve';
+    phaseAssertedAt = (storedImmutablePhase && storedImmutablePhase.asserted_at) || null;
+  } else if (policy.trailingActivation === 'explicit' && requestedPhase !== null) {
+    trailingPhase = requestedPhase;
+    phaseMode = 'establish';
+  }
+
   const requestedTrailing = raw.trailing_ma_period;
   let trailingPeriod = null;
   let trailingMode = 'none';
   let trailingSelectedAt = null;
+  // A not_activated explicit phase makes the trailing MA criterion N/A, so no
+  // MA selection is required.
+  const periodRequired = requiredInputs.includes('trailing_ma_period') && trailingPhase !== 'not_activated';
   if (persistedTrailing) {
-    if (
-      requestedTrailing === undefined ||
-      requestedTrailing === null ||
-      requestedTrailing === '' ||
-      Number(requestedTrailing) === persistedTrailing
-    ) {
+    if (requestedTrailing === undefined || requestedTrailing === null || requestedTrailing === '' || Number(requestedTrailing) === persistedTrailing) {
       trailingPeriod = persistedTrailing;
     } else {
       throw new ManagementQualityInputError(
@@ -733,23 +796,17 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       );
     }
     trailingMode = 'preserve';
-    trailingSelectedAt =
-      (storedImmutableTrailing && storedImmutableTrailing.selected_at) ||
-      (storedDetected.management && storedDetected.management.trailing_ma && storedDetected.management.trailing_ma.selectedAt) ||
-      null;
-  } else if (requiredInputs.includes('trailing_ma_period')) {
+    trailingSelectedAt = (storedImmutableTrailing && storedImmutableTrailing.selected_at) || null;
+  } else if (periodRequired) {
     trailingPeriod = parseTrailingPeriod(requestedTrailing, { required: true, allowedPeriods });
     trailingMode = trailingPeriod !== null ? 'establish' : 'none';
   }
 
   const symbol = String(trade.symbol || '').trim().toUpperCase();
-  const entrySession = entryContext.actualEntrySession || fallbackEntrySession(trade);
-  const daily = entrySession && symbol
-    ? await resolveManagementDailyEvidence({ symbol, userId, entrySession })
-    : { bars: [], entryIndex: -1, authoritative: false, source: null, completeness: 'unverified', window: null, reason: 'no entry session/symbol' };
-
+  const entrySession = entryContext.actualEntrySession || null;
+  const nowEpoch = nowEpochSeconds();
   const fillsResult = reconstructManagementFills(trade);
-  const fills = fillsResult
+  const reductions = fillsResult
     ? reconstructReductions({
         fills: fillsResult.fills,
         direction: fillsResult.direction,
@@ -757,42 +814,255 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
         sessionDateInZone
       })
     : null;
-  const fillsState = fills
-    ? { available: true, ...fills }
-    : { available: false, reductions: [], totalReductionQty: null, positionClosed: false, lastClosingTimeEpoch: null, lastClosingSessionDate: null, remainingQty: null };
+  const fillsState = reductions
+    ? { available: true, ...reductions }
+    : { available: false, reductions: [], totalReductionQty: null, positionClosed: false, lastClosingTimeEpoch: null, lastClosingPrice: null, lastClosingSessionDate: null, firstFullClose: null, remainingQty: null };
 
-  // Production: no trustworthy stop-history source exists -> UNKNOWN.
-  const stopHistory = resolveStopHistory({});
+  const anchorSession = fillsState.positionClosed ? fillsState.lastClosingSessionDate : null;
+  const daily = entrySession && symbol
+    ? await resolveManagementDailyEvidence({ symbol, userId, entrySession, anchorSession, nowEpoch })
+    : { bars: [], entryIndex: -1, completedThroughIndex: -1, indexMap: new Map(), authoritative: false, source: null, completeness: 'unverified', window: null, reason: 'no entry session/symbol' };
+  const sessionIndexForDate = (date) => (daily.indexMap && daily.indexMap.has(date) ? daily.indexMap.get(date) : null);
 
-  // Profile-owned partial trigger / sizing parameters.
-  const partialTimingCriterion = enabledCriterion(managementConfig, 'partial_timing');
-  const partialSizingCriterion = enabledCriterion(managementConfig, 'partial_sizing');
-  const trailingMaCriterion = enabledCriterion(managementConfig, 'trailing_ma');
-  const partialTriggerParameters = partialTimingCriterion
-    ? {
-        earliest_day: partialTimingCriterion.parameters.earliest_day,
-        latest_day: partialTimingCriterion.parameters.latest_day,
-        minimum_mfe_r: partialTimingCriterion.parameters.minimum_mfe_r
+  const quantityUnit = resolveQuantityUnit(trade.instrument_type);
+  const tickSize = resolveTickSize({ storedTickSize: trade.tick_size });
+  const stopHistory = resolveStopHistory({ trustedStopHistory: trustedStopHistory || null });
+  const stopExecutionClassification = resolveStopExecutionClassification({
+    trustedStopExecutionClassification: trustedStopExecutionClassification || null
+  });
+
+  const initialR = entryContext.initialR && entryContext.initialR.available
+    ? entryContext.initialR
+    : { available: false, r_per_share: null };
+
+  // ---- Partial trigger (point-in-time) ------------------------------------
+  let partialTrigger = null;
+  let dayEvidence = [];
+  if (
+    policy.partialTrigger &&
+    initialR.available &&
+    daily.authoritative
+  ) {
+    dayEvidence = buildDayEvidence({
+      bars: daily.bars,
+      entryIndex: daily.entryIndex,
+      latestDay: policy.partialTrigger.latest_day,
+      isSessionCompleted: (date) => isSessionCompleted(date, nowEpoch)
+    });
+    const day1 = dayEvidence.find((day) => day.day === 1);
+    if (day1) {
+      const observations = (fillsResult ? fillsResult.fills : [])
+        .filter((fill) => fill.action === (fillsResult && fillsResult.direction === 'short' ? 'sell' : 'buy'))
+        .map((fill) => ({ epoch: fill.timeEpoch, price: fill.price }));
+      const day1PostEntry = await resolveDayOnePostEntryHigh({
+        day1Bar: { date: day1.sessionDate, high: daily.bars[day1.sessionIndex] ? daily.bars[day1.sessionIndex].high : null },
+        entryEpoch: entryContext.entryEpoch,
+        entryBasis: entryContext.entryBasis,
+        rPerShare: initialR.r_per_share,
+        minimumMfeR: policy.partialTrigger.minimum_mfe_r,
+        symbol,
+        userId,
+        observations
+      });
+      day1.high = day1PostEntry.high;
+      day1.highKnown = day1PostEntry.available === true;
+      day1.precision = day1PostEntry.precision;
+      day1.source = day1PostEntry.source;
+      day1.possibleX = day1PostEntry.possibleX === true;
+    }
+    partialTrigger = resolvePartialTrigger({
+      dayEvidence,
+      entryBasis: entryContext.entryBasis,
+      rPerShare: initialR.r_per_share,
+      parameters: policy.partialTrigger
+    });
+
+    // Crossing timestamp from trustworthy intraday evidence where available.
+    if (partialTrigger.status === 'triggered' && Number.isInteger(partialTrigger.firstReachSessionIndex)) {
+      const reachDay = partialTrigger.firstReachDay;
+      const reachBar = daily.bars[partialTrigger.firstReachSessionIndex];
+      const priorHighest = dayEvidence
+        .filter((day) => day.day < reachDay && day.highKnown && isFiniteNumber(day.high))
+        .reduce((max, day) => (max === null ? day.high : Math.max(max, day.high)), null);
+      const thresholdPrice = entryContext.entryBasis + policy.partialTrigger.minimum_mfe_r * initialR.r_per_share;
+      let crossing = null;
+      if (reachBar) {
+        try {
+          const intraday = await loadSessionIntradayBars(symbol, reachBar.date, userId);
+          if (intraday && intraday.available && intraday.bars.length > 0) {
+            const bounds = regularSessionBounds(reachBar.date);
+            // Entry-print observations are only relevant to the Day-1 crossing;
+            // Days 2+ have their own session evidence.
+            const observations = reachDay === 1
+              ? (fillsResult ? fillsResult.fills : [])
+                  .filter((fill) => fill.action === (fillsResult && fillsResult.direction === 'short' ? 'sell' : 'buy'))
+                  .map((fill) => ({ epoch: fill.timeEpoch, price: fill.price }))
+              : [];
+            const found = findCrossingInSession({
+              bars: intraday.bars,
+              priorHighest,
+              thresholdPrice,
+              entryEpoch: reachDay === 1 ? entryContext.entryEpoch : null,
+              sessionOpenEpoch: bounds ? bounds.openEpoch : null,
+              sessionCloseEpoch: bounds ? bounds.closeEpoch : null,
+              observations
+            });
+            if (found.crossed) {
+              crossing = { epoch: found.epoch, precision: found.precision, source: intraday.source || found.source };
+            }
+          }
+        } catch (error) {
+          crossing = null;
+        }
       }
-    : { earliest_day: 3, latest_day: 5, minimum_mfe_r: 1.0 };
-  const targetPct = partialSizingCriterion
-    ? partialSizingCriterion.parameters.target_pct
-    : 50;
-  const executionWindowMinutes = trailingMaCriterion
-    ? trailingMaCriterion.parameters.execution_window_minutes
-    : 30;
+      if (!crossing) {
+        crossing = {
+          epoch: null,
+          precision: reachDay === 1 ? 'daily_bar' : 'session',
+          source: daily.source || 'daily_bar'
+        };
+      }
+      partialTrigger = { ...partialTrigger, crossing };
+    }
+  } else if (policy.partialTrigger) {
+    partialTrigger = {
+      status: daily.authoritative ? 'insufficient_evidence' : 'insufficient_evidence',
+      triggered: false,
+      crossed: false,
+      reason: 'partial_trigger_unavailable',
+      mfeByDay: [],
+      observedDays: 0,
+      horizonComplete: false,
+      day1Uncertain: false
+    };
+  }
+
+  // ---- Partial completion / sizing-at-event -------------------------------
+  const targetPct = policy.partialTarget ? policy.partialTarget.target_pct : null;
+  const targetFraction = targetPct !== null ? targetPct / 100 : null;
+  let partialCompletion = {
+    completed: false,
+    achievedQty: null,
+    achievedFraction: null,
+    achievedPct: null,
+    observedQty: null,
+    observedFraction: null,
+    completionTimeEpoch: null,
+    completionSessionDate: null,
+    completionSessionIndex: null,
+    sessionsAfterTrigger: null,
+    timingOutcome: 'later_or_not_completed',
+    rounding: { resolved: false, requiredQty: null, unit: null, reason: 'policy_unavailable' }
+  };
+  if (
+    policy.partialTrigger &&
+    policy.partialTarget &&
+    partialTrigger &&
+    partialTrigger.status === 'triggered' &&
+    fillsState.available
+  ) {
+    partialCompletion = resolvePartialCompletion({
+      reductions: fillsState.reductions,
+      originalPositionQty: entryContext.originalPositionQty,
+      targetFraction,
+      targetPct,
+      quantityUnit,
+      triggerDueSessionIndex: partialTrigger.dueSessionIndex,
+      sessionIndexForDate
+    });
+  } else if (policy.partialTrigger && policy.partialTarget && partialTrigger && partialTrigger.status === 'triggered' && !fillsState.available) {
+    partialCompletion = {
+      ...partialCompletion,
+      rounding: { resolved: false, requiredQty: null, unit: null, reason: 'fills_unavailable' }
+    };
+  }
+
+  // ---- Partial exit supersession / premature reduction --------------------
+  const partialExit = fillsState.available
+    ? resolvePartialExitSupersession({
+        reductions: fillsState.reductions,
+        originalPositionQty: entryContext.originalPositionQty,
+        dueSessionDate: partialTrigger ? partialTrigger.dueSessionDate : null,
+        stopExecutionClassification
+      })
+    : { closedBeforeDue: false, outcome: 'none', closeSessionDate: null, closeTimeEpoch: null };
+
+  let boundarySessionDate = null;
+  if (partialTrigger && partialTrigger.status === 'triggered') {
+    boundarySessionDate = partialTrigger.dueSessionDate || null;
+  } else if (partialTrigger && partialTrigger.status === 'never_reached') {
+    const lastDay = dayEvidence.length > 0 ? dayEvidence[dayEvidence.length - 1] : null;
+    boundarySessionDate = lastDay ? lastDay.sessionDate : null;
+  } else if (daily.authoritative) {
+    const lastCompletedDay = [...dayEvidence].reverse().find((day) => day.sessionCompleted);
+    boundarySessionDate = lastCompletedDay ? lastCompletedDay.sessionDate : null;
+  }
+  const prematureBase = fillsState.available
+    ? resolvePrematureReduction({
+        reductions: fillsState.reductions,
+        originalPositionQty: entryContext.originalPositionQty,
+        boundarySessionDate,
+        stopExecutionClassification
+      })
+    : { outcome: 'not_evaluated', prematureQty: null, prematureFraction: null, excludedQty: 0, ambiguousQty: 0, boundarySessionDate };
+  const prematureReduction = {
+    ...prematureBase,
+    classificationAvailable: !!(stopExecutionClassification && stopExecutionClassification.available),
+    classificationComplete: !!(stopExecutionClassification && stopExecutionClassification.complete)
+  };
+
+  // ---- Trailing -----------------------------------------------------------
+  const trailing = resolveTrailingState({
+    policy,
+    partialTrigger,
+    partialCompletion,
+    partialExit,
+    fillsState,
+    daily,
+    nowEpoch,
+    trailingPhase,
+    sessionIndexForDate,
+    executionWindowMinutes: policy.executionWindowMinutes,
+    stopExecutionClassification,
+    userInputs: { ...storedInputs, ...raw }
+  });
+
+  // ---- BE deadline context ------------------------------------------------
+  const be = { deadlineEpoch: null, nextSessionCloseEpoch: null };
+  if (partialCompletion.completionSessionDate && Number.isInteger(policy.postPartialDeadlineSessions)) {
+    const completionIndex = sessionIndexForDate(partialCompletion.completionSessionDate);
+    if (Number.isInteger(completionIndex)) {
+      const deadlineIndex = completionIndex + policy.postPartialDeadlineSessions;
+      const deadlineBar = daily.bars[deadlineIndex];
+      if (deadlineBar) {
+        const deadlineBounds = regularSessionBounds(deadlineBar.date);
+        be.deadlineEpoch = deadlineBounds ? deadlineBounds.closeEpoch : null;
+        const nextBar = daily.bars[deadlineIndex + 1];
+        if (nextBar) {
+          const nextBounds = regularSessionBounds(nextBar.date);
+          be.nextSessionCloseEpoch = nextBounds ? nextBounds.closeEpoch : null;
+        }
+      }
+    }
+  }
 
   const managementState = buildManagementState({
     trade,
     entryContext,
     daily,
     fills: fillsState,
+    policy,
+    quantityUnit,
+    tickSize,
     stopHistory,
-    trailingPeriod,
-    partialTriggerParameters,
-    targetPct,
-    executionWindowMinutes,
-    protectiveStopExecutions: []
+    stopExecutionClassification,
+    partialTrigger,
+    partialCompletion,
+    partialExit,
+    prematureReduction,
+    trailing,
+    be,
+    nowEpoch
   });
 
   const criterionRows = buildManagementCriterionRows(managementConfig, managementState, {
@@ -800,25 +1070,22 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   });
 
   const managementEvidenceBlock = buildManagementEvidenceBlock({
-    daily,
-    fills: fillsState,
-    stopHistory,
-    partialTrigger: managementState.partialTrigger,
-    partialCompletion: managementState.partialCompletion,
-    prematureReduction: managementState.prematureReduction,
-    trailing: managementState.trailing,
-    entryContext
+    daily, fills: fillsState, stopHistory, stopExecutionClassification, policy, quantityUnit, tickSize,
+    partialTrigger, partialCompletion, partialExit, prematureReduction, trailing, entryContext, nowEpoch
   });
 
   const managementDetectedContext = {
     evaluatedAt: new Date().toISOString(),
     trailing_ma: trailingPeriod
       ? { value: trailingPeriod, source: 'user_asserted', selectedAt: trailingSelectedAt || new Date().toISOString(), timing: 'post_trade' }
+      : null,
+    trailing_phase: trailingPhase
+      ? { value: trailingPhase, source: 'user_asserted', assertedAt: phaseAssertedAt || new Date().toISOString(), timing: 'post_trade' }
       : null
   };
 
   const dependencyFingerprint = computeManagementDependencyFingerprint(evaluation);
-  const entryDependency = computeManagementEntryDependencyFingerprint(evaluation);
+  const entryDependencyFingerprintValue = computeManagementEntryDependencyFingerprint(evaluation);
 
   let updated;
   try {
@@ -827,61 +1094,192 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
       managementEvidence: managementEvidenceBlock,
       managementDetectedContext,
       dependencyFingerprint,
-      entryDependencyFingerprint: entryDependency,
-      trailingMa: {
-        mode: trailingMode,
-        value: trailingPeriod,
-        selectedAt: trailingSelectedAt
-      }
+      entryDependencyFingerprint: entryDependencyFingerprintValue,
+      trailingMa: { mode: trailingMode, value: trailingPeriod, selectedAt: trailingSelectedAt },
+      trailingPhase: { mode: phaseMode, value: trailingPhase, assertedAt: phaseAssertedAt }
     });
   } catch (error) {
     if (
       error &&
       (error.code === 'STALE_DEPENDENCY' ||
         error.code === 'STALE_ENTRY_DEPENDENCY' ||
-        error.code === 'TRAILING_MA_IMMUTABLE')
+        error.code === 'TRAILING_MA_IMMUTABLE' ||
+        error.code === 'TRAILING_PHASE_IMMUTABLE')
     ) {
       throw new ManagementQualityInputError(error.message, error.code);
     }
     throw error;
   }
   if (!updated) {
-    throw new ManagementQualityInputError(
-      'Evaluation could not be updated (it may have reached a terminal state).',
-      'EVALUATION_TERMINAL'
-    );
+    throw new ManagementQualityInputError('Evaluation could not be updated (it may have reached a terminal state).', 'EVALUATION_TERMINAL');
   }
 
   return {
     evaluation: toFrontendEvaluation(updated),
     profileVersion: {
-      id: version.id,
-      profileId: version.profile_id,
-      profileName: version.profile_name,
-      versionNumber: version.version_number,
-      schemaVersion: version.schema_version
+      id: version.id, profileId: version.profile_id, profileName: version.profile_name,
+      versionNumber: version.version_number, schemaVersion: version.schema_version
     },
     management: {
       entryBasis: entryContext.entryBasis,
       originalPositionQty: entryContext.originalPositionQty,
       initialR: managementState.initialR,
       trailingMaPeriod: trailingPeriod,
-      partialTrigger: managementState.partialTrigger,
-      stopHistoryAvailable: stopHistory.available
+      trailingPhase,
+      policy: policy,
+      partialTrigger
     }
   };
 }
 
-/**
- * Finalizes an evaluation with complete Setup + Entry + Management results to
- * a terminal `completed` state (immutable). Uses the Phase 1 saveResult
- * contract, which re-validates all dimensions against the immutable profile
- * version and recomputes the authoritative aggregate.
- */
-async function finalize(userId, tradeId, { evaluationId } = {}) {
-  if (!evaluationId) {
-    throw new ManagementQualityInputError('evaluationId is required to finalize.', 'EVALUATION_REQUIRED');
+function resolveTrailingState({
+  policy, partialTrigger, partialCompletion, partialExit, fillsState, daily, nowEpoch,
+  trailingPhase, sessionIndexForDate, executionWindowMinutes, stopExecutionClassification, userInputs
+}) {
+  const activation = policy.trailingActivation || null;
+  const activationSource = policy.trailingActivationSource || null;
+  const base = {
+    activation,
+    activationSource,
+    active: false,
+    activationResolved: false,
+    activationSessionIndex: null,
+    inactiveReason: null,
+    signal: null,
+    signalReason: null,
+    supersession: { outcome: 'none', reason: null, closeSessionDate: null, closeTimeEpoch: null },
+    execution: null,
+    executionReason: null,
+    exitPrice: fillsState && isFiniteNumber(fillsState.lastClosingPrice) ? fillsState.lastClosingPrice : null
+  };
+
+  if (!activation) return { ...base, inactiveReason: 'trailing_not_configured' };
+
+  if (activation === 'after_partial') {
+    if (partialExit && partialExit.outcome === 'superseded_protective') {
+      return { ...base, activationResolved: true, inactiveReason: 'protected_exit_before_partial' };
+    }
+    if (partialExit && (partialExit.outcome === 'superseded_discretionary' || partialExit.outcome === 'superseded_ambiguous')) {
+      return { ...base, activationResolved: false, inactiveReason: 'partial_exit_unclassified' };
+    }
+    if (!partialTrigger || partialTrigger.status === 'pending' || partialTrigger.status === 'insufficient_evidence') {
+      return { ...base, activationResolved: false, inactiveReason: 'partial_trigger_pending' };
+    }
+    if (partialTrigger.status === 'never_reached') {
+      return { ...base, activationResolved: true, inactiveReason: 'partial_never_triggered' };
+    }
+    if (!partialCompletion || !partialCompletion.completed) {
+      return { ...base, activationResolved: true, inactiveReason: 'partial_not_completed' };
+    }
+    base.active = true;
+    base.activationResolved = true;
+    base.activationSessionIndex = partialCompletion.completionSessionIndex;
+  } else if (activation === 'immediate') {
+    base.active = true;
+    base.activationResolved = true;
+    base.activationSessionIndex = daily.entryIndex;
+  } else if (activation === 'explicit') {
+    if (trailingPhase !== 'activated' && trailingPhase !== 'not_activated') {
+      return { ...base, activationResolved: false, inactiveReason: 'activation_not_asserted' };
+    }
+    if (trailingPhase === 'not_activated') {
+      return { ...base, activationResolved: true, inactiveReason: 'user_asserted_not_activated' };
+    }
+    base.active = true;
+    base.activationResolved = true;
+    const assertedSession = userInputs && userInputs.trailing_activation_session;
+    base.activationSessionIndex =
+      (assertedSession && sessionIndexForDate(assertedSession)) ??
+      (partialCompletion && partialCompletion.completionSessionIndex) ??
+      daily.entryIndex;
   }
+
+  if (!base.active) return base;
+  if (!daily.authoritative) {
+    return { ...base, signalReason: 'daily_evidence_unavailable' };
+  }
+
+  const selectedPeriod = userInputs ? Number(userInputs.trailing_ma_period) : null;
+  if (!Number.isInteger(selectedPeriod)) {
+    return { ...base, signalReason: 'trailing_ma_period_not_selected' };
+  }
+
+  const fromIndex = Number.isInteger(base.activationSessionIndex) ? base.activationSessionIndex : daily.entryIndex;
+  const completedThroughIndex = daily.completedThroughIndex;
+  const signal = findTrailingSignal({ bars: daily.bars, period: selectedPeriod, fromIndex, completedThroughIndex });
+
+  const positionClosed = !!(fillsState && fillsState.positionClosed);
+  const exit = fillsState && fillsState.firstFullClose ? fillsState.firstFullClose : null;
+
+  if (positionClosed && exit) {
+    const closedBeforeSignal = !signal || (exit.sessionDate && signal.date && exit.sessionDate < signal.date);
+    if (closedBeforeSignal) {
+      const verdict = classifyExit(fillsState.firstFullClose, stopExecutionClassification);
+      const outcome =
+        verdict === 'protective' ? 'superseded_protective'
+          : verdict === 'discretionary' ? 'superseded_discretionary'
+            : 'superseded_ambiguous';
+      return {
+        ...base,
+        signal,
+        signalReason: signal ? null : 'no_signal_before_exit',
+        supersession: { outcome, reason: 'exit_before_signal', closeSessionDate: exit.sessionDate || null, closeTimeEpoch: exit.timeEpoch ?? null }
+      };
+    }
+  }
+
+  if (!signal) {
+    return { ...base, signalReason: 'no_signal_within_available_evidence' };
+  }
+
+  const nextBar = daily.bars[signal.sessionIndex + 1];
+  const secondBar = daily.bars[signal.sessionIndex + 2];
+  const nextSession = nextBar
+    ? { date: nextBar.date, ...(regularSessionBounds(nextBar.date) || {}) }
+    : null;
+  const secondNextSession = secondBar
+    ? { date: secondBar.date, ...(regularSessionBounds(secondBar.date) || {}) }
+    : null;
+
+  if (positionClosed && exit && exit.sessionDate && signal.date && exit.sessionDate >= signal.date) {
+    const execution = classifyTrailingExecution({
+      nextSession,
+      secondNextSession,
+      actualExitEpoch: fillsState.lastClosingTimeEpoch,
+      executionWindowMinutes
+    });
+    return { ...base, signal, execution };
+  }
+
+  // Position still open after the signal.
+  const horizonCompleteForExit =
+    Number.isInteger(daily.completedThroughIndex) &&
+    daily.completedThroughIndex >= signal.sessionIndex + 2;
+  if (horizonCompleteForExit) {
+    return {
+      ...base,
+      signal,
+      execution: { outcome: 'later_or_ignored', reason: 'signal_ignored_position_still_open', nextSessionDate: nextSession ? nextSession.date : null, actualExitEpoch: null, beforeNextOpen: false }
+    };
+  }
+  return { ...base, signal, executionReason: 'insufficient_horizon_after_signal' };
+}
+
+function classifyExit(exitReduction, classification) {
+  // Production cannot classify fills (no order type). A trusted classification
+  // hook may supply per-fill verdicts; otherwise the exit is ambiguous.
+  if (!exitReduction) return 'ambiguous';
+  if (classification && classification.available === true) {
+    const verdict = (classification.byEpoch || {})[exitReduction.timeEpoch];
+    if (verdict === 'protective') return 'protective';
+    if (verdict === 'discretionary') return 'discretionary';
+    return classification.complete === true ? 'discretionary' : 'ambiguous';
+  }
+  return 'ambiguous';
+}
+
+async function finalize(userId, tradeId, { evaluationId } = {}) {
+  if (!evaluationId) throw new ManagementQualityInputError('evaluationId is required to finalize.', 'EVALUATION_REQUIRED');
   const evaluation = await resolveEvaluationForManagement(userId, tradeId, evaluationId);
   const results = parseJsonField(evaluation.results);
   if (!results || !results.setup || !results.entry || !results.management) {
@@ -890,16 +1288,12 @@ async function finalize(userId, tradeId, { evaluationId } = {}) {
       'MANAGEMENT_INCOMPLETE'
     );
   }
-
   const completed = await saveResult(evaluationId, userId, {
     status: EVALUATION_STATUS.COMPLETED,
     results: { setup: results.setup, entry: results.entry, management: results.management }
   });
   if (!completed) {
-    throw new ManagementQualityInputError(
-      'Evaluation could not be completed (it may already be terminal).',
-      'EVALUATION_TERMINAL'
-    );
+    throw new ManagementQualityInputError('Evaluation could not be completed (it may already be terminal).', 'EVALUATION_TERMINAL');
   }
   return { evaluation: toFrontendEvaluation(completed) };
 }
@@ -927,7 +1321,10 @@ module.exports = {
   buildManagementCriterionRows,
   buildManagementEvidenceBlock,
   parseTrailingPeriod,
+  parseTrailingPhase,
   resolveManagementDailyEvidence,
+  resolveDayOnePostEntryHigh,
+  resolveTrailingState,
   computeManagementDependencyFingerprint,
   computeManagementEntryDependencyFingerprint,
   toFrontendEvaluation
