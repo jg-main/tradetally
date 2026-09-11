@@ -28,7 +28,7 @@ const {
 } = require('./evaluationService');
 const { normalizeDailyBars, indexByDate, addCalendarDays } = require('./dailyEvidence');
 const { loadDailyEvidence } = require('./marketEvidenceService');
-const { loadSessionIntradayBars } = require('./intradayEvidenceService');
+const { loadSessionIntradayBars, missingIntervalStarts } = require('./intradayEvidenceService');
 const { setupDependencyFingerprint, entryDependencyFingerprint } = require('./dependencyFingerprint');
 const {
   reconstructManagementFills,
@@ -392,6 +392,21 @@ async function resolveDayOnePostEntryHigh({
     && isFiniteNumber(day1Bar.high)
     && day1Bar.high >= thresholdPrice;
 
+  const resolutionSeconds = 60;
+  const firstPostEntryInterval = isFiniteNumber(entryEpoch)
+    ? bounds.openEpoch + Math.ceil((entryEpoch - bounds.openEpoch) / resolutionSeconds) * resolutionSeconds
+    : bounds.openEpoch;
+
+  // The completed daily high itself is below the threshold: a definitive
+  // no-cross even when intraday evidence is sparse or absent.
+  if (!dailyAtOrAboveThreshold) {
+    return {
+      highKnown: true, high: null, highValueKnown: false,
+      definitivelyBelowThreshold: true, possibleX: false,
+      precision: null, source: null, reason: 'day1_daily_high_below_threshold'
+    };
+  }
+
   const boundedObservations = (observations || []).filter((obs) =>
     isFiniteNumber(obs.price) && obs.price > 0 &&
     isFiniteNumber(obs.epoch) &&
@@ -400,16 +415,17 @@ async function resolveDayOnePostEntryHigh({
     (!isFiniteNumber(entryEpoch) || obs.epoch >= entryEpoch)
   );
 
-  const resolutionSeconds = 60;
   let postEntryHigh = -Infinity;
   let precision = null;
   let source = null;
   let containingPossibleX = false;
   let intradayAvailable = false;
+  let intradayBars = [];
   try {
     const intraday = await loadSessionIntradayBars(symbol, day1Bar.date, userId);
     if (intraday && intraday.available && intraday.bars.length > 0) {
       intradayAvailable = true;
+      intradayBars = intraday.bars;
       for (const bar of intraday.bars) {
         if (!isFiniteNumber(bar.time) || !isFiniteNumber(bar.high)) continue;
         if (bar.time < bounds.openEpoch || bar.time >= bounds.closeEpoch) continue;
@@ -440,15 +456,26 @@ async function resolveDayOnePostEntryHigh({
   }
 
   if (thresholdPrice !== null && postEntryHigh >= thresholdPrice) {
-    // A fully post-entry bar or an execution print establishes the crossing.
-    return { highKnown: true, high: postEntryHigh, highValueKnown: true, possibleX: false, precision: precision || 'execution_print', source: source || 'executions_jsonb', reason: null };
+    // An observed fully post-entry bar or execution print establishes the
+    // crossing (no need for a gap-free full session), but the exact maximum may
+    // be understated by gaps, so the exact value is not claimed.
+    return { highKnown: true, high: postEntryHigh, highValueKnown: false, possibleX: false, precision: precision || 'execution_print', source: source || 'executions_jsonb', reason: null };
   }
   if (containingPossibleX) {
     return { highKnown: false, high: null, highValueKnown: false, possibleX: true, precision: null, source: null, reason: 'day1_containing_bar_could_cross' };
   }
   if (intradayAvailable) {
-    // The containing bar is provably below the threshold and no fully
-    // post-entry evidence reached it: Day 1 definitively did not cross.
+    // Sparse post-entry evidence cannot prove a no-cross: the daily high is
+    // at/above the threshold and one or more required post-entry intervals are
+    // missing, so Day 1 remains potentially a crossing day.
+    const missing = missingIntervalStarts(intradayBars, firstPostEntryInterval, bounds.closeEpoch, resolutionSeconds);
+    if (missing.length > 0) {
+      return {
+        highKnown: false, high: null, highValueKnown: false, possibleX: true,
+        precision: null, source: null, reason: 'day1_post_entry_intervals_missing',
+        missingIntervals: missing.length
+      };
+    }
     return {
       highKnown: true,
       high: postEntryHigh === -Infinity ? null : postEntryHigh,
@@ -460,20 +487,9 @@ async function resolveDayOnePostEntryHigh({
       reason: null
     };
   }
-  if (dailyAtOrAboveThreshold) {
-    // No intraday evidence: the daily high could include a post-entry crossing.
-    return { highKnown: false, high: null, highValueKnown: false, possibleX: true, precision: null, source: null, reason: 'day1_post_entry_evidence_unavailable' };
-  }
-  return {
-    highKnown: true,
-    high: postEntryHigh === -Infinity ? null : postEntryHigh,
-    highValueKnown: postEntryHigh !== -Infinity,
-    definitivelyBelowThreshold: true,
-    possibleX: false,
-    precision,
-    source,
-    reason: null
-  };
+  // No intraday evidence at all and the daily high is at/above the threshold:
+  // the crossing could have happened post-entry, so Day 1 is uncertain.
+  return { highKnown: false, high: null, highValueKnown: false, possibleX: true, precision: null, source: null, reason: 'day1_post_entry_evidence_unavailable' };
 }
 
 function buildManagementState({
@@ -646,6 +662,10 @@ function buildManagementEvidenceBlock({
           crossing_source: partialTrigger.crossing ? partialTrigger.crossing.source : null,
           crossing_interval_start: partialTrigger.crossing ? partialTrigger.crossing.intervalStartEpoch ?? null : null,
           crossing_interval_end: partialTrigger.crossing ? partialTrigger.crossing.intervalEndEpoch ?? null : null,
+          crossing_uncertain: partialTrigger.crossing ? partialTrigger.crossing.uncertain === true : false,
+          crossing_uncertainty_start: partialTrigger.crossing ? partialTrigger.crossing.uncertaintyStartEpoch ?? null : null,
+          crossing_uncertainty_end: partialTrigger.crossing ? partialTrigger.crossing.uncertaintyEndEpoch ?? null : null,
+          crossing_authoritative: partialTrigger.crossing ? partialTrigger.crossing.authoritative === true : false,
           boundary: partialTrigger.boundary
             ? {
                 kind: partialTrigger.boundary.kind,
@@ -653,6 +673,9 @@ function buildManagementEvidenceBlock({
                 epoch: partialTrigger.boundary.epoch,
                 interval_start: partialTrigger.boundary.intervalStartEpoch ?? null,
                 interval_end: partialTrigger.boundary.intervalEndEpoch ?? null,
+                uncertainty_start: partialTrigger.boundary.uncertaintyStartEpoch ?? null,
+                uncertainty_end: partialTrigger.boundary.uncertaintyEndEpoch ?? null,
+                uncertain: partialTrigger.boundary.uncertain === true,
                 precision: partialTrigger.boundary.precision || null,
                 source: partialTrigger.boundary.source || null,
                 ordering_known: partialTrigger.boundary.orderingKnown === true
@@ -1020,12 +1043,19 @@ async function resolveManagementCore({
         .filter((day) => day.day < reachDay && day.highKnown && isFiniteNumber(day.high))
         .reduce((max, day) => (max === null ? day.high : Math.max(max, day.high)), null);
       const thresholdPrice = entryContext.entryBasis + policy.partialTrigger.minimum_mfe_r * initialR.r_per_share;
+      const bounds = reachBar ? regularSessionBounds(reachBar.date) : null;
+      // Validate only the path required for the crossing: from the session open
+      // (or the first fully post-entry interval on Day 1) to the candidate.
+      const pathStartEpoch = bounds
+        ? (reachDay === 1 && isFiniteNumber(entryContext.entryEpoch)
+            ? bounds.openEpoch + Math.ceil((entryContext.entryEpoch - bounds.openEpoch) / 60) * 60
+            : bounds.openEpoch)
+        : null;
       let crossing = null;
       if (reachBar) {
         try {
           const intraday = await loadSessionIntradayBars(symbol, reachBar.date, userId);
           if (intraday && intraday.available && intraday.bars.length > 0) {
-            const bounds = regularSessionBounds(reachBar.date);
             // Entry-print observations are only relevant to the Day-1 crossing;
             // Days 2+ have their own session evidence.
             const observations = reachDay === 1
@@ -1040,15 +1070,28 @@ async function resolveManagementCore({
               entryEpoch: reachDay === 1 ? entryContext.entryEpoch : null,
               sessionOpenEpoch: bounds ? bounds.openEpoch : null,
               sessionCloseEpoch: bounds ? bounds.closeEpoch : null,
+              pathStartEpoch,
               observations
             });
             if (found.crossed) {
+              const uncertain = isFiniteNumber(found.uncertaintyStartEpoch) && isFiniteNumber(found.uncertaintyEndEpoch);
+              const isExecutionPrint = found.precision === 'execution_print';
               crossing = {
-                epoch: isFiniteNumber(found.crossingEpoch) ? found.crossingEpoch : null,
-                intervalStartEpoch: isFiniteNumber(found.crossingStartEpoch) ? found.crossingStartEpoch : null,
-                intervalEndEpoch: isFiniteNumber(found.crossingEndEpoch) ? found.crossingEndEpoch : null,
+                epoch: uncertain ? null : (isFiniteNumber(found.crossingEpoch) ? found.crossingEpoch : null),
+                intervalStartEpoch: uncertain
+                  ? found.uncertaintyStartEpoch
+                  : (isFiniteNumber(found.crossingStartEpoch) ? found.crossingStartEpoch : null),
+                intervalEndEpoch: uncertain
+                  ? found.uncertaintyEndEpoch
+                  : (isFiniteNumber(found.crossingEndEpoch) ? found.crossingEndEpoch : null),
+                uncertaintyStartEpoch: uncertain ? found.uncertaintyStartEpoch : null,
+                uncertaintyEndEpoch: uncertain ? found.uncertaintyEndEpoch : null,
+                uncertain,
+                authoritative: found.authoritative === true,
                 precision: found.precision,
-                source: intraday.source || found.source
+                // An exact execution print keeps its executions_jsonb provenance;
+                // a candle interval keeps the provider/cache source.
+                source: isExecutionPrint ? 'executions_jsonb' : (intraday.source || found.source)
               };
             }
           }
@@ -1061,13 +1104,18 @@ async function resolveManagementCore({
           epoch: null,
           intervalStartEpoch: null,
           intervalEndEpoch: null,
+          uncertaintyStartEpoch: null,
+          uncertaintyEndEpoch: null,
+          uncertain: false,
+          authoritative: false,
           precision: reachDay === 1 ? 'daily_bar' : 'session',
           source: daily.source || 'daily_bar'
         };
       }
       // The crossing evidence also establishes the authoritative boundary when
       // the first reach is on/after earliest_day. A 1-minute bar establishes an
-      // interval, never a fabricated exact instant.
+      // interval (or a conservative uncertainty interval), never a fabricated
+      // exact instant.
       let boundary = partialTrigger.boundary;
       if (boundary && boundary.kind === 'crossing') {
         boundary = {
@@ -1075,6 +1123,9 @@ async function resolveManagementCore({
           epoch: isFiniteNumber(crossing.epoch) ? crossing.epoch : null,
           intervalStartEpoch: isFiniteNumber(crossing.intervalStartEpoch) ? crossing.intervalStartEpoch : null,
           intervalEndEpoch: isFiniteNumber(crossing.intervalEndEpoch) ? crossing.intervalEndEpoch : null,
+          uncertaintyStartEpoch: isFiniteNumber(crossing.uncertaintyStartEpoch) ? crossing.uncertaintyStartEpoch : null,
+          uncertaintyEndEpoch: isFiniteNumber(crossing.uncertaintyEndEpoch) ? crossing.uncertaintyEndEpoch : null,
+          uncertain: crossing.uncertain === true,
           precision: crossing.precision || 'session',
           source: crossing.source || null,
           orderingKnown: isFiniteNumber(crossing.epoch)
@@ -1247,7 +1298,10 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   // partial; the SMA is parsed if supplied but only *required* once the
   // trailing phase is proven active. explicit/immediate require it up front.
   const maInputEnabled = requiredInputs.includes('trailing_ma_period') && trailingPhase !== 'not_activated';
-  const maRequiredUpFront = maInputEnabled && policy.trailingActivation !== 'after_partial';
+  // Dependency order: for explicit activation the phase and activation session
+  // are validated first, so the SMA is only required up front for `immediate`
+  // (and post-resolution when an `after_partial`/`explicit` phase is active).
+  const maRequiredUpFront = maInputEnabled && policy.trailingActivation === 'immediate';
   if (persistedTrailing) {
     if (requestedTrailing === undefined || requestedTrailing === null || requestedTrailing === '' || Number(requestedTrailing) === persistedTrailing) {
       trailingPeriod = persistedTrailing;
@@ -1373,22 +1427,32 @@ async function evaluate(userId, tradeId, { evaluationId, userInputs: rawUserInpu
   });
 
   // Explicit activation without an authoritative boundary needs semantic input;
-  // never scan from entry. An invalid asserted boundary is rejected clearly
-  // rather than silently shifted.
-  if (policy.trailingActivation === 'explicit' && trailingPhase === 'activated') {
-    if (!trailingActivationSession) {
+  // never scan from entry. The dependency order is phase -> activation session
+  // -> SMA. An invalid asserted boundary is rejected clearly rather than
+  // silently shifted.
+  if (policy.trailingActivation === 'explicit') {
+    if (trailingPhase !== 'activated' && trailingPhase !== 'not_activated') {
       throw new ManagementQualityInputError(
-        'trailing_activation_session is required when the trailing phase is asserted activated.',
+        'trailing_phase is required when explicit trailing activation is configured.',
         'INPUT_REQUIRED',
-        { field: 'trailing_activation_session' }
+        { field: 'trailing_phase' }
       );
     }
-    if (trailing.active !== true) {
-      throw new ManagementQualityInputError(
-        `trailing_activation_session ${trailingActivationSession} is not a valid authoritative activation boundary (${trailing.inactiveReason || 'unresolved'}).`,
-        'INVALID_ACTIVATION_SESSION',
-        { reason: trailing.inactiveReason || null }
-      );
+    if (trailingPhase === 'activated') {
+      if (!trailingActivationSession) {
+        throw new ManagementQualityInputError(
+          'trailing_activation_session is required when the trailing phase is asserted activated.',
+          'INPUT_REQUIRED',
+          { field: 'trailing_activation_session' }
+        );
+      }
+      if (trailing.active !== true) {
+        throw new ManagementQualityInputError(
+          `trailing_activation_session ${trailingActivationSession} is not a valid authoritative activation boundary (${trailing.inactiveReason || 'unresolved'}).`,
+          'INVALID_ACTIVATION_SESSION',
+          { reason: trailing.inactiveReason || null }
+        );
+      }
     }
   }
   if (trailing.active === true && !trailingPeriod) {

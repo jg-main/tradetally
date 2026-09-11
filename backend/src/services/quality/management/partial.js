@@ -62,15 +62,18 @@ function relationToBoundary(reduction, boundary) {
   if (boundary.orderingKnown && isFiniteNumber(boundary.epoch) && isFiniteNumber(epoch)) {
     return epoch < boundary.epoch ? 'same_before' : 'same_after';
   }
-  // 1-minute bar-interval boundary: only definite before/after the interval is
-  // knowable; a reduction inside the bar is ambiguous.
-  if (
-    isFiniteNumber(boundary.intervalStartEpoch) &&
-    isFiniteNumber(boundary.intervalEndEpoch) &&
-    isFiniteNumber(epoch)
-  ) {
-    if (epoch < boundary.intervalStartEpoch) return 'same_before';
-    if (epoch >= boundary.intervalEndEpoch) return 'same_after';
+  // 1-minute bar interval OR conservative first-crossing uncertainty interval:
+  // only definite before/after the window is knowable; a reduction inside the
+  // window is ambiguous.
+  const windowStart = isFiniteNumber(boundary.uncertaintyStartEpoch)
+    ? boundary.uncertaintyStartEpoch
+    : boundary.intervalStartEpoch;
+  const windowEnd = isFiniteNumber(boundary.uncertaintyEndEpoch)
+    ? boundary.uncertaintyEndEpoch
+    : boundary.intervalEndEpoch;
+  if (isFiniteNumber(windowStart) && isFiniteNumber(windowEnd) && isFiniteNumber(epoch)) {
+    if (epoch < windowStart) return 'same_before';
+    if (epoch >= windowEnd) return 'same_after';
     return 'same_unknown';
   }
   // Session-level crossing with no intraday evidence: unknown ordering.

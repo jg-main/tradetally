@@ -320,3 +320,76 @@ describe('resolvePartialTrigger — authoritative boundary (F1)', () => {
     expect(result.boundary.orderingKnown).toBe(false);
   });
 });
+
+describe('findCrossingInSession — sparse-intraday first-crossing discipline (F1 blocker)', () => {
+  // Session open 10:00:00 for readability; resolution 60s.
+  const OPEN = 1_000_000;
+  const CLOSE = OPEN + 6.5 * 3600;
+  const base = { sessionOpenEpoch: OPEN, sessionCloseEpoch: CLOSE, entryEpoch: null, priorHighest: -Infinity };
+
+  it('A: a missing interval before the observed crossing yields an uncertainty interval, not a narrow bar', () => {
+    const bars = [
+      { time: OPEN, high: 101 },          // 10:00 below
+      { time: OPEN + 120, high: 101 },    // 10:02 below (10:01 missing)
+      { time: OPEN + 180, high: 106 }     // 10:03 crosses
+    ];
+    const result = findCrossingInSession({ ...base, bars, thresholdPrice: 105 });
+    expect(result.crossed).toBe(true);
+    expect(result.authoritative).toBe(false);
+    expect(result.crossingStartEpoch).toBeNull();
+    expect(result.crossingEpoch).toBeNull();
+    expect(result.uncertaintyStartEpoch).toBe(OPEN + 60); // earliest missing 10:01
+    expect(result.uncertaintyEndEpoch).toBe(OPEN + 240);  // end of the 10:03 bar
+    expect(result.reason).toBe('preceding_intraday_intervals_missing');
+  });
+
+  it('B: with the preceding path complete the crossing interval is authoritative', () => {
+    const bars = [
+      { time: OPEN, high: 101 },
+      { time: OPEN + 60, high: 101 },
+      { time: OPEN + 120, high: 101 },
+      { time: OPEN + 180, high: 106 }
+    ];
+    const result = findCrossingInSession({ ...base, bars, thresholdPrice: 105 });
+    expect(result.crossed).toBe(true);
+    expect(result.authoritative).toBe(true);
+    expect(result.uncertaintyStartEpoch).toBeNull();
+    expect(result.crossingStartEpoch).toBe(OPEN + 180);
+    expect(result.crossingEndEpoch).toBe(OPEN + 240);
+    expect(result.precision).toBe('1min_bar');
+  });
+
+  it('C: an exact execution print with a complete preceding path establishes the exact first crossing', () => {
+    const bars = [
+      { time: OPEN, high: 101 },
+      { time: OPEN + 60, high: 101 },
+      { time: OPEN + 120, high: 101 }
+    ];
+    const result = findCrossingInSession({
+      ...base, bars, thresholdPrice: 103,
+      observations: [{ epoch: OPEN + 200, price: 103.5 }]
+    });
+    expect(result.crossed).toBe(true);
+    expect(result.authoritative).toBe(true);
+    expect(result.crossingEpoch).toBe(OPEN + 200);
+    expect(result.precision).toBe('execution_print');
+    expect(result.source).toBe('executions_jsonb');
+  });
+
+  it('D: an exact execution print with a prior missing interval does NOT establish the first-crossing instant', () => {
+    const bars = [
+      { time: OPEN, high: 101 },
+      { time: OPEN + 120, high: 101 } // 10:01 missing
+    ];
+    const result = findCrossingInSession({
+      ...base, bars, thresholdPrice: 103,
+      observations: [{ epoch: OPEN + 200, price: 103.5 }]
+    });
+    expect(result.crossed).toBe(true);
+    expect(result.authoritative).toBe(false);
+    expect(result.crossingEpoch).toBeNull();
+    expect(result.uncertaintyStartEpoch).toBe(OPEN + 60);
+    expect(result.uncertaintyEndEpoch).toBe(OPEN + 200);
+    expect(result.precision).toBe('execution_print');
+  });
+});

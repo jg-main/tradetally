@@ -577,11 +577,20 @@ describe('ManagementQualityService.finalize', () => {
   });
 });
 
-describe('resolveDayOnePostEntryHigh — containing-bar ambiguity (F1)', () => {
+describe('resolveDayOnePostEntryHigh — containing-bar + sparse-path discipline (F1)', () => {
   const { regularSessionBounds } = require('../../../src/services/quality/entry/sessionTime');
   const DATE = '2026-03-12';
   const bounds = regularSessionBounds(DATE);
   const entryEpoch = bounds.openEpoch + 30; // entry 09:30:30
+
+  function sessionBars({ high = 101, omit = [] } = {}) {
+    const bars = [];
+    for (let t = bounds.openEpoch; t < bounds.closeEpoch; t += 60) {
+      if (omit.includes(t)) continue;
+      bars.push({ time: t, open: high, high, low: high, close: high });
+    }
+    return bars;
+  }
 
   beforeEach(() => {
     loadSessionIntradayBars.mockReset();
@@ -591,69 +600,81 @@ describe('resolveDayOnePostEntryHigh — containing-bar ambiguity (F1)', () => {
     loadSessionIntradayBars.mockResolvedValue({
       available: true,
       source: 'test_intraday',
-      bars: [
-        { time: bounds.openEpoch, high: 106 },        // 09:30 containing bar could cross +1R
-        { time: bounds.openEpoch + 60, high: 101 },   // fully post-entry, below
-        { time: bounds.openEpoch + 120, high: 101 }
-      ]
+      bars: [{ time: bounds.openEpoch, high: 106 }, ...sessionBars({ omit: [bounds.openEpoch] })]
     });
     const result = await ManagementQualityService.resolveDayOnePostEntryHigh({
       day1Bar: { date: DATE, high: 106 },
-      entryEpoch,
-      entryBasis: 100,
-      rPerShare: 5,
-      minimumMfeR: 1.0,
-      symbol: 'TEST',
-      userId: USER_ID,
-      observations: []
+      entryEpoch, entryBasis: 100, rPerShare: 5, minimumMfeR: 1.0, symbol: 'TEST', userId: USER_ID, observations: []
     });
     expect(result.highKnown).toBe(false);
     expect(result.possibleX).toBe(true);
     expect(result.reason).toBe('day1_containing_bar_could_cross');
   });
 
-  test('entry inside a containing bar provably below +1R lets later evidence resolve Day 1 normally', async () => {
+  test('E: containing bar below +1R with a missing post-entry interval keeps Day 1 uncertain', async () => {
     loadSessionIntradayBars.mockResolvedValue({
       available: true,
       source: 'test_intraday',
-      bars: [
-        { time: bounds.openEpoch, high: 101 },        // 09:30 containing bar below +1R
-        { time: bounds.openEpoch + 60, high: 102 }    // fully post-entry
-      ]
+      // 09:31 missing; every observed regular-session bar is below +1R.
+      bars: sessionBars({ high: 101, omit: [bounds.openEpoch + 60] })
     });
     const result = await ManagementQualityService.resolveDayOnePostEntryHigh({
-      day1Bar: { date: DATE, high: 102 },
-      entryEpoch,
-      entryBasis: 100,
-      rPerShare: 5,
-      minimumMfeR: 1.0,
-      symbol: 'TEST',
-      userId: USER_ID,
-      observations: []
+      day1Bar: { date: DATE, high: 106 }, // daily high >= threshold (could be in the gap)
+      entryEpoch, entryBasis: 100, rPerShare: 5, minimumMfeR: 1.0, symbol: 'TEST', userId: USER_ID, observations: []
+    });
+    expect(result.highKnown).toBe(false);
+    expect(result.possibleX).toBe(true);
+    expect(result.reason).toBe('day1_post_entry_intervals_missing');
+    expect(result.missingIntervals).toBeGreaterThan(0);
+  });
+
+  test('F: a complete post-entry path below +1R is a definitive no-cross', async () => {
+    loadSessionIntradayBars.mockResolvedValue({
+      available: true,
+      source: 'test_intraday',
+      bars: sessionBars({ high: 101 }) // complete regular session, all below +1R
+    });
+    const result = await ManagementQualityService.resolveDayOnePostEntryHigh({
+      // daily high >= threshold from outside the regular session (e.g. premarket)
+      day1Bar: { date: DATE, high: 106 },
+      entryEpoch, entryBasis: 100, rPerShare: 5, minimumMfeR: 1.0, symbol: 'TEST', userId: USER_ID, observations: []
     });
     expect(result.highKnown).toBe(true);
     expect(result.possibleX).toBe(false);
-    expect(result.high).toBe(102);
+    expect(result.definitivelyBelowThreshold).toBe(true);
+    expect(result.high).toBe(101);
   });
 
-  test('a fully post-entry bar that crosses establishes the Day-1 crossing', async () => {
+  test('G: a daily high below +1R is a definitive no-cross even with missing intraday bars', async () => {
+    loadSessionIntradayBars.mockResolvedValue({
+      available: true,
+      source: 'test_intraday',
+      bars: sessionBars({ high: 101, omit: [bounds.openEpoch + 60, bounds.openEpoch + 120] })
+    });
+    const result = await ManagementQualityService.resolveDayOnePostEntryHigh({
+      day1Bar: { date: DATE, high: 102 },
+      entryEpoch, entryBasis: 100, rPerShare: 5, minimumMfeR: 1.0, symbol: 'TEST', userId: USER_ID, observations: []
+    });
+    expect(result.highKnown).toBe(true);
+    expect(result.possibleX).toBe(false);
+    expect(result.definitivelyBelowThreshold).toBe(true);
+    expect(result.highValueKnown).toBe(false);
+    expect(result.reason).toBe('day1_daily_high_below_threshold');
+  });
+
+  test('a fully post-entry observed bar that crosses establishes the Day-1 crossing', async () => {
     loadSessionIntradayBars.mockResolvedValue({
       available: true,
       source: 'test_intraday',
       bars: [
         { time: bounds.openEpoch, high: 101 },
-        { time: bounds.openEpoch + 60, high: 106 }    // fully post-entry crossing
+        { time: bounds.openEpoch + 60, high: 106 }, // fully post-entry crossing
+        ...sessionBars({ omit: [bounds.openEpoch, bounds.openEpoch + 60] })
       ]
     });
     const result = await ManagementQualityService.resolveDayOnePostEntryHigh({
       day1Bar: { date: DATE, high: 106 },
-      entryEpoch,
-      entryBasis: 100,
-      rPerShare: 5,
-      minimumMfeR: 1.0,
-      symbol: 'TEST',
-      userId: USER_ID,
-      observations: []
+      entryEpoch, entryBasis: 100, rPerShare: 5, minimumMfeR: 1.0, symbol: 'TEST', userId: USER_ID, observations: []
     });
     expect(result.highKnown).toBe(true);
     expect(result.possibleX).toBe(false);
@@ -661,27 +682,30 @@ describe('resolveDayOnePostEntryHigh — containing-bar ambiguity (F1)', () => {
     expect(result.precision).toBe('1min_bar');
   });
 
-  test('a containing bar below +1R with no fully post-entry evidence is a definitive no-cross with an unknown exact value', async () => {
+  test('a containing bar below +1R with no fully post-entry evidence is uncertain (sparse path)', async () => {
     loadSessionIntradayBars.mockResolvedValue({
       available: true,
       source: 'test_intraday',
       bars: [{ time: bounds.openEpoch, high: 101 }] // only the containing bar
     });
     const result = await ManagementQualityService.resolveDayOnePostEntryHigh({
-      day1Bar: { date: DATE, high: 101 },
-      entryEpoch,
-      entryBasis: 100,
-      rPerShare: 5,
-      minimumMfeR: 1.0,
-      symbol: 'TEST',
-      userId: USER_ID,
-      observations: []
+      day1Bar: { date: DATE, high: 106 },
+      entryEpoch, entryBasis: 100, rPerShare: 5, minimumMfeR: 1.0, symbol: 'TEST', userId: USER_ID, observations: []
     });
-    expect(result.highKnown).toBe(true);
-    expect(result.possibleX).toBe(false);
-    expect(result.definitivelyBelowThreshold).toBe(true);
-    expect(result.highValueKnown).toBe(false);
-    expect(result.high).toBeNull();
+    expect(result.highKnown).toBe(false);
+    expect(result.possibleX).toBe(true);
+    expect(result.reason).toBe('day1_post_entry_intervals_missing');
+  });
+
+  test('no intraday evidence at all with daily high >= +1R keeps Day 1 uncertain', async () => {
+    loadSessionIntradayBars.mockResolvedValue({ available: false, bars: [], source: null });
+    const result = await ManagementQualityService.resolveDayOnePostEntryHigh({
+      day1Bar: { date: DATE, high: 106 },
+      entryEpoch, entryBasis: 100, rPerShare: 5, minimumMfeR: 1.0, symbol: 'TEST', userId: USER_ID, observations: []
+    });
+    expect(result.highKnown).toBe(false);
+    expect(result.possibleX).toBe(true);
+    expect(result.reason).toBe('day1_post_entry_evidence_unavailable');
   });
 });
 
@@ -920,5 +944,101 @@ describe('explicit activation end-to-end (F4)', () => {
     expect(payload.evaluation).toBeTruthy();
     const data = evaluationService.saveManagementProgress.mock.calls[0][2];
     expect(data.trailingActivation).toMatchObject({ mode: 'establish', session: '2026-03-12' });
+  });
+});
+
+describe('crossing provenance (F3)', () => {
+  test('a candle interval keeps the actual provider/cache source', async () => {
+    await ManagementQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: EVAL_ID,
+      userInputs: { trailing_ma_period: 20 }
+    });
+    const data = evaluationService.saveManagementProgress.mock.calls[0][2];
+    expect(data.managementEvidence.partial_trigger.crossing_precision).toBe('1min_bar');
+    expect(data.managementEvidence.partial_trigger.crossing_source).toBe('test_intraday');
+  });
+
+  test('an exact execution_print crossing keeps source executions_jsonb (not the intraday provider)', async () => {
+    const printTrade = tradeRow({
+      executions: [
+        { action: 'buy', quantity: 200, price: 106, datetime: '2026-03-10T14:30:00.000Z' },
+        { action: 'sell', quantity: 100, price: 110, datetime: '2026-03-12T15:00:00.000Z' }
+      ]
+    });
+    db.query.mockImplementation((sql) => {
+      if (sql.includes('FROM trades')) return Promise.resolve({ rows: [printTrade] });
+      if (sql.includes('FROM quality_profile_versions v') && sql.includes('p.name AS profile_name')) {
+        return Promise.resolve({ rows: [{ id: VERSION_ID, version_number: 1, schema_version: 1, configuration: CONFIG, profile_id: 'profile-1', profile_name: 'Canonical BO' }] });
+      }
+      return Promise.resolve({ rows: [] });
+    });
+    const entryOpen = Math.floor(Date.parse('2026-03-10T13:30:00.000Z') / 1000);
+    // The entry-session daily high must reflect the print, otherwise the daily
+    // high short-circuits to a definitive no-cross.
+    const barsWithPrint = DAILY_BARS.map((bar) =>
+      bar.date === ENTRY_SESSION ? { ...bar, high: 106 } : bar
+    );
+    loadDailyEvidence.mockResolvedValue({ bars: barsWithPrint, source: 'finnhub', completeness: 'verified', error: null });
+    loadSessionIntradayBars.mockImplementation(async (symbol, date) => {
+      if (date === '2026-03-10') {
+        return { available: true, source: 'test_provider', bars: [{ time: entryOpen, high: 101, low: 100, close: 101 }] };
+      }
+      return { available: false, bars: [], source: null, reason: 'no intraday' };
+    });
+
+    await ManagementQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: EVAL_ID,
+      userInputs: { trailing_ma_period: 20 }
+    });
+    const data = evaluationService.saveManagementProgress.mock.calls[0][2];
+    expect(data.managementEvidence.partial_trigger.crossing_precision).toBe('execution_print');
+    expect(data.managementEvidence.partial_trigger.crossing_source).toBe('executions_jsonb');
+  });
+});
+
+describe('evaluate explicit required-input order (F2)', () => {
+  function explicitConfig() {
+    const config = JSON.parse(JSON.stringify(CONFIG));
+    config.dimensions.management.criteria.find((c) => c.key === 'trailing_ma').parameters.activation = 'explicit';
+    return config;
+  }
+
+  test('no phase assertion => INPUT_REQUIRED field trailing_phase first (not trailing_ma_period)', async () => {
+    installDbRouter(explicitConfig());
+    await expect(
+      ManagementQualityService.evaluate(USER_ID, TRADE_ID, { evaluationId: EVAL_ID })
+    ).rejects.toMatchObject({ code: 'INPUT_REQUIRED', details: { field: 'trailing_phase' } });
+  });
+
+  test('phase=not_activated => no SMA/session required', async () => {
+    installDbRouter(explicitConfig());
+    const payload = await ManagementQualityService.evaluate(USER_ID, TRADE_ID, {
+      evaluationId: EVAL_ID,
+      userInputs: { trailing_phase: 'not_activated' }
+    });
+    expect(payload.evaluation).toBeTruthy();
+    const data = evaluationService.saveManagementProgress.mock.calls[0][2];
+    const trailing = data.managementResults.criterionResults.find((r) => r.key === 'trailing_ma');
+    expect(trailing.status).toBe('NOT_APPLICABLE');
+  });
+
+  test('phase=activated with no session => INPUT_REQUIRED field trailing_activation_session (before the SMA)', async () => {
+    installDbRouter(explicitConfig());
+    await expect(
+      ManagementQualityService.evaluate(USER_ID, TRADE_ID, {
+        evaluationId: EVAL_ID,
+        userInputs: { trailing_phase: 'activated' }
+      })
+    ).rejects.toMatchObject({ code: 'INPUT_REQUIRED', details: { field: 'trailing_activation_session' } });
+  });
+
+  test('phase=activated with a valid session but no SMA => INPUT_REQUIRED field trailing_ma_period', async () => {
+    installDbRouter(explicitConfig());
+    await expect(
+      ManagementQualityService.evaluate(USER_ID, TRADE_ID, {
+        evaluationId: EVAL_ID,
+        userInputs: { trailing_phase: 'activated', trailing_activation_session: '2026-03-12' }
+      })
+    ).rejects.toMatchObject({ code: 'INPUT_REQUIRED', details: { field: 'trailing_ma_period' } });
   });
 });

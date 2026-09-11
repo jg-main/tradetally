@@ -22,6 +22,12 @@
 //         session OPEN (no second touch required);
 //       * first reach on earliest_day..latest_day -> due at the first
 //         trustworthy crossing instant.
+//   - A first crossing may only be claimed at bar precision when the minute
+//     path PRECEDING the candidate is complete (reusing the Phase-3 sufficiency
+//     helpers). Sparse evidence yields a conservative uncertainty interval
+//     rather than a fabricated narrow [barOpen, barClose).
+
+const { missingIntervalStarts } = require('../intradayEvidenceService');
 
 function isFiniteNumber(value) {
   return typeof value === 'number' && Number.isFinite(value);
@@ -77,7 +83,7 @@ function buildDayEvidence({ bars, entryIndex, latestDay, isSessionCompleted, ses
   return days;
 }
 
-function buildBoundary(day, { kind, epoch, precision, source, orderingKnown, intervalStartEpoch, intervalEndEpoch }) {
+function buildBoundary(day, { kind, epoch, precision, source, orderingKnown, intervalStartEpoch, intervalEndEpoch, uncertaintyStartEpoch, uncertaintyEndEpoch, uncertain }) {
   return {
     kind,
     // Instant boundaries (session open / crossing) order by epoch or interval;
@@ -92,6 +98,11 @@ function buildBoundary(day, { kind, epoch, precision, source, orderingKnown, int
     // A 1-minute crossing is an INTERVAL, never a fabricated exact instant.
     intervalStartEpoch: isFiniteNumber(intervalStartEpoch) ? intervalStartEpoch : null,
     intervalEndEpoch: isFiniteNumber(intervalEndEpoch) ? intervalEndEpoch : null,
+    // Conservative first-crossing uncertainty interval when the preceding
+    // minute path is sparse.
+    uncertaintyStartEpoch: isFiniteNumber(uncertaintyStartEpoch) ? uncertaintyStartEpoch : null,
+    uncertaintyEndEpoch: isFiniteNumber(uncertaintyEndEpoch) ? uncertaintyEndEpoch : null,
+    uncertain: uncertain === true,
     precision: precision || null,
     source: source || null,
     orderingKnown: orderingKnown === true
@@ -249,8 +260,10 @@ function findCrossingInSession({
   sessionOpenEpoch,
   sessionCloseEpoch,
   observations = [],
-  barResolutionSeconds = 60
+  barResolutionSeconds = 60,
+  pathStartEpoch
 }) {
+  const resolution = isFiniteNumber(barResolutionSeconds) && barResolutionSeconds > 0 ? barResolutionSeconds : 60;
   let highest = isFiniteNumber(priorHighest) ? priorHighest : -Infinity;
   const scoped = (bars || [])
     .filter((bar) => isFiniteNumber(bar.time))
@@ -266,48 +279,85 @@ function findCrossingInSession({
     .filter((o) => !isFiniteNumber(entryEpoch) || o.epoch >= entryEpoch)
     .sort((a, b) => a.epoch - b.epoch);
 
-  const printCrossing = (observation) => ({
-    crossed: true,
-    crossingEpoch: observation.epoch,
-    crossingStartEpoch: null,
-    crossingEndEpoch: null,
-    price: observation.price,
-    precision: 'execution_print',
-    source: 'executions_jsonb',
-    reason: null
-  });
+  let pathStart = null;
+  if (isFiniteNumber(pathStartEpoch)) {
+    pathStart = pathStartEpoch;
+  } else if (isFiniteNumber(sessionOpenEpoch)) {
+    // Day 1: the path to validate begins at the first fully post-entry interval.
+    pathStart = isFiniteNumber(entryEpoch) && entryEpoch > sessionOpenEpoch
+      ? sessionOpenEpoch + Math.ceil((entryEpoch - sessionOpenEpoch) / resolution) * resolution
+      : sessionOpenEpoch;
+  } else if (scoped.length > 0) {
+    pathStart = scoped[0].time;
+  }
+  const regionStart = isFiniteNumber(entryEpoch) && isFiniteNumber(pathStart)
+    ? Math.min(entryEpoch, pathStart)
+    : pathStart;
+
+  // A candidate crossing is only authoritative when every expected 1-minute
+  // interval before it is present. Otherwise the true first crossing may have
+  // occurred in an earlier missing interval, so we return a conservative
+  // uncertainty interval instead of a fabricated narrow bar interval.
+  const resolveCandidate = ({ price, precision, source, candidateStart, candidateEnd }) => {
+    const beforePathStart = isFiniteNumber(pathStart) && isFiniteNumber(candidateStart) && candidateStart < pathStart;
+    const missing = (!isFiniteNumber(pathStart) || beforePathStart || !isFiniteNumber(candidateStart))
+      ? []
+      : missingIntervalStarts(scoped, pathStart, candidateStart, resolution);
+    if (missing.length === 0 && isFiniteNumber(candidateStart) && !beforePathStart) {
+      if (precision === 'execution_print') {
+        return {
+          crossed: true, crossingEpoch: candidateStart, crossingStartEpoch: null, crossingEndEpoch: null,
+          uncertaintyStartEpoch: null, uncertaintyEndEpoch: null, authoritative: true,
+          price, precision, source, missingIntervals: 0, reason: null
+        };
+      }
+      return {
+        crossed: true, crossingEpoch: null, crossingStartEpoch: candidateStart, crossingEndEpoch: candidateEnd,
+        uncertaintyStartEpoch: null, uncertaintyEndEpoch: null, authoritative: true,
+        price, precision, source, missingIntervals: 0, reason: null
+      };
+    }
+    const start = missing.length > 0
+      ? Math.min(...missing)
+      : (isFiniteNumber(regionStart) ? regionStart : candidateStart);
+    return {
+      crossed: true, crossingEpoch: null, crossingStartEpoch: null, crossingEndEpoch: null,
+      uncertaintyStartEpoch: start, uncertaintyEndEpoch: candidateEnd, authoritative: false,
+      price, precision, source, missingIntervals: missing.length,
+      reason: missing.length > 0 ? 'preceding_intraday_intervals_missing' : 'candidate_precedes_validated_path_start'
+    };
+  };
 
   let obsIndex = 0;
   for (const bar of scoped) {
     while (obsIndex < obs.length && obs[obsIndex].epoch <= bar.time) {
       highest = Math.max(highest, obs[obsIndex].price);
-      if (highest >= thresholdPrice) return printCrossing(obs[obsIndex]);
+      if (highest >= thresholdPrice) {
+        return resolveCandidate({
+          price: obs[obsIndex].price, precision: 'execution_print', source: 'executions_jsonb',
+          candidateStart: obs[obsIndex].epoch, candidateEnd: obs[obsIndex].epoch
+        });
+      }
       obsIndex += 1;
     }
     if (isFiniteNumber(bar.high)) {
       highest = Math.max(highest, bar.high);
       if (highest >= thresholdPrice) {
-        // A 1-minute bar proves the crossing occurred somewhere inside the bar
-        // interval; it does NOT establish an exact sub-minute instant.
-        const resolution = isFiniteNumber(barResolutionSeconds) && barResolutionSeconds > 0
-          ? barResolutionSeconds
-          : 60;
-        return {
-          crossed: true,
-          crossingEpoch: null,
-          crossingStartEpoch: bar.time,
-          crossingEndEpoch: bar.time + resolution,
-          price: bar.high,
-          precision: '1min_bar',
-          source: 'intraday_cache',
-          reason: null
-        };
+        return resolveCandidate({
+          price: bar.high, precision: '1min_bar', source: 'intraday_cache',
+          candidateStart: bar.time, candidateEnd: bar.time + resolution
+        });
       }
     }
   }
   while (obsIndex < obs.length) {
     highest = Math.max(highest, obs[obsIndex].price);
-    if (highest >= thresholdPrice) return printCrossing(obs[obsIndex]);
+    if (highest >= thresholdPrice) {
+      return resolveCandidate({
+        price: obs[obsIndex].price, precision: 'execution_print', source: 'executions_jsonb',
+        candidateStart: obs[obsIndex].epoch, candidateEnd: obs[obsIndex].epoch
+      });
+    }
     obsIndex += 1;
   }
   return {
@@ -315,9 +365,13 @@ function findCrossingInSession({
     crossingEpoch: null,
     crossingStartEpoch: null,
     crossingEndEpoch: null,
+    uncertaintyStartEpoch: null,
+    uncertaintyEndEpoch: null,
+    authoritative: false,
     price: null,
     precision: null,
     source: null,
+    missingIntervals: 0,
     reason: null
   };
 }
