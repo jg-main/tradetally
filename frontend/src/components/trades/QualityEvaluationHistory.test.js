@@ -147,6 +147,35 @@ describe('QualityEvaluationHistory', () => {
     expect(historyStore.selectPrimary).toHaveBeenCalledWith('trade-1', 'eval-1')
   })
 
+  it('emits primary-changed with the backend-resolved summary after a successful selection', async () => {
+    historyStore.evaluations = [historyRow({ status: 'completed', is_primary: false })]
+    historyStore.selectPrimary.mockResolvedValue({
+      primary: { evaluation_id: 'eval-1' },
+      qualitySummary: { source: 'profile_primary', setup: { grade: 'C', score: 72, compliance: 'FAIL', coverage: 95 } }
+    })
+    const wrapper = mountSection()
+    await flushPromises()
+
+    await wrapper.get('[data-testid="set-primary"]').trigger('click')
+    await flushPromises()
+
+    const emitted = wrapper.emitted('primary-changed')
+    expect(emitted).toHaveLength(1)
+    expect(emitted[0][0].qualitySummary.setup.grade).toBe('C')
+  })
+
+  it('does not emit primary-changed when the selection is rejected', async () => {
+    historyStore.evaluations = [historyRow({ status: 'completed', is_primary: false })]
+    historyStore.selectPrimary.mockRejectedValue(new Error('forbidden'))
+    const wrapper = mountSection()
+    await flushPromises()
+
+    await wrapper.get('[data-testid="set-primary"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.emitted('primary-changed')).toBeUndefined()
+  })
+
   it('does not offer Set Primary for a draft row', async () => {
     historyStore.evaluations = [historyRow({ status: 'draft', is_primary: false })]
     const wrapper = mountSection()

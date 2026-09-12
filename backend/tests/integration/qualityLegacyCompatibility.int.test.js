@@ -20,7 +20,9 @@
 const { randomUUID } = require('crypto');
 const db = require('../../src/config/database');
 const profileService = require('../../src/services/quality/profileService');
+const historyService = require('../../src/services/quality/historyService');
 const legacyCompatibilityService = require('../../src/services/quality/legacyCompatibilityService');
+const AnalyticsCache = require('../../src/services/analyticsCache');
 const TradeQueries = require('../../src/services/tradeQueries');
 const Trade = require('../../src/models/Trade');
 
@@ -384,5 +386,52 @@ describe('Phase 6 — no mutation and raw preservation (real PostgreSQL)', () =>
       [fixture.trades.t5]
     );
     expect(primaryT5.rows).toHaveLength(1);
+  });
+});
+
+describe('Phase 6 — primary mutation invalidates stale analytics cache (real PostgreSQL)', () => {
+  test('selectPrimary clears the cached qualityGrades population and recomputes it', async () => {
+    // T3 currently resolves to primary A (effective A). Cache an A-filtered
+    // population, then switch T3 to primary C and prove the stale cache is gone
+    // and the recomputed population no longer contains T3.
+    const filters = { qualityGrades: ['A'] };
+    const cacheKey = TradeQueries.cacheKey(fixture.userId, filters);
+
+    const before = await TradeQueries.getAnalytics(fixture.userId, filters);
+    expect(before.summary.totalTrades).toBe(3); // T1 legacy A, T3 primary A, T4 primary A
+
+    await AnalyticsCache.set(fixture.userId, cacheKey, { stale: true }, 60);
+    expect(await AnalyticsCache.get(fixture.userId, cacheKey)).not.toBeNull();
+
+    const evalC = await insertCompletedEvaluation({
+      userId: fixture.userId,
+      tradeId: fixture.trades.t3,
+      versionId: fixture.versionId,
+      setup: { score: 72, grade: 'C', compliance: 'FAIL', coverage: 95 }
+    });
+
+    await historyService.selectPrimary(fixture.userId, fixture.trades.t3, evalC);
+
+    // The effective primary change invalidated the user's analytics cache.
+    expect(await AnalyticsCache.get(fixture.userId, cacheKey)).toBeNull();
+
+    const after = await TradeQueries.getAnalytics(fixture.userId, filters);
+    expect(after.summary.totalTrades).toBe(2); // T1 + T4; T3 is now effective C
+    const rows = await TradeQueries.findByUser(fixture.userId, filters);
+    expect(rows.map((r) => r.id).sort()).toEqual([fixture.trades.t1, fixture.trades.t4].sort());
+  });
+
+  test('clearPrimary clears the cached population and restores legacy semantics', async () => {
+    const filters = { qualityGrades: ['A'] };
+    const cacheKey = TradeQueries.cacheKey(fixture.userId, filters);
+    await AnalyticsCache.set(fixture.userId, cacheKey, { stale: true }, 60);
+    expect(await AnalyticsCache.get(fixture.userId, cacheKey)).not.toBeNull();
+
+    // T2 has legacy A + primary C; clearing the primary restores legacy A.
+    await historyService.clearPrimary(fixture.userId, fixture.trades.t2);
+
+    expect(await AnalyticsCache.get(fixture.userId, cacheKey)).toBeNull();
+    const rows = await TradeQueries.findByUser(fixture.userId, filters);
+    expect(rows.map((r) => r.id)).toContain(fixture.trades.t2);
   });
 });

@@ -20,6 +20,7 @@ const db = require('../../config/database');
 const evaluationService = require('./evaluationService');
 const profileService = require('./profileService');
 const { EVALUATION_STATUS } = require('./constants');
+const AnalyticsCache = require('../analyticsCache');
 
 const TERMINAL_STATUSES = Object.freeze([
   EVALUATION_STATUS.COMPLETED,
@@ -37,6 +38,21 @@ class QualityHistoryInputError extends Error {
 
 function isTerminalStatus(status) {
   return TERMINAL_STATUSES.includes(status);
+}
+
+// Phase 6: selecting/clearing the explicit primary changes the effective Setup
+// grade used by the trade-list / count / analytics / export `qualityGrades`
+// filter, so any cached filtered population for the user is stale. Invalidate
+// the canonical analytics cache AFTER a successful mutation. Best-effort: the
+// mutation is already committed/deleted, and AnalyticsCache.invalidate never
+// throws by design, but a guard here guarantees a cache-layer failure can never
+// roll back or fail an otherwise-successful primary change.
+async function invalidateAnalyticsAfterPrimaryChange(userId) {
+  try {
+    await AnalyticsCache.invalidate(userId);
+  } catch (_error) {
+    // Intentionally ignored: cache invalidation must not fail the mutation.
+  }
 }
 
 // Flat queryable summary columns are NUMERIC in PostgreSQL and returned as
@@ -202,6 +218,7 @@ async function selectPrimary(userId, tradeId, evaluationId) {
   }
 
   const client = await db.connect();
+  let committed = false;
   try {
     await client.query('BEGIN');
 
@@ -265,12 +282,19 @@ async function selectPrimary(userId, tradeId, evaluationId) {
     );
 
     await client.query('COMMIT');
+    committed = true;
     return upsert.rows[0];
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
   } finally {
+    // Release the transaction client BEFORE invalidating so the cache write
+    // never contends with this transaction for a pool connection, then
+    // invalidate only when the mutation actually committed.
     client.release();
+    if (committed) {
+      await invalidateAnalyticsAfterPrimaryChange(userId);
+    }
   }
 }
 
@@ -285,6 +309,11 @@ async function clearPrimary(userId, tradeId) {
     `,
     [tradeId, userId]
   );
+  // Clearing the primary restores legacy/none compatibility semantics for the
+  // user's `qualityGrades` filter, so cached analytics must be dropped. Also
+  // invalidate when nothing was deleted: harmless, and it keeps the idempotent
+  // no-op path from ever serving a stale population.
+  await invalidateAnalyticsAfterPrimaryChange(userId);
   return result.rows[0] || null;
 }
 

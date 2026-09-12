@@ -5,7 +5,8 @@ const { api } = vi.hoisted(() => ({
   api: {
     get: vi.fn(),
     post: vi.fn(),
-    put: vi.fn()
+    put: vi.fn(),
+    delete: vi.fn()
   }
 }))
 
@@ -19,6 +20,7 @@ describe('qualityHistory store', () => {
     api.get.mockReset()
     api.post.mockReset()
     api.put.mockReset()
+    api.delete.mockReset()
   })
 
   it('loads the immutable evaluation history for a trade', async () => {
@@ -53,18 +55,42 @@ describe('qualityHistory store', () => {
     expect(created.id).toBe('new-eval')
   })
 
-  it('selects a primary evaluation and updates local flags', async () => {
-    api.put.mockResolvedValue({ data: { primary: { evaluation_id: 'e2' } } })
+  it('selects a primary evaluation and returns the backend-resolved summary', async () => {
+    api.put.mockResolvedValue({
+      data: {
+        primary: { evaluation_id: 'e2' },
+        qualitySummary: { source: 'profile_primary', setup: { grade: 'C', score: 72 } }
+      }
+    })
     const store = useQualityHistoryStore()
     store.evaluations = [
       { id: 'e1', is_primary: true },
       { id: 'e2', is_primary: false }
     ]
 
-    await store.selectPrimary('trade-1', 'e2')
+    const result = await store.selectPrimary('trade-1', 'e2')
 
     expect(api.put).toHaveBeenCalledWith('/trades/trade-1/quality/evaluations/e2/primary')
     expect(store.evaluations.map((row) => row.is_primary)).toEqual([false, true])
+    expect(result.primary.evaluation_id).toBe('e2')
+    expect(result.qualitySummary.source).toBe('profile_primary')
+  })
+
+  it('clears the primary and returns the resolved legacy/none summary', async () => {
+    api.delete.mockResolvedValue({
+      data: {
+        cleared: { trade_id: 'trade-1', evaluation_id: 'e1' },
+        qualitySummary: { source: 'legacy', setup: { grade: 'A', score: 4.5 } }
+      }
+    })
+    const store = useQualityHistoryStore()
+    store.evaluations = [{ id: 'e1', is_primary: true }]
+
+    const result = await store.clearPrimary('trade-1')
+
+    expect(api.delete).toHaveBeenCalledWith('/trades/trade-1/quality/evaluations/primary')
+    expect(store.evaluations.map((row) => row.is_primary)).toEqual([false])
+    expect(result.qualitySummary.source).toBe('legacy')
   })
 
   it('compares two evaluations using the compare endpoint', async () => {

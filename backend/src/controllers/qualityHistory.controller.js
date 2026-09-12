@@ -16,6 +16,7 @@
 const historyService = require('../services/quality/historyService');
 const comparisonService = require('../services/quality/comparisonService');
 const profileService = require('../services/quality/profileService');
+const legacyCompatibilityService = require('../services/quality/legacyCompatibilityService');
 
 const NOT_FOUND_CODES = [
   'TRADE_NOT_FOUND',
@@ -40,6 +41,17 @@ function respondError(res, error) {
     });
   }
   return res.status(500).json({ error: error.message || 'Internal server error' });
+}
+
+// Best-effort compatibility-summary lookup for the primary mutation responses.
+// Returns null when it cannot be resolved; the mutation itself has already
+// succeeded and must not be reported as failed because of a display lookup.
+async function resolveCompatibilitySummary(userId, tradeId) {
+  try {
+    return await legacyCompatibilityService.resolveForTradeId(userId, tradeId);
+  } catch (_error) {
+    return null;
+  }
 }
 
 const qualityHistoryController = {
@@ -89,7 +101,12 @@ const qualityHistoryController = {
     try {
       const { id: tradeId, evaluationId } = req.params;
       const primary = await historyService.selectPrimary(req.user.id, tradeId, evaluationId);
-      return res.json({ primary });
+      // Phase 6: return the backend-authoritative compatibility summary so the
+      // caller can patch its in-memory trade immediately (no Vue-side
+      // precedence and no second round trip). The primary mutation already
+      // succeeded, so a summary-resolution failure must not fail the request.
+      const qualitySummary = await resolveCompatibilitySummary(req.user.id, tradeId);
+      return res.json({ primary, qualitySummary });
     } catch (error) {
       return respondError(res, error);
     }
@@ -99,7 +116,10 @@ const qualityHistoryController = {
     try {
       const { id: tradeId } = req.params;
       const cleared = await historyService.clearPrimary(req.user.id, tradeId);
-      return res.json({ cleared });
+      // Clearing restores legacy/none compatibility semantics; return the
+      // resolved summary so an exposing UI can restore the display in place.
+      const qualitySummary = await resolveCompatibilitySummary(req.user.id, tradeId);
+      return res.json({ cleared, qualitySummary });
     } catch (error) {
       return respondError(res, error);
     }

@@ -237,8 +237,12 @@
         />
       </div>
 
-      <!-- Incomplete Calculation Banner -->
-      <div v-if="hasIncompleteQuality" class="rounded-md bg-yellow-50 dark:bg-yellow-900/20 p-4 border border-yellow-200 dark:border-yellow-800">
+      <!-- Incomplete Calculation Banner (legacy metric coverage only). When an
+           explicit profile primary is authoritative, this legacy banner must
+           not qualify/explain the profile-based grade, so it is hidden from the
+           current-profile context; the labelled legacy breakdown still explains
+           the preserved historical calculation. -->
+      <div v-if="showLegacyIncompleteBanner" class="rounded-md bg-yellow-50 dark:bg-yellow-900/20 p-4 border border-yellow-200 dark:border-yellow-800">
         <div class="flex">
           <div class="flex-shrink-0">
             <svg class="h-5 w-5 text-yellow-400" viewBox="0 0 20 20" fill="currentColor">
@@ -603,30 +607,7 @@
                 </router-link>
               </div>
 
-              <div class="mb-5 rounded-xl border border-gray-200 dark:border-gray-700 p-4">
-                <div class="flex flex-wrap items-center gap-3">
-                  <div class="text-sm font-medium text-gray-700 dark:text-gray-300">Setup Quality</div>
-                  <span
-                    v-if="trade.setupQuality?.grade"
-                    class="inline-flex items-center rounded-full px-3 py-1 text-sm font-semibold"
-                    :class="{
-                      'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400': trade.setupQuality.grade === 'A',
-                      'bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400': trade.setupQuality.grade === 'B',
-                      'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400': trade.setupQuality.grade === 'C',
-                      'bg-orange-100 text-orange-800 dark:bg-orange-900/20 dark:text-orange-400': trade.setupQuality.grade === 'D',
-                      'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400': trade.setupQuality.grade === 'F'
-                    }"
-                  >
-                    Grade {{ trade.setupQuality.grade }}
-                  </span>
-                  <span v-if="trade.setupQuality?.score" class="text-sm text-gray-500 dark:text-gray-400">
-                    {{ Number(trade.setupQuality.score).toFixed(1) }}/5.0
-                  </span>
-                  <span v-else class="text-sm text-gray-500 dark:text-gray-400">
-                    Calculate setup quality to pair setup context with adherence.
-                  </span>
-                </div>
-              </div>
+              <PlaybookSetupQualityContext :trade="trade" />
 
               <ProUpgradePrompt
                 v-if="authStore.user && !isPlaybookFeatureAvailable"
@@ -1560,7 +1541,7 @@
           <ManagementQualitySection v-if="isOwner" :trade="trade" />
 
           <!-- Quality Profiles — Version / Evaluation History (Phase 5) -->
-          <QualityEvaluationHistory v-if="isOwner" :trade="trade" />
+          <QualityEvaluationHistory v-if="isOwner" :trade="trade" @primary-changed="onPrimaryChanged" />
 
           <!-- News Section -->
           <div v-if="trade.has_news && trade.news_events && trade.news_events.length > 0" class="card">
@@ -1661,6 +1642,7 @@ import TradeImages from '@/components/trades/TradeImages.vue'
 import TradeCharts from '@/components/trades/TradeCharts.vue'
 import SetupQualitySection from '@/components/trades/SetupQualitySection.vue'
 import TradeSetupQualitySummary from '@/components/trades/TradeSetupQualitySummary.vue'
+import PlaybookSetupQualityContext from '@/components/trades/PlaybookSetupQualityContext.vue'
 import EntryQualitySection from '@/components/trades/EntryQualitySection.vue'
 import ManagementQualitySection from '@/components/trades/ManagementQualitySection.vue'
 import QualityEvaluationHistory from '@/components/trades/QualityEvaluationHistory.vue'
@@ -1670,6 +1652,8 @@ import { useAIStore } from '@/stores/ai'
 import { getTradeDateOnlyParts } from '@/utils/date'
 import {
   resolveTradeQualitySummary,
+  applyPrimaryChange,
+  shouldShowLegacyIncompleteBanner,
   QUALITY_SOURCE
 } from '@/utils/tradeQualitySummary'
 import {
@@ -1783,6 +1767,32 @@ const isOwner = computed(() => !!authStore.user && !!trade.value && trade.value.
 // (explicit primary profile evaluation > legacy > none); this view only
 // renders that contract and never re-derives precedence.
 const qualitySummary = computed(() => resolveTradeQualitySummary(trade.value))
+
+// Phase 6: patch the compatibility display from the backend-resolved summary
+// returned by an explicit primary mutation. The shared helper owns the
+// null-summary semantics; this view never derives precedence. If a successful
+// selection did not carry a resolvable summary, refetch the backend-resolved
+// contract instead of leaving stale data or falling back to legacy.
+async function onPrimaryChanged(payload) {
+  const applied = applyPrimaryChange(trade.value, payload)
+  if (!applied) {
+    await refreshQualitySummaryFromBackend()
+  }
+}
+
+// Lightweight single-trade refresh used only as the fallback above. Fetches the
+// trade (which carries the backend-resolved qualitySummary for owners) and
+// patches only that field, without reloading playbooks/comments/analytics.
+async function refreshQualitySummaryFromBackend() {
+  try {
+    const fresh = await tradesStore.fetchTrade(route.params.id)
+    if (fresh && Object.prototype.hasOwnProperty.call(fresh, 'qualitySummary')) {
+      trade.value.qualitySummary = fresh.qualitySummary
+    }
+  } catch (_error) {
+    // Leave the current display untouched; the next navigation/reload reconciles.
+  }
+}
 const allocationModalGroups = computed(() => {
   const byId = new Map(allocationGroups.value.map((group) => [group.id, group]))
   for (const allocation of tradeAllocations.value) {
@@ -2019,24 +2029,10 @@ function toggleAIPanel() {
   }
 }
 
-// Computed property to check if quality calculation is incomplete
-const hasIncompleteQuality = computed(() => {
-  if (!trade.value || !trade.value.qualityMetrics) {
-    return false
-  }
-
-  const metrics = trade.value.qualityMetrics
-
-  // Check if any of the key metrics are null or undefined
-  const hasNullMetrics =
-    metrics.newsSentiment === null || metrics.newsSentiment === undefined ||
-    metrics.gap === null || metrics.gap === undefined ||
-    metrics.relativeVolume === null || metrics.relativeVolume === undefined ||
-    metrics.float === null || metrics.float === undefined ||
-    metrics.price === null || metrics.price === undefined
-
-  return hasNullMetrics
-})
+// Phase 6: the legacy "Incomplete Calculation" banner describes legacy metric
+// coverage only. It is suppressed when an explicit profile primary is
+// authoritative so it cannot qualify/explain the profile-based grade.
+const showLegacyIncompleteBanner = computed(() => shouldShowLegacyIncompleteBanner(trade.value))
 
 function buildChecklistResponses(playbook, existingReview = null) {
   const storedResponses = new Map(

@@ -4,6 +4,9 @@ import {
   setupGradeForTrade,
   qualityGradeBadgeClass,
   qualitySummaryTooltip,
+  applyPrimaryChange,
+  isLegacyQualityIncomplete,
+  shouldShowLegacyIncompleteBanner,
   QUALITY_SOURCE
 } from './tradeQualitySummary'
 
@@ -78,5 +81,65 @@ describe('tradeQualitySummary', () => {
     })
     expect(primary).toContain('Canonical BO v3')
     expect(primary).toContain('92 / 100')
+  })
+
+  describe('applyPrimaryChange', () => {
+    it('patches a resolved summary, including a null Setup grade', () => {
+      const trade = { qualityGrade: 'A', qualitySummary: { source: QUALITY_SOURCE.LEGACY } }
+      const applied = applyPrimaryChange(trade, {
+        primary: { evaluation_id: 'e1' },
+        qualitySummary: { source: QUALITY_SOURCE.PROFILE_PRIMARY, setup: { grade: null, score: null } }
+      })
+      expect(applied).toBe(true)
+      expect(trade.qualitySummary.source).toBe(QUALITY_SOURCE.PROFILE_PRIMARY)
+      expect(trade.qualitySummary.setup.grade).toBeNull()
+    })
+
+    it('restores the legacy fallback on an explicit clear', () => {
+      const trade = { qualityGrade: 'A', qualitySummary: { source: QUALITY_SOURCE.PROFILE_PRIMARY } }
+      const applied = applyPrimaryChange(trade, { cleared: { trade_id: 't1' }, qualitySummary: null })
+      expect(applied).toBe(true)
+      expect(trade.qualitySummary).toBeNull()
+      // The resolver now falls back to the preserved legacy grade.
+      expect(resolveTradeQualitySummary(trade).source).toBe(QUALITY_SOURCE.LEGACY)
+    })
+
+    it('reports not-applied (so the caller refetches) when a selection summary lookup failed', () => {
+      const trade = { qualityGrade: 'A', qualitySummary: { source: QUALITY_SOURCE.PROFILE_PRIMARY, setup: { grade: 'C' } } }
+      const applied = applyPrimaryChange(trade, { primary: { evaluation_id: 'e1' }, qualitySummary: null })
+      expect(applied).toBe(false)
+      // Must not fall back to legacy.
+      expect(trade.qualitySummary.setup.grade).toBe('C')
+    })
+  })
+
+  describe('legacy incomplete banner gate', () => {
+    const incompleteMetrics = { newsSentiment: null, gap: 0.1, relativeVolume: 1.1, float: 1, price: 100 }
+
+    it('is true for a legacy-only trade with incomplete legacy metrics', () => {
+      const trade = { qualityGrade: 'A', qualityScore: 4.5, qualityMetrics: incompleteMetrics }
+      expect(isLegacyQualityIncomplete(trade)).toBe(true)
+      expect(shouldShowLegacyIncompleteBanner(trade)).toBe(true)
+    })
+
+    it('is suppressed when an explicit profile primary is authoritative', () => {
+      const trade = {
+        qualityGrade: 'A',
+        qualityScore: 4.5,
+        qualityMetrics: incompleteMetrics,
+        qualitySummary: {
+          source: QUALITY_SOURCE.PROFILE_PRIMARY,
+          setup: { score: 72, grade: 'C', compliance: 'FAIL', coverage: 95, scoreScale: 100 }
+        }
+      }
+      // The legacy metric state is still incomplete, but it must not describe
+      // the profile-based grade.
+      expect(isLegacyQualityIncomplete(trade)).toBe(true)
+      expect(shouldShowLegacyIncompleteBanner(trade)).toBe(false)
+    })
+
+    it('is false with no legacy metrics', () => {
+      expect(shouldShowLegacyIncompleteBanner({ qualityGrade: null, qualityMetrics: null })).toBe(false)
+    })
   })
 })

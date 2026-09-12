@@ -81,7 +81,35 @@ export const useQualityHistoryStore = defineStore('qualityHistory', () => {
         ...row,
         is_primary: row.id === evaluationId
       }))
-      return response.data.primary
+      // Phase 6: the backend returns the resolved compatibility summary so the
+      // parent Trade Detail can patch its display in place. The UI never
+      // re-derives primary-vs-legacy precedence.
+      return {
+        primary: response.data.primary,
+        qualitySummary: response.data.qualitySummary || null
+      }
+    } catch (err) {
+      setError(err)
+      throw err
+    } finally {
+      selectingPrimary.value = false
+    }
+  }
+
+  /**
+   * Clears the explicit primary (API exposes DELETE). Returns the resolved
+   * compatibility summary so an exposing UI can restore legacy/none display.
+   */
+  async function clearPrimary(tradeId) {
+    selectingPrimary.value = true
+    error.value = null
+    try {
+      const response = await api.delete(`/trades/${tradeId}/quality/evaluations/primary`)
+      evaluations.value = evaluations.value.map((row) => ({ ...row, is_primary: false }))
+      return {
+        cleared: response.data.cleared,
+        qualitySummary: response.data.qualitySummary || null
+      }
     } catch (err) {
       setError(err)
       throw err
@@ -131,6 +159,7 @@ export const useQualityHistoryStore = defineStore('qualityHistory', () => {
     fetchVersions,
     startEvaluation,
     selectPrimary,
+    clearPrimary,
     compareEvaluations,
     $reset
   }

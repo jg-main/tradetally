@@ -364,6 +364,29 @@ async function resolveForOwnedTrade(userId, trade) {
   return resolveQualitySummary({ ...trade, ...prefixPrimaryColumns(primary) });
 }
 
+// Resolves the compatibility summary for one owned trade id. Used by the
+// Phase-5 primary mutation endpoints so a client can patch its in-memory trade
+// with the backend-authoritative result immediately after select/clearPrimary
+// without a second round trip or re-deriving precedence in the UI. When a
+// primary exists, the legacy trade row is not even needed; when it does not,
+// the legacy fields are loaded and resolution falls back to legacy/none.
+async function resolveForTradeId(userId, tradeId) {
+  if (!userId || !tradeId) return resolveQualitySummary(null);
+
+  const primary = await findPrimaryEvaluation(userId, tradeId);
+  if (primary) {
+    return resolveQualitySummary(prefixPrimaryColumns(primary));
+  }
+
+  const result = await db.query(
+    `SELECT id, quality_grade, quality_score, quality_metrics
+     FROM trades
+     WHERE id = $1 AND user_id = $2`,
+    [tradeId, userId]
+  );
+  return resolveQualitySummary(result.rows[0] || null);
+}
+
 module.exports = {
   SOURCE,
   LEGACY_SCORE_SCALE,
@@ -379,5 +402,6 @@ module.exports = {
   findPrimaryEvaluation,
   hasLegacyQuality,
   resolveQualitySummary,
-  resolveForOwnedTrade
+  resolveForOwnedTrade,
+  resolveForTradeId
 };

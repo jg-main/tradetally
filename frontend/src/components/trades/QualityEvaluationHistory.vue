@@ -150,6 +150,11 @@ const props = defineProps({
   trade: { type: Object, required: true }
 })
 
+// Phase 6: after an explicit primary change the backend returns the resolved
+// compatibility summary; the parent Trade Detail patches its display from this
+// event instead of re-deriving primary-vs-legacy precedence.
+const emit = defineEmits(['primary-changed'])
+
 const store = useQualityHistoryStore()
 const setupStore = useQualitySetupStore()
 const workflow = useQualityWorkflowStore()
@@ -249,7 +254,8 @@ function closeComparison() {
 
 async function setPrimary(row) {
   try {
-    await store.selectPrimary(props.trade.id, row.id)
+    const result = await store.selectPrimary(props.trade.id, row.id)
+    emit('primary-changed', result)
   } catch (err) {
     // surfaced via store.error
   }

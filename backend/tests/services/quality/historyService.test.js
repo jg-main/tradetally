@@ -15,9 +15,14 @@ jest.mock('../../../src/services/quality/profileService', () => {
   return { ...actual, findVersionById: jest.fn() };
 });
 
+jest.mock('../../../src/services/analyticsCache', () => ({
+  invalidate: jest.fn()
+}));
+
 const db = require('../../../src/config/database');
 const evaluationService = require('../../../src/services/quality/evaluationService');
 const profileService = require('../../../src/services/quality/profileService');
+const AnalyticsCache = require('../../../src/services/analyticsCache');
 const historyService = require('../../../src/services/quality/historyService');
 
 const USER = 'user-1';
@@ -148,6 +153,8 @@ describe('historyService.selectPrimary', () => {
     });
     expect(client.query.mock.calls.some(([sql]) => String(sql).includes('INSERT INTO trade_quality_primary_evaluations'))).toBe(false);
     expect(client.query.mock.calls.some(([sql]) => String(sql).includes('ROLLBACK'))).toBe(true);
+    // Phase 6: a rejected selection is not an effective primary change.
+    expect(AnalyticsCache.invalidate).not.toHaveBeenCalled();
   });
 
   test('rejects an evaluation from another trade/user (not found for this trade)', async () => {
@@ -183,6 +190,9 @@ describe('historyService.selectPrimary', () => {
     expect(upsert[0]).toMatch(/ON CONFLICT \(trade_id\) DO UPDATE/);
     expect(upsert[1]).toEqual([TRADE, USER, 'eval-1']);
     expect(client.query.mock.calls.some(([sql]) => String(sql).includes('COMMIT'))).toBe(true);
+    // Phase 6: effective primary change invalidates the user's analytics cache
+    // only after commit.
+    expect(AnalyticsCache.invalidate).toHaveBeenCalledWith(USER);
   });
 
   test('re-selecting the same primary is an idempotent upsert', async () => {
@@ -209,11 +219,18 @@ describe('historyService.clearPrimary', () => {
 
     const cleared = await historyService.clearPrimary(USER, TRADE);
     expect(cleared.evaluation_id).toBe('eval-1');
+    // Phase 6: clearing the primary restores legacy/none filter semantics, so
+    // the analytics cache must be invalidated.
+    expect(AnalyticsCache.invalidate).toHaveBeenCalledWith(USER);
+    expect(AnalyticsCache.invalidate).toHaveBeenCalledTimes(1);
 
+    AnalyticsCache.invalidate.mockClear();
     db.query.mockReset();
     db.query
       .mockResolvedValueOnce({ rows: [{ found: 1 }] })
       .mockResolvedValueOnce({ rows: [] });
     await expect(historyService.clearPrimary(USER, TRADE)).resolves.toBeNull();
+    // Idempotent no-op clear still invalidates (harmless) and never throws.
+    expect(AnalyticsCache.invalidate).toHaveBeenCalledWith(USER);
   });
 });

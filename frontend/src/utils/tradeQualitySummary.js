@@ -80,6 +80,60 @@ export function setupGradeForTrade(trade) {
   return resolveTradeQualitySummary(trade).setup?.grade || null
 }
 
+/**
+ * Applies the backend-resolved result of an explicit primary mutation to a
+ * trade object. The backend is authoritative: the UI never decides
+ * primary-vs-legacy here.
+ *   - a resolved summary is always applied, even when its Setup grade is null
+ *     (which must render N/A and never fall back to legacy);
+ *   - a null summary is only applied for an explicit clear (which restores the
+ *     legacy/none fallback).
+ *
+ * Returns true when the display was updated or an explicit clear was applied.
+ * Returns false when a successful selection did not carry a resolvable summary
+ * (a rare backend lookup failure): the caller must refresh from the backend
+ * rather than leave stale data OR fall back to legacy.
+ */
+export function applyPrimaryChange(trade, payload) {
+  if (!trade || !payload) return false
+  if (payload.qualitySummary) {
+    trade.qualitySummary = payload.qualitySummary
+    return true
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, 'cleared')) {
+    trade.qualitySummary = null
+    return true
+  }
+  return false
+}
+
+/**
+ * True when the preserved legacy quality metrics are missing one of the key
+ * inputs. This describes ONLY the legacy calculation, never a profile result.
+ */
+export function isLegacyQualityIncomplete(trade) {
+  const metrics = trade?.qualityMetrics
+  if (!metrics) return false
+  return (
+    metrics.newsSentiment === null || metrics.newsSentiment === undefined ||
+    metrics.gap === null || metrics.gap === undefined ||
+    metrics.relativeVolume === null || metrics.relativeVolume === undefined ||
+    metrics.float === null || metrics.float === undefined ||
+    metrics.price === null || metrics.price === undefined
+  )
+}
+
+/**
+ * The legacy "Incomplete Calculation" banner qualifies the legacy metric
+ * coverage. When an explicit profile primary is authoritative it must not be
+ * shown from the current-profile context, because it does not describe that
+ * profile-based grade.
+ */
+export function shouldShowLegacyIncompleteBanner(trade) {
+  if (resolveTradeQualitySummary(trade).source === QUALITY_SOURCE.PROFILE_PRIMARY) return false
+  return isLegacyQualityIncomplete(trade)
+}
+
 /** Tailwind classes for a grade badge. */
 export function qualityGradeBadgeClass(grade) {
   return {
