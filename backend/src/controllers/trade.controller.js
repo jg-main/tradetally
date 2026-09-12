@@ -5134,6 +5134,10 @@ const tradeController = {
              WHERE id = $2 AND user_id = $3`,
             [JSON.stringify(quality.metrics), id, req.user.id]
           );
+          // Phase 6: a legacy A -> NULL write changes the effective
+          // qualityGrades-filter membership for trades without a primary, so
+          // cached analytics must be dropped AFTER the persisted write.
+          await AnalyticsCache.invalidate(req.user.id);
         }
 
         return res.status(400).json({
@@ -5164,6 +5168,12 @@ const tradeController = {
         id,
         req.user.id
       ]);
+
+      // Phase 6: legacy quality writes change the effective Setup grade used by
+      // the qualityGrades filter for trades without a primary. Invalidate only
+      // after the persisted UPDATE succeeded (a pre-persistence calculation
+      // failure never reaches this point).
+      await AnalyticsCache.invalidate(req.user.id);
 
       logger.info(`Calculated quality for trade ${id}: ${quality.grade} (${quality.score}/5.0) for ${trade.symbol}`);
 
@@ -5233,6 +5243,12 @@ const tradeController = {
 
       await Promise.all(updates);
 
+      // Phase 6: invalidate the user's analytics cache ONCE after the batch
+      // writes complete (never per trade), and only when rows were persisted.
+      if (updates.length > 0) {
+        await AnalyticsCache.invalidate(req.user.id);
+      }
+
       logger.info(`Calculated quality for ${updates.length} trades for user ${req.user.id}`, 'app');
 
       res.json({
@@ -5282,6 +5298,10 @@ const tradeController = {
 
       logger.info(`Starting quality calculation for ${tradesResult.rows.length} trades for user ${req.user.id}`, 'app');
 
+      // Capture the authenticated user id before the detached async worker so
+      // the worker never depends on the request object lifecycle.
+      const userId = req.user.id;
+
       // Start async processing (don't await)
       setImmediate(async () => {
         try {
@@ -5303,7 +5323,7 @@ const tradeController = {
                   result.quality.score,
                   JSON.stringify(result.quality.metrics),
                   result.tradeId,
-                  req.user.id
+                  userId
                 ])
               );
             }
@@ -5311,7 +5331,15 @@ const tradeController = {
 
           await Promise.all(updates);
 
-          logger.info(`Completed quality calculation for ${updates.length} trades for user ${req.user.id}`, 'app');
+          // Phase 6: invalidate AFTER the writes complete (not when the job is
+          // queued), once per run, and only when rows were persisted. A cache
+          // failure must not undo the already-persisted legacy grades:
+          // AnalyticsCache.invalidate is best-effort by design.
+          if (updates.length > 0) {
+            await AnalyticsCache.invalidate(userId);
+          }
+
+          logger.info(`Completed quality calculation for ${updates.length} trades for user ${userId}`, 'app');
         } catch (error) {
           logger.logError('Error in async quality calculation:', error);
         }

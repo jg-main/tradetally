@@ -18,6 +18,16 @@
 //   T7 no legacy, no primary                       -> none
 
 const { randomUUID } = require('crypto');
+
+// The legacy calculator depends on external market-data providers, which are
+// out of scope for this durable DB/cache regression. Mock only the calculator;
+// the controller, its real DB writes, and the canonical analytics cache remain
+// the actual code paths under test.
+jest.mock('../../src/services/tradeQuality.service', () => ({
+  calculateQuality: jest.fn(),
+  calculateBatchQuality: jest.fn()
+}));
+
 const db = require('../../src/config/database');
 const profileService = require('../../src/services/quality/profileService');
 const historyService = require('../../src/services/quality/historyService');
@@ -25,6 +35,18 @@ const legacyCompatibilityService = require('../../src/services/quality/legacyCom
 const AnalyticsCache = require('../../src/services/analyticsCache');
 const TradeQueries = require('../../src/services/tradeQueries');
 const Trade = require('../../src/models/Trade');
+const tradeQualityService = require('../../src/services/tradeQuality.service');
+const tradeController = require('../../src/controllers/trade.controller');
+
+function mockRes() {
+  const res = {
+    statusCode: 200,
+    payload: null,
+    status(code) { this.statusCode = code; return this; },
+    json(body) { this.payload = body; return this; }
+  };
+  return res;
+}
 
 function binary(pass, fail) {
   return { type: 'binary', pass_score: pass, fail_score: fail };
@@ -191,6 +213,7 @@ async function createFixture() {
 
 async function destroyFixture(fixture) {
   if (!fixture) return;
+  await db.query('DELETE FROM analytics_cache WHERE user_id = $1', [fixture.userId]);
   await db.query('DELETE FROM trade_quality_primary_evaluations WHERE user_id = $1', [fixture.userId]);
   await db.query('DELETE FROM trade_quality_evaluations WHERE user_id = $1', [fixture.userId]);
   await db.query('DELETE FROM quality_profile_versions WHERE profile_id = $1', [fixture.profileId]);
@@ -433,5 +456,82 @@ describe('Phase 6 — primary mutation invalidates stale analytics cache (real P
     expect(await AnalyticsCache.get(fixture.userId, cacheKey)).toBeNull();
     const rows = await TradeQueries.findByUser(fixture.userId, filters);
     expect(rows.map((r) => r.id)).toContain(fixture.trades.t2);
+  });
+});
+
+describe('Phase 6 — legacy quality writes invalidate stale analytics cache (real PostgreSQL)', () => {
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  test('A -> C legacy recalc invalidates the cached A population and moves T1 to C', async () => {
+    const filtersA = { qualityGrades: ['A'] };
+    const filtersC = { qualityGrades: ['C'] };
+    const keyA = TradeQueries.cacheKey(fixture.userId, filtersA);
+
+    // T1 is legacy-only effective A.
+    const beforeA = await TradeQueries.findByUser(fixture.userId, filtersA);
+    expect(beforeA.map((r) => r.id)).toContain(fixture.trades.t1);
+
+    await AnalyticsCache.set(fixture.userId, keyA, { stale: true }, 60);
+    expect(await AnalyticsCache.get(fixture.userId, keyA)).not.toBeNull();
+
+    tradeQualityService.calculateQuality.mockResolvedValue({
+      grade: 'C',
+      score: 2.5,
+      metrics: { float: 1, coverage: 0.9 }
+    });
+
+    const res = mockRes();
+    await tradeController.calculateTradeQuality(
+      { params: { id: fixture.trades.t1 }, user: { id: fixture.userId } },
+      res,
+      () => {}
+    );
+
+    expect(res.statusCode).toBe(200);
+    expect(res.payload.success).toBe(true);
+    // The persisted legacy write invalidated the stale cached population.
+    expect(await AnalyticsCache.get(fixture.userId, keyA)).toBeNull();
+
+    const afterA = await TradeQueries.findByUser(fixture.userId, filtersA);
+    expect(afterA.map((r) => r.id)).not.toContain(fixture.trades.t1);
+    const afterC = await TradeQueries.findByUser(fixture.userId, filtersC);
+    expect(afterC.map((r) => r.id)).toContain(fixture.trades.t1);
+
+    const raw = await db.query('SELECT quality_grade FROM trades WHERE id = $1', [fixture.trades.t1]);
+    expect(raw.rows[0].quality_grade).toBe('C');
+  });
+
+  test('A -> NULL metrics-only recalc invalidates and removes T1 from the A population', async () => {
+    const filtersA = { qualityGrades: ['A'] };
+    const keyA = TradeQueries.cacheKey(fixture.userId, filtersA);
+    await AnalyticsCache.set(fixture.userId, keyA, { stale: true }, 60);
+    expect(await AnalyticsCache.get(fixture.userId, keyA)).not.toBeNull();
+
+    tradeQualityService.calculateQuality.mockResolvedValue({
+      grade: null,
+      score: null,
+      metrics: { coverage: 0.2 },
+      reason: 'insufficient_coverage',
+      message: 'Not enough data'
+    });
+
+    const res = mockRes();
+    await tradeController.calculateTradeQuality(
+      { params: { id: fixture.trades.t1 }, user: { id: fixture.userId } },
+      res,
+      () => {}
+    );
+
+    expect(res.statusCode).toBe(400);
+    expect(await AnalyticsCache.get(fixture.userId, keyA)).toBeNull();
+
+    const afterA = await TradeQueries.findByUser(fixture.userId, filtersA);
+    expect(afterA.map((r) => r.id)).not.toContain(fixture.trades.t1);
+
+    const raw = await db.query('SELECT quality_grade, quality_metrics FROM trades WHERE id = $1', [fixture.trades.t1]);
+    expect(raw.rows[0].quality_grade).toBeNull();
+    expect(raw.rows[0].quality_metrics).toBeTruthy();
   });
 });
