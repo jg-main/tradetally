@@ -26,6 +26,7 @@ const db = require('../../src/config/database');
 const Trade = require('../../src/models/Trade');
 const tradeQualityService = require('../../src/services/tradeQuality.service');
 const AnalyticsCache = require('../../src/services/analyticsCache');
+const logger = require('../../src/utils/logger');
 const tradeController = require('../../src/controllers/trade.controller');
 
 function createRes() {
@@ -220,6 +221,59 @@ describe('legacy batch Calculate Setup Quality compatibility', () => {
     // E. no writes -> no invalidation.
     expect(AnalyticsCache.invalidate).not.toHaveBeenCalled();
   });
+
+  test('partial batch (2 fulfill, 1 reject) waits for all, invalidates once, then errors', async () => {
+    db.query
+      .mockResolvedValueOnce({ rows: [{ id: 't1' }, { id: 't2' }, { id: 't3' }] }) // SELECT
+      .mockResolvedValueOnce({ rows: [] }) // update 1 fulfills
+      .mockRejectedValueOnce(new Error('update-2 failed')) // update 2 rejects
+      .mockResolvedValueOnce({ rows: [] }); // update 3 fulfills
+    tradeQualityService.calculateBatchQuality.mockResolvedValue([
+      batchResult('t1'), batchResult('t2'), batchResult('t3')
+    ]);
+
+    const next = jest.fn();
+    const res = createRes();
+    await tradeController.calculateBatchQuality(
+      { body: { tradeIds: ['t1', 't2', 't3'] }, user: { id: 'user-1' } },
+      res,
+      next
+    );
+
+    // All three started UPDATEs reached a terminal state.
+    expect(db.query).toHaveBeenCalledTimes(4);
+    // A partial persisted batch still invalidates exactly once.
+    expect(AnalyticsCache.invalidate).toHaveBeenCalledTimes(1);
+    expect(AnalyticsCache.invalidate).toHaveBeenCalledWith('user-1');
+    // Original failure still propagates through the existing error path.
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(next.mock.calls[0][0].message).toBe('update-2 failed');
+    // No success response.
+    expect(res.payload).toBeNull();
+  });
+
+  test('all-failed batch performs no invalidation and follows the error path', async () => {
+    db.query
+      .mockResolvedValueOnce({ rows: [{ id: 't1' }, { id: 't2' }] }) // SELECT
+      .mockRejectedValueOnce(new Error('update-1 failed'))
+      .mockRejectedValueOnce(new Error('update-2 failed'));
+    tradeQualityService.calculateBatchQuality.mockResolvedValue([
+      batchResult('t1'), batchResult('t2')
+    ]);
+
+    const next = jest.fn();
+    const res = createRes();
+    await tradeController.calculateBatchQuality(
+      { body: { tradeIds: ['t1', 't2'] }, user: { id: 'user-1' } },
+      res,
+      next
+    );
+
+    // B. nothing persisted -> no invalidation.
+    expect(AnalyticsCache.invalidate).not.toHaveBeenCalled();
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(res.payload).toBeNull();
+  });
 });
 
 describe('legacy all-trades async quality calculation compatibility', () => {
@@ -289,6 +343,82 @@ describe('legacy all-trades async quality calculation compatibility', () => {
       expect(AnalyticsCache.invalidate).not.toHaveBeenCalled();
     } finally {
       setImmediateSpy.mockRestore();
+    }
+  });
+
+  test('background partial success (2 fulfill, 1 reject) invalidates once after settling', async () => {
+    let worker;
+    const setImmediateSpy = jest
+      .spyOn(global, 'setImmediate')
+      .mockImplementation((fn) => { worker = fn; return 1; });
+    const logErrorSpy = jest.spyOn(logger, 'logError').mockImplementation(() => {});
+
+    try {
+      db.query
+        .mockResolvedValueOnce({ rows: [{ id: 't1' }, { id: 't2' }, { id: 't3' }] }) // SELECT
+        .mockResolvedValueOnce({ rows: [] }) // update 1 fulfills
+        .mockRejectedValueOnce(new Error('async update-2 failed')) // update 2 rejects
+        .mockResolvedValueOnce({ rows: [] }); // update 3 fulfills
+      tradeQualityService.calculateBatchQuality.mockResolvedValue([
+        { tradeId: 't1', quality: { grade: 'B', score: 3.5, metrics: { float: 1 } } },
+        { tradeId: 't2', quality: { grade: 'A', score: 4.5, metrics: { float: 1 } } },
+        { tradeId: 't3', quality: { grade: 'C', score: 2.5, metrics: { float: 1 } } }
+      ]);
+
+      const res = createRes();
+      await tradeController.calculateAllTradesQuality(
+        { user: { id: 'user-1' } },
+        res,
+        jest.fn()
+      );
+
+      await worker();
+
+      expect(db.query).toHaveBeenCalledTimes(4); // 1 SELECT + 3 UPDATEs
+      // C. partial success still invalidates exactly once, with the captured id.
+      expect(AnalyticsCache.invalidate).toHaveBeenCalledTimes(1);
+      expect(AnalyticsCache.invalidate).toHaveBeenCalledWith('user-1');
+      // The DB failure is reported through the existing background catch.
+      expect(logErrorSpy).toHaveBeenCalledTimes(1);
+      expect(logErrorSpy.mock.calls[0][1].message).toBe('async update-2 failed');
+    } finally {
+      setImmediateSpy.mockRestore();
+      logErrorSpy.mockRestore();
+    }
+  });
+
+  test('background all-failed writes do not invalidate', async () => {
+    let worker;
+    const setImmediateSpy = jest
+      .spyOn(global, 'setImmediate')
+      .mockImplementation((fn) => { worker = fn; return 1; });
+    const logErrorSpy = jest.spyOn(logger, 'logError').mockImplementation(() => {});
+
+    try {
+      db.query
+        .mockResolvedValueOnce({ rows: [{ id: 't1' }, { id: 't2' }] }) // SELECT
+        .mockRejectedValueOnce(new Error('async update-1 failed'))
+        .mockRejectedValueOnce(new Error('async update-2 failed'));
+      tradeQualityService.calculateBatchQuality.mockResolvedValue([
+        { tradeId: 't1', quality: { grade: 'B', score: 3.5, metrics: { float: 1 } } },
+        { tradeId: 't2', quality: { grade: 'A', score: 4.5, metrics: { float: 1 } } }
+      ]);
+
+      const res = createRes();
+      await tradeController.calculateAllTradesQuality(
+        { user: { id: 'user-1' } },
+        res,
+        jest.fn()
+      );
+
+      await worker();
+
+      // D. nothing persisted -> no invalidation, failure reported.
+      expect(AnalyticsCache.invalidate).not.toHaveBeenCalled();
+      expect(logErrorSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      setImmediateSpy.mockRestore();
+      logErrorSpy.mockRestore();
     }
   });
 });

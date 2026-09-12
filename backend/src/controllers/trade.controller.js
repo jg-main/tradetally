@@ -49,6 +49,30 @@ function marketDataConfigDetails(feature) {
 }
 
 /**
+ * Phase 6: batch legacy-quality writes are independent, non-transactional
+ * UPDATEs. Wait for EVERY already-started write to settle, invalidate the
+ * canonical analytics cache once if at least one write persisted (a partial
+ * batch still changes the effective qualityGrades population), and only then
+ * rethrow the first failure so the existing error path is preserved. A batch
+ * where every write failed persists nothing and skips invalidation.
+ */
+async function settleLegacyQualityWrites(updates, userId) {
+  if (updates.length === 0) return;
+
+  const settled = await Promise.allSettled(updates);
+  const persistedCount = settled.filter((entry) => entry.status === 'fulfilled').length;
+
+  if (persistedCount > 0) {
+    await AnalyticsCache.invalidate(userId);
+  }
+
+  const failure = settled.find((entry) => entry.status === 'rejected');
+  if (failure) {
+    throw failure.reason;
+  }
+}
+
+/**
  * Queue MAE/MFE calculation for a closed trade via the durable mae_recalc
  * job (rate-limited batches, survives restarts) instead of computing inline
  * in the request process. Only Pro users get auto-calculation.
@@ -5241,13 +5265,10 @@ const tradeController = {
         }
       }
 
-      await Promise.all(updates);
-
-      // Phase 6: invalidate the user's analytics cache ONCE after the batch
-      // writes complete (never per trade), and only when rows were persisted.
-      if (updates.length > 0) {
-        await AnalyticsCache.invalidate(req.user.id);
-      }
+      // Phase 6: settle every started UPDATE, invalidate once if any persisted
+      // (partial success still changes the effective filter population), then
+      // rethrow the first failure through the existing error path.
+      await settleLegacyQualityWrites(updates, req.user.id);
 
       logger.info(`Calculated quality for ${updates.length} trades for user ${req.user.id}`, 'app');
 
@@ -5329,15 +5350,10 @@ const tradeController = {
             }
           }
 
-          await Promise.all(updates);
-
-          // Phase 6: invalidate AFTER the writes complete (not when the job is
-          // queued), once per run, and only when rows were persisted. A cache
-          // failure must not undo the already-persisted legacy grades:
-          // AnalyticsCache.invalidate is best-effort by design.
-          if (updates.length > 0) {
-            await AnalyticsCache.invalidate(userId);
-          }
+          // Phase 6: settle all started writes, invalidate once if any
+          // persisted, then surface the first failure through the existing
+          // background catch. A cache failure cannot undo persisted grades.
+          await settleLegacyQualityWrites(updates, userId);
 
           logger.info(`Completed quality calculation for ${updates.length} trades for user ${userId}`, 'app');
         } catch (error) {
