@@ -38,6 +38,7 @@ const {
 } = require('../services/brokerFeeApplicationService');
 const OptionStrategyGroupingService = require('../services/optionStrategyGroupingService');
 const AmbiguousTradeReviewService = require('../services/ambiguousTradeReviewService');
+const legacyCompatibilityService = require('../services/quality/legacyCompatibilityService');
 
 function marketDataApiKeyName() {
   return finnhub.providerName === 'fmp' ? 'FMP_API_KEY' : 'FINNHUB_API_KEY';
@@ -555,6 +556,10 @@ const tradeController = {
         trade.playbookId = review?.playbook_id || null;
         trade.playbookReview = mapTradeReviewSummary(review);
         trade.setupQuality = buildSetupQuality(trade);
+        // Phase 6 additive compatibility contract: primary profile evaluation
+        // supersedes legacy for display/filtering, otherwise legacy, otherwise
+        // none. Raw legacy fields above remain untouched.
+        trade.qualitySummary = legacyCompatibilityService.resolveQualitySummary(trade);
       });
 
       // Prepare response with trades immediately
@@ -976,6 +981,14 @@ const tradeController = {
       }
 
       trade.setupQuality = buildSetupQuality(trade);
+
+      // Phase 6 compatibility summary. Owner-only: public/shared trade
+      // payloads intentionally do NOT gain profile metadata (profile name,
+      // version, evaluation id, scores) through this new field. Legacy
+      // setupQuality above is unchanged for public trades.
+      if (isOwner) {
+        trade.qualitySummary = await legacyCompatibilityService.resolveForOwnedTrade(req.user.id, trade);
+      }
 
       // Surface live unrealized P&L for open positions the same way the dashboard's
       // Open Positions table does. Non-options only (open option premiums are entered

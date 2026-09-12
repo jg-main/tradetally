@@ -3288,3 +3288,48 @@ Mean Reversion
 can reuse the same criterion framework without modifying the core grading engine.
 
 The immediate target is not a generic strategy programming language. It is a structured, versioned, reusable grading framework with Canonical BO as the first complete profile.
+
+---
+
+# 68. Phase 6 — legacy compatibility contract (implemented)
+
+This section records the concrete compatibility contract delivered by Phase 6.
+It does not change any earlier rule in this document.
+
+- Legacy trade fields `quality_grade`, `quality_score`, and `quality_metrics`
+  are preserved. Profile results are never written into them and legacy values
+  are never converted into profile evaluations.
+- A trade's compatibility Setup source resolves as:
+  1. an explicit Phase-5 **primary** profile evaluation exists →
+     `profile_primary`;
+  2. otherwise legacy quality data exists → `legacy`;
+  3. otherwise → `none`.
+- Only the explicitly selected primary supersedes legacy display/filtering.
+  Latest/newest/draft/non-primary evaluations never do. If evaluations exist
+  without a primary selection, legacy behavior is retained.
+- A primary whose Setup dimension is ungraded has an effective Setup grade of
+  `null` (shown as N/A); it never falls back to the legacy grade.
+- The additive `qualitySummary` payload field mirrors this contract for the
+  trade list (all rows) and trade detail (owner only). Raw legacy API fields
+  (`qualityGrade` / `quality_score` / `qualityMetrics` / `setupQuality`) are
+  unchanged; profile 0-100 scores are never presented as legacy 0-5 scores.
+- The existing `qualityGrades` filter parameter means the **effective Setup
+  grade**: the primary evaluation's Setup grade when a primary exists, else the
+  legacy grade. It is implemented as a `CASE`, never a `COALESCE`, so a null
+  primary grade does not fall back. The same shared predicate applies to trade
+  list, count, analytics, analytics export, CSV export, partial exits, and
+  Trade Management.
+- The list query resolves the primary evaluation with a single one-row LATERAL
+  join (no per-trade follow-up query / no N+1).
+- The legacy "Calculate Setup Quality" service continues to write only the
+  legacy columns; it does not create profile evaluations or alter the primary
+  pointer. Where a primary exists the action is labelled "Calculate Legacy
+  Setup Quality".
+- No automatic backfill was performed: no evaluations are created from legacy
+  grades, no scores are rescaled, no primary is auto-selected, and no
+  historical trade is regraded. Phase 6 added no migration.
+- No combined overall quality score is introduced; Setup, Entry, and
+  Management remain independent.
+- Public/shared trade payloads are unchanged: the new profile-specific
+  compatibility summary is not added to them.
+

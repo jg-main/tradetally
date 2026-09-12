@@ -392,10 +392,13 @@ describe('TradeQueries.getAnalytics characterization', () => {
       expect(sql).toContain('t.instrument_type IN ($2,$3)');
     });
 
-    test('qualityGrades: IN with placeholders', async () => {
+    test('qualityGrades: compatibility CASE with primary override', async () => {
       await TradeQueries.getAnalytics('user-1', { qualityGrades: ['A', 'B'] });
       const sql = captureSql();
-      expect(sql).toContain('t.quality_grade IN ($2,$3)');
+      // Phase 6: shared effective-Setup-grade semantics in every analytics query.
+      expect(sql).toContain('trade_quality_primary_evaluations');
+      expect(sql).toContain('IN ($2,$3)');
+      expect(sql).toContain('ELSE t.quality_grade');
     });
 
     test('tags: array overlap', async () => {

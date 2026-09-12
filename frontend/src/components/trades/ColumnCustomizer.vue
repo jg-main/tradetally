@@ -172,7 +172,7 @@ const defaultColumns = [
   { key: 'grossPnl', label: 'Gross P&L', visible: true, width: 'auto' },
   { key: 'unrealizedPnl', label: 'Unrealized', visible: true, width: 'auto' },
   { key: 'confidence', label: 'Confidence', visible: true, width: 'auto' },
-  { key: 'quality', label: 'Quality', visible: true, width: 'auto' },
+  { key: 'quality', label: 'Setup Quality', visible: true, width: 'auto' },
   { key: 'sector', label: 'Sector', visible: true, width: 'auto' },
   { key: 'status', label: 'Status', visible: true, width: 'auto' },
   { key: 'comments', label: 'Comments', visible: true, width: 'auto' },
@@ -249,7 +249,7 @@ const loadSavedColumns = () => {
           // Insert quality column after confidence
           savedColumns.splice(confidenceIndex + 1, 0, {
             key: 'quality',
-            label: 'Quality',
+            label: 'Setup Quality',
             visible: true,
             width: 'auto'
           })
@@ -257,7 +257,7 @@ const loadSavedColumns = () => {
           // If confidence not found, just add at a reasonable position
           savedColumns.push({
             key: 'quality',
-            label: 'Quality',
+            label: 'Setup Quality',
             visible: true,
             width: 'auto'
           })

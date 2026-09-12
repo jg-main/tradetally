@@ -37,6 +37,17 @@ describe('tradeFilterState', () => {
     })
   })
 
+  it('preserves the qualityGrades key when restoring saved filter state', () => {
+    // Saved state predating Phase 6 (string form) must keep loading as an array
+    // under the exact same key; the filter's meaning is now the effective
+    // compatibility Setup grade but its API parameter is unchanged.
+    const storage = createStorage({
+      tradeFilters: JSON.stringify({ qualityGrades: 'A,C' })
+    })
+    expect(loadTradeFiltersFromStorage(storage).qualityGrades).toEqual(['A', 'C'])
+    expect(normalizeTradeFiltersForSharedState({ qualityGrades: ['A'] }).qualityGrades).toEqual(['A'])
+  })
+
   it('loads saved filters from storage in normalized form', () => {
     const storage = createStorage({
       tradeFilters: JSON.stringify({

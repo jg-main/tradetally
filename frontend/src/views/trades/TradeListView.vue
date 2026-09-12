@@ -410,20 +410,23 @@
             </div>
           </div>
 
-          <!-- Quality Grade -->
-          <div v-if="trade.qualityGrade" class="mt-3 pt-2 border-t border-gray-200 dark:border-gray-700">
+          <!-- Setup Quality (compatibility source: primary profile > legacy) -->
+          <div v-if="isPrimaryQuality(trade) || isLegacyQuality(trade)" class="mt-3 pt-2 border-t border-gray-200 dark:border-gray-700">
             <div class="flex items-center justify-between">
-              <div class="text-xs text-gray-500 dark:text-gray-400">Quality</div>
-              <span class="px-2 py-1 inline-flex text-xs font-semibold rounded"
-                :class="{
-                  'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400': trade.qualityGrade === 'A',
-                  'bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400': trade.qualityGrade === 'B',
-                  'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400': trade.qualityGrade === 'C',
-                  'bg-orange-100 text-orange-800 dark:bg-orange-900/20 dark:text-orange-400': trade.qualityGrade === 'D',
-                  'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400': trade.qualityGrade === 'F'
-                }">
-                {{ trade.qualityGrade }}
-              </span>
+              <div class="text-xs text-gray-500 dark:text-gray-400">Setup Quality</div>
+              <div class="flex items-center gap-1">
+                <span v-if="qualityGradeFor(trade)"
+                  class="px-2 py-1 inline-flex text-xs font-semibold rounded"
+                  :class="qualityBadgeClass(qualityGradeFor(trade))"
+                  :title="qualityTooltipFor(trade)"
+                  data-testid="trade-quality-grade">
+                  {{ qualityGradeFor(trade) }}
+                </span>
+                <span v-else-if="isPrimaryQuality(trade)" class="text-xs font-semibold text-gray-500 dark:text-gray-400" :title="qualityTooltipFor(trade)">N/A</span>
+                <span v-else class="text-xs text-gray-500 dark:text-gray-400">-</span>
+                <span v-if="isPrimaryQuality(trade)" class="text-[10px] text-primary-600 dark:text-primary-400" title="Profile-based Setup Quality">profile</span>
+                <span v-else-if="isLegacyQuality(trade)" class="text-[10px] text-gray-400" title="Legacy Setup Quality">legacy</span>
+              </div>
             </div>
           </div>
 
@@ -659,22 +662,11 @@
                   <div v-else class="text-sm text-gray-500 dark:text-gray-400">-</div>
                 </td>
 
-                <!-- Quality Column -->
+                <!-- Setup Quality Column (compatibility source: primary profile > legacy) -->
                 <td v-else-if="column.visible && column.key === 'quality'"
                     :class="[getCellPadding, 'whitespace-nowrap cursor-pointer text-center']"
                     @click="$router.push(`/trades/${trade.id}`)">
-                  <span v-if="trade.qualityGrade"
-                    class="px-2 py-1 inline-block text-xs font-semibold rounded"
-                    :class="{
-                      'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400': trade.qualityGrade === 'A',
-                      'bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400': trade.qualityGrade === 'B',
-                      'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400': trade.qualityGrade === 'C',
-                      'bg-orange-100 text-orange-800 dark:bg-orange-900/20 dark:text-orange-400': trade.qualityGrade === 'D',
-                      'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400': trade.qualityGrade === 'F'
-                    }">
-                    {{ trade.qualityGrade }}
-                  </span>
-                  <span v-else class="text-sm text-gray-500 dark:text-gray-400">-</span>
+                  <TradeQualityCell :trade="trade" />
                 </td>
 
                 <!-- Sector Column -->
@@ -1110,6 +1102,7 @@ const BulkTradeAllocationModal = defineAsyncComponent(() => import('@/components
 import TradeCommentsDialog from '@/components/trades/TradeCommentsDialog.vue'
 import EnrichmentStatus from '@/components/trades/EnrichmentStatus.vue'
 import ColumnCustomizer from '@/components/trades/ColumnCustomizer.vue'
+import TradeQualityCell from '@/components/trades/TradeQualityCell.vue'
 import TagManagement from '@/components/trades/TagManagement.vue'
 import MdiIcon from '@/components/MdiIcon.vue'
 import StockLogo from '@/components/common/StockLogo.vue'
@@ -1119,6 +1112,13 @@ import api from '@/services/api'
 import { useCurrencyFormatter } from '@/composables/useCurrencyFormatter'
 import { getTradeDateOnlyParts } from '@/utils/date'
 import { getTradeGrossPnl, isTradeOpen } from '@/utils/tradePnl'
+import {
+  resolveTradeQualitySummary,
+  setupGradeForTrade,
+  qualityGradeBadgeClass,
+  qualitySummaryTooltip,
+  QUALITY_SOURCE
+} from '@/utils/tradeQualitySummary'
 
 const tradesStore = useTradesStore()
 const uiPreferencesStore = useUiPreferencesStore()
@@ -1179,6 +1179,15 @@ const newspaperIcon = mdiNewspaper
 
 // Fullwidth mode
 const isFullWidth = ref(false)
+
+// Phase 6 compatibility Setup Quality (primary profile supersedes legacy).
+// The backend resolves the source; the view only renders the contract.
+const qualitySourceFor = (trade) => resolveTradeQualitySummary(trade).source
+const qualityGradeFor = (trade) => setupGradeForTrade(trade)
+const qualityBadgeClass = (grade) => qualityGradeBadgeClass(grade)
+const qualityTooltipFor = (trade) => qualitySummaryTooltip(trade)
+const isPrimaryQuality = (trade) => qualitySourceFor(trade) === QUALITY_SOURCE.PROFILE_PRIMARY
+const isLegacyQuality = (trade) => qualitySourceFor(trade) === QUALITY_SOURCE.LEGACY
 
 // Scroll synchronization
 const topScroll = ref(null)

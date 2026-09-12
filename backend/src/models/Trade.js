@@ -9,6 +9,7 @@ const { toSnakeCase } = require('../utils/caseConvert');
 const { buildTradeDateRangeClause } = require('../utils/tradeDateFilter');
 const OptionStrategyGroupingService = require('../services/optionStrategyGroupingService');
 const { getPublicTradeSqlColumns } = require('../utils/publicTrade');
+const legacyCompatibilityService = require('../services/quality/legacyCompatibilityService');
 /**
  * Round a numeric value to fit database precision
  * DECIMAL(20, 8) allows up to 12 integer digits and 8 decimal places
@@ -2829,7 +2830,10 @@ class Trade {
 
     if (filters.qualityGrades && filters.qualityGrades.length > 0) {
       const placeholders = filters.qualityGrades.map((_, index) => `$${paramCount + index}`).join(',');
-      whereClause += ` AND t.quality_grade IN (${placeholders})`;
+      // Phase 6 compatibility semantics shared with TradeQueries: a primary
+      // profile evaluation supersedes the legacy grade (even when NULL); no
+      // primary means legacy. Centralized in legacyCompatibilityService.
+      whereClause += ` AND ${legacyCompatibilityService.effectiveSetupGradeFilterSql('t', placeholders)}`;
       filters.qualityGrades.forEach(grade => values.push(grade));
       paramCount += filters.qualityGrades.length;
     }

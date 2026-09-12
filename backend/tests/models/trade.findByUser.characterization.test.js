@@ -178,11 +178,16 @@ describe('TradeQueries.findByUser characterization', () => {
       expect(sql).toContain('END = ANY($2::text[])');
     });
 
-    test('qualityGrades: IN with placeholders', async () => {
+    test('qualityGrades: compatibility CASE with primary override', async () => {
       await TradeQueries.findByUser('user-1', { qualityGrades: ['A', 'B'] });
       const { sql, values } = captureQuery();
       expect(values).toEqual(['user-1', 'A', 'B']);
-      expect(sql).toContain('t.quality_grade IN ($2,$3)');
+      // Phase 6: effective Setup grade = primary profile grade when a Phase-5
+      // primary exists, else legacy quality_grade (never a COALESCE).
+      expect(sql).toContain('trade_quality_primary_evaluations');
+      expect(sql).toContain('IN ($2,$3)');
+      expect(sql).toContain('ELSE t.quality_grade');
+      expect(sql).not.toContain('COALESCE(t.quality_grade');
     });
 
     test('tags: array overlap operator', async () => {
@@ -393,7 +398,8 @@ describe('TradeQueries.findByUser characterization', () => {
       expect(values).toEqual(['user-1', 'breakout', 'ACCT-1', 'ACCT-2', 'A']);
       expect(sql).toContain('t.strategy IN ($2)');
       expect(sql).toContain('t.account_identifier IN ($3,$4)');
-      expect(sql).toContain('t.quality_grade IN ($5)');
+      expect(sql).toContain('IN ($5)');
+      expect(sql).toContain('ELSE t.quality_grade');
     });
 
     test('sectors + limit: sector join present, limit param follows sector params', async () => {

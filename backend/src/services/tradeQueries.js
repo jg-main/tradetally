@@ -14,6 +14,7 @@ const Trade = require('../models/Trade');
 const { getUserTimezone } = require('../utils/timezone');
 const { buildTradeDateRangeClause } = require('../utils/tradeDateFilter');
 const { buildExecutionDailyPnlRows } = require('../utils/executionPnlByDate');
+const legacyCompatibilityService = require('./quality/legacyCompatibilityService');
 
 async function timedDbQuery(label, query, values = []) {
   const startedAt = Date.now();
@@ -430,7 +431,12 @@ class TradeQueries {
 
     if (filters.qualityGrades && filters.qualityGrades.length > 0) {
       const placeholders = filters.qualityGrades.map((_, i) => `$${paramCount + i}`).join(',');
-      whereClause += ` AND t.quality_grade IN (${placeholders})`;
+      // Phase 6 compatibility semantics: the filter must agree with the
+      // displayed Setup Quality. A trade with an explicit primary profile
+      // evaluation filters on that primary's Setup grade (even when NULL);
+      // otherwise it falls back to the legacy grade. This is a CASE, not a
+      // COALESCE, so an ungraded primary never masquerades as a legacy grade.
+      whereClause += ` AND ${legacyCompatibilityService.effectiveSetupGradeFilterSql('t', placeholders)}`;
       filters.qualityGrades.forEach(g => values.push(g));
       paramCount += filters.qualityGrades.length;
     }
@@ -487,6 +493,7 @@ class TradeQueries {
 
     const mainQuery = `
       SELECT ${listColumns},
+        ${legacyCompatibilityService.primaryListSelectSql()},
         CASE WHEN jsonb_typeof(t.news_events) = 'array' THEN jsonb_array_length(t.news_events) ELSE 0 END as news_event_count,
         pm.current_price,
         pm.last_updated as current_price_updated_at,
@@ -499,12 +506,14 @@ class TradeQueries {
         tpg.leg_count as group_leg_count
       FROM (${subquery}) AS trade_ids
       INNER JOIN trades t ON t.id = trade_ids.id
+      ${legacyCompatibilityService.primaryCompatibilityLateralSql('t')}
       LEFT JOIN price_monitoring pm ON pm.symbol = t.symbol
       LEFT JOIN trade_attachments ta ON t.id = ta.trade_id
       LEFT JOIN trade_comments tc ON t.id = tc.trade_id
       LEFT JOIN symbol_categories sc ON t.symbol = sc.symbol
       LEFT JOIN trade_position_groups tpg ON t.position_group_id = tpg.id
-      GROUP BY t.id, pm.current_price, pm.last_updated, sc.finnhub_industry, sc.company_name, tpg.detected_strategy, tpg.leg_count
+      GROUP BY t.id, pm.current_price, pm.last_updated, sc.finnhub_industry, sc.company_name, tpg.detected_strategy, tpg.leg_count,
+        ${legacyCompatibilityService.primaryListGroupBySql()}
       ORDER BY t.entry_time DESC NULLS LAST, t.id DESC
     `;
 

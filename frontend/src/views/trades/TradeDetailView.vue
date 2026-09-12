@@ -445,39 +445,11 @@
                     </div>
                   </dd>
                 </div>
-                <div class="sm:col-span-2">
-                  <dt class="text-sm font-medium text-gray-500 dark:text-gray-400">Setup Quality</dt>
-                  <dd class="mt-1">
-                    <div v-if="trade.qualityGrade" class="flex items-center space-x-3">
-                      <span class="px-3 py-1 inline-flex text-sm font-semibold rounded"
-                        :class="{
-                          'bg-green-100 text-green-800 dark:bg-green-900/20 dark:text-green-400': trade.qualityGrade === 'A',
-                          'bg-blue-100 text-blue-800 dark:bg-blue-900/20 dark:text-blue-400': trade.qualityGrade === 'B',
-                          'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/20 dark:text-yellow-400': trade.qualityGrade === 'C',
-                          'bg-orange-100 text-orange-800 dark:bg-orange-900/20 dark:text-orange-400': trade.qualityGrade === 'D',
-                          'bg-red-100 text-red-800 dark:bg-red-900/20 dark:text-red-400': trade.qualityGrade === 'F'
-                        }">
-                        Grade {{ trade.qualityGrade }}
-                      </span>
-                      <span v-if="trade.qualityScore" class="text-sm text-gray-600 dark:text-gray-400">
-                        ({{ Number(trade.qualityScore).toFixed(1) }}/5.0)
-                      </span>
-                    </div>
-                    <div v-else-if="trade.instrument_type === 'future'">
-                      <span class="text-sm text-gray-500 dark:text-gray-400">Not available for futures</span>
-                    </div>
-                    <div v-else class="flex items-center space-x-2">
-                      <span class="text-sm text-gray-500 dark:text-gray-400">Not calculated</span>
-                      <button
-                        @click="calculateQuality"
-                        :disabled="calculatingQuality"
-                        class="text-xs px-3 py-1 bg-primary-600 text-white rounded hover:bg-primary-700 disabled:opacity-50"
-                      >
-                        {{ calculatingQuality ? 'Calculating...' : 'Calculate Setup Quality' }}
-                      </button>
-                    </div>
-                  </dd>
-                </div>
+                <TradeSetupQualitySummary
+                  :trade="trade"
+                  :calculating="calculatingQuality"
+                  @calculate="calculateQuality"
+                />
                 <div v-if="trade.sector">
                   <dt class="text-sm font-medium text-gray-500 dark:text-gray-400">Sector</dt>
                   <dd class="mt-1 text-sm text-gray-900 dark:text-white">{{ trade.sector }}</dd>
@@ -523,7 +495,7 @@
           <!-- Setup Quality Breakdown -->
           <div v-if="trade.qualityMetrics" class="card">
             <div class="card-body">
-              <h3 class="text-lg font-medium text-gray-900 dark:text-white" :class="trade.qualityMetrics.dataSymbol ? 'mb-1' : 'mb-4'">Setup Quality Breakdown</h3>
+              <h3 class="text-lg font-medium text-gray-900 dark:text-white" :class="trade.qualityMetrics.dataSymbol ? 'mb-1' : 'mb-4'">{{ qualitySummary.source === QUALITY_SOURCE.PROFILE_PRIMARY ? 'Legacy Setup Quality Breakdown' : 'Setup Quality Breakdown' }}</h3>
               <p v-if="!trade.qualityGrade && trade.qualityMetrics.coverage !== undefined" class="text-xs text-yellow-700 dark:text-yellow-300 mb-3">
                 Setup quality was not graded because only {{ formatPercentValue(trade.qualityMetrics.coverage) }} of the configured metric weight had data. Minimum required coverage is {{ formatPercentValue(trade.qualityMetrics.minimumCoverage ?? 0.4) }}.
               </p>
@@ -584,7 +556,7 @@
               <div class="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
                 <div class="flex items-center justify-between">
                   <div>
-                    <h4 class="text-sm font-semibold text-gray-900 dark:text-white">Overall Setup Quality</h4>
+                    <h4 class="text-sm font-semibold text-gray-900 dark:text-white">{{ qualitySummary.source === QUALITY_SOURCE.PROFILE_PRIMARY ? 'Overall Legacy Setup Quality' : 'Overall Setup Quality' }}</h4>
                     <p class="text-xs text-gray-500 dark:text-gray-400">
                       {{ hasExcludedQualityMetrics
                         ? 'Weighted average of metrics with data - metrics without data are excluded and the remaining weights are rescaled'
@@ -1688,6 +1660,7 @@ import TradeChartVisualization from '@/components/trades/TradeChartVisualization
 import TradeImages from '@/components/trades/TradeImages.vue'
 import TradeCharts from '@/components/trades/TradeCharts.vue'
 import SetupQualitySection from '@/components/trades/SetupQualitySection.vue'
+import TradeSetupQualitySummary from '@/components/trades/TradeSetupQualitySummary.vue'
 import EntryQualitySection from '@/components/trades/EntryQualitySection.vue'
 import ManagementQualitySection from '@/components/trades/ManagementQualitySection.vue'
 import QualityEvaluationHistory from '@/components/trades/QualityEvaluationHistory.vue'
@@ -1695,6 +1668,10 @@ import ProUpgradePrompt from '@/components/ProUpgradePrompt.vue'
 import BaseSelect from '@/components/common/BaseSelect.vue'
 import { useAIStore } from '@/stores/ai'
 import { getTradeDateOnlyParts } from '@/utils/date'
+import {
+  resolveTradeQualitySummary,
+  QUALITY_SOURCE
+} from '@/utils/tradeQualitySummary'
 import {
   consumeReloadScrollPosition,
   saveReloadScrollPosition,
@@ -1801,6 +1778,11 @@ const symbolCompanyName = computed(() => {
 // True only for the trade's owner. Guests/other users viewing a public trade get
 // a read-only view: owner actions and owner-only data fetches are skipped.
 const isOwner = computed(() => !!authStore.user && !!trade.value && trade.value.user_id === authStore.user.id)
+
+// Phase 6 compatibility Setup Quality. The backend resolves the source
+// (explicit primary profile evaluation > legacy > none); this view only
+// renders that contract and never re-derives precedence.
+const qualitySummary = computed(() => resolveTradeQualitySummary(trade.value))
 const allocationModalGroups = computed(() => {
   const byId = new Map(allocationGroups.value.map((group) => [group.id, group]))
   for (const allocation of tradeAllocations.value) {
@@ -2898,6 +2880,14 @@ async function splitSelectedTrades() {
 async function calculateQuality() {
   if (!trade.value || calculatingQuality.value) return
 
+  // Legacy recalculation never changes an explicit primary profile result. When
+  // no primary exists, refresh the additive compatibility summary from the raw
+  // legacy fields so the display reflects the new legacy grade.
+  const refreshLegacyCompatibility = () => {
+    if (trade.value.qualitySummary?.source === QUALITY_SOURCE.PROFILE_PRIMARY) return
+    trade.value.qualitySummary = resolveTradeQualitySummary({ ...trade.value, qualitySummary: null })
+  }
+
   try {
     calculatingQuality.value = true
     const response = await api.post(`/trades/${trade.value.id}/quality`)
@@ -2913,6 +2903,7 @@ async function calculateQuality() {
         score: response.data.quality.score,
         metrics: response.data.quality.metrics
       }
+      refreshLegacyCompatibility()
 
       showSuccess('Success', `Setup quality calculated: ${response.data.quality.grade}`)
     } else {
@@ -2930,6 +2921,7 @@ async function calculateQuality() {
         score: null,
         metrics: partialQuality.metrics
       }
+      refreshLegacyCompatibility()
     }
     showError('Error', error.response?.data?.error || 'Failed to calculate setup quality')
   } finally {
