@@ -177,12 +177,14 @@ describe('QualityEvaluationHistory', () => {
 
   it('refreshes history when the active evaluation progresses or finalizes', async () => {
     historyStore.evaluations = [historyRow({ id: 'eval-new', status: 'draft' })]
+    const workflow = useQualityWorkflowStore()
+    workflow.activate({ id: 'eval-new', trade_id: 'trade-1', status: 'draft' })
     mountSection()
     await flushPromises()
     const before = historyStore.fetchEvaluations.mock.calls.length
 
     // Simulates Setup/Entry/Management publishing progress and finalize.
-    useQualityWorkflowStore().updateActive({ id: 'eval-new', trade_id: 'trade-1', status: 'completed' })
+    workflow.updateActive({ id: 'eval-new', trade_id: 'trade-1', status: 'completed' })
 
     await flushPromises()
     expect(historyStore.fetchEvaluations.mock.calls.length).toBeGreaterThan(before)

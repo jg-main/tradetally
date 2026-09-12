@@ -338,75 +338,80 @@ const CRITERION_LABELS = {
   pivot_quality: 'Pivot Quality'
 }
 
+// The evaluation identity the local state currently belongs to. Binding to the
+// LOCAL identity (not merely the previous workflow id) means the normal
+// page-load path — local latest draft D1 while workflow.activeEvaluationId is
+// still null, then a fresh E2 — is detected as an identity change and reset.
+const boundEvaluationId = ref(null)
+
+function bindEvaluation(row) {
+  if (!row || !row.id) {
+    evaluation.value = null
+    boundEvaluationId.value = null
+    return
+  }
+  evaluation.value = row
+  boundEvaluationId.value = row.id
+  hydrateFromEvaluation(row)
+}
+
 watch(
   () => store.evaluation,
   (value) => {
-    // An explicitly selected active evaluation must not be overridden by the
-    // store's independent "latest draft" discovery.
-    if (workflow.activeEvaluationId && value && value.id !== workflow.activeEvaluationId) return
-    evaluation.value = value
-    hydrateFromEvaluation(value)
+    // Only hydrate from the store when it is the active identity; a stale
+    // response after clear (active null) must not populate local state.
+    if (!value || value.id !== workflow.activeEvaluationId) return
+    bindEvaluation(value)
   }
 )
 
-// The active workflow row is the single source of truth: when History starts a
-// re-evaluation (or another section progresses it), Setup follows that exact id.
+// Same-id progress from the active workflow row refreshes the bound row.
 watch(
   () => workflow.activeEvaluation,
   (value) => {
-    if (value && value.id === workflow.activeEvaluationId) {
-      evaluation.value = value
-      hydrateFromEvaluation(value)
+    if (value && value.id === boundEvaluationId.value) {
+      bindEvaluation(value)
     }
   }
 )
 
-// Evaluation-local state must never leak from D1 into a fresh D2. Reset on an
-// actual IDENTITY change only; same-id progress updates keep their state, and
-// an initial activation (null -> first id) must not wipe state hydrated from
-// the persisted row. A prepared payload that already belongs to the new id is
-// preserved (the current request's own result).
+// Identity transition. Covers null/local-D1 -> fresh E2, D1 -> D2 and
+// clear -> null. Resetting is based on the LOCAL bound identity, so a null
+// workflow id no longer hides the change. Activating the same locally-bound
+// evaluation keeps its valid state.
 watch(
   () => workflow.activeEvaluationId,
-  (newId, oldId) => {
-    if (newId === oldId) return
-    if (newId === null || newId === undefined) {
+  (newId) => {
+    if (!newId) {
       resetEvaluationLocalState()
+      boundEvaluationId.value = null
       return
     }
-    const identityChanged = oldId !== null && oldId !== undefined
-    if (identityChanged) {
-      const keepPrepared = !!(
-        prepared.value &&
-        prepared.value.evaluation &&
-        prepared.value.evaluation.id === newId
-      )
-      resetEvaluationLocalState({ keepPrepared })
-    }
-    if (workflow.activeEvaluation && workflow.activeEvaluation.id === newId) {
-      evaluation.value = workflow.activeEvaluation
-      hydrateFromEvaluation(workflow.activeEvaluation)
-    }
-    if (store.evaluation && store.evaluation.id === newId) {
-      evaluation.value = store.evaluation
-      hydrateFromEvaluation(store.evaluation)
-    }
+    if (newId === boundEvaluationId.value) return
+    const keepPrepared = !!(
+      prepared.value &&
+      prepared.value.evaluation &&
+      prepared.value.evaluation.id === newId
+    )
+    resetEvaluationLocalState({ keepPrepared })
+    const row =
+      workflow.activeEvaluation && workflow.activeEvaluation.id === newId
+        ? workflow.activeEvaluation
+        : store.evaluation && store.evaluation.id === newId
+          ? store.evaluation
+          : null
+    if (row) bindEvaluation(row)
+    else boundEvaluationId.value = newId
   }
 )
 
 watch(
   () => store.prepared,
   (value) => {
-    // A stale prepare response for a superseded evaluation must not hydrate the
-    // explicit active workflow row.
-    if (
-      workflow.activeEvaluationId &&
-      value &&
-      value.evaluation &&
-      value.evaluation.id !== workflow.activeEvaluationId
-    ) {
-      return
-    }
+    // Null-safe scope guard: a stale payload after clear (active null) or for a
+    // superseded evaluation must not hydrate local state.
+    const payloadId = value && value.evaluation && value.evaluation.id
+    if (payloadId !== workflow.activeEvaluationId) return
     prepared.value = value
     // After a fresh prepare, keep persisted confirmations if present.
     hydrateFromEvaluation(store.evaluation)
@@ -526,13 +531,18 @@ function hydrateFromEvaluation(value) {
 
 async function runPrepare() {
   prepared.value = null
-  // Capture the exact evaluation the request is issued against so a returned
-  // replacement row can be adopted only by this (non-superseded) request.
+  // Capture the exact evaluation and workflow generation the request is issued
+  // against, so a returned replacement row can be adopted only by this
+  // non-superseded request.
   const expectedId = resolveSetupEvaluationId()
+  const guard = workflow.beginRequest({
+    tradeId: props.trade.id,
+    expectedEvaluationId: expectedId
+  })
   try {
     const payload = await store.prepare(props.trade.id, prepareOptions({}, expectedId))
-    const adopted = workflow.adoptPreparedEvaluation(expectedId, payload && payload.evaluation)
-    if (!adopted) return // superseded in flight: do not apply a stale response
+    const adopted = workflow.adoptPreparedEvaluation(guard, payload && payload.evaluation)
+    if (!adopted) return // superseded/cleared in flight: ignore the stale response
     prepared.value = payload
     // Keep the displayed evaluation in sync with the returned row: a
     // re-prepare that invalidated stale Setup results must not keep showing
@@ -616,6 +626,10 @@ function realignPivotToBase() {
 async function detectPivotForConfirmedBase() {
   if (!baseStartInput.value || !baseStartInput.value.date) return
   const expectedId = resolveSetupEvaluationId()
+  const guard = workflow.beginRequest({
+    tradeId: props.trade.id,
+    expectedEvaluationId: expectedId
+  })
   const confirmedBaseStart = {
     date: baseStartInput.value.date,
     source: baseStartInput.value.source
@@ -625,8 +639,8 @@ async function detectPivotForConfirmedBase() {
       props.trade.id,
       prepareOptions({ confirmedBaseStart }, expectedId)
     )
-    const adopted = workflow.adoptPreparedEvaluation(expectedId, payload && payload.evaluation)
-    if (!adopted) return // superseded in flight: do not apply a stale response
+    const adopted = workflow.adoptPreparedEvaluation(guard, payload && payload.evaluation)
+    if (!adopted) return // superseded/cleared in flight: ignore the stale response
     prepared.value = payload
     // Sync the displayed evaluation: the server may have invalidated stale
     // Setup results when the Base Start context changed.
@@ -694,6 +708,10 @@ async function runEvaluate() {
     store.error = 'Run Prepare Setup first.'
     return
   }
+  const guard = workflow.beginRequest({
+    tradeId: props.trade.id,
+    expectedEvaluationId: evaluationId
+  })
   try {
     // Send ONLY the semantic inputs the active execution contract requires.
     const userInputs = {}
@@ -715,9 +733,10 @@ async function runEvaluate() {
       evaluationId,
       userInputs
     })
+    // Only a request whose scope is still current may mutate workflow/local state.
+    if (!workflow.commitProgress(guard, payload.evaluation)) return
     evaluation.value = payload.evaluation
     prepared.value = { ...(prepared.value || {}), evaluation: payload.evaluation }
-    if (payload.evaluation) workflow.updateActive(payload.evaluation)
   } catch (err) {
     // store.error is already surfaced in the template
   }
@@ -740,16 +759,14 @@ onMounted(async () => {
     workflow.ensureTrade(props.trade.id)
     await store.fetchEvaluations(props.trade.id)
     // Prefer an explicitly selected active evaluation over "latest draft".
-    if (
+    const row =
       workflow.activeEvaluationId &&
       workflow.activeEvaluation &&
       workflow.activeEvaluation.id === workflow.activeEvaluationId
-    ) {
-      evaluation.value = workflow.activeEvaluation
-    } else {
-      evaluation.value = store.evaluation
-    }
-    hydrateFromEvaluation(evaluation.value)
+        ? workflow.activeEvaluation
+        : store.evaluation
+    // Bind the local state to the identity it was hydrated from.
+    bindEvaluation(row)
   } catch (err) {
     // Ignore — the panel shows the Prepare CTA instead.
   } finally {

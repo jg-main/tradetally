@@ -278,64 +278,69 @@ const CRITERION_LABELS = {
   trailing_ma: 'Trailing MA Exit'
 }
 
+// The evaluation identity the local state currently belongs to. Binding to the
+// LOCAL identity (not merely the previous workflow id) detects the normal
+// page-load path — local latest draft D1 while workflow is still null, then a
+// fresh E2 — as an identity change and resets leaked state.
+const boundEvaluationId = ref(null)
+
+function bindEvaluation(row) {
+  if (!row || !row.id) {
+    evaluation.value = null
+    boundEvaluationId.value = null
+    return
+  }
+  evaluation.value = row
+  boundEvaluationId.value = row.id
+  hydrateFromEvaluation(row)
+}
+
 watch(() => store.evaluation, (value) => {
-  // An explicitly selected active evaluation must not be overridden by the
-  // store's independent "latest draft" discovery.
-  if (workflow.activeEvaluationId && value && value.id !== workflow.activeEvaluationId) return
-  evaluation.value = value
-  hydrateFromEvaluation(value)
+  // Null-safe scope guard: only the active identity may populate local state.
+  if (!value || value.id !== workflow.activeEvaluationId) return
+  bindEvaluation(value)
 })
 
 // Follow the active workflow row (started by History or progressed by
 // Setup/Entry) so Management always operates on the SAME evaluation.
 watch(() => workflow.activeEvaluation, (value) => {
-  if (value && value.id === workflow.activeEvaluationId) {
-    evaluation.value = value
-    hydrateFromEvaluation(value)
+  if (value && value.id === boundEvaluationId.value) {
+    bindEvaluation(value)
   }
 })
 
-// Evaluation-local state must not leak from D1 into a fresh D2 (in particular
-// the trailing selections and the prepared entryDependency). Reset on an actual
-// identity change only; same-id progress keeps its state, and an initial
-// activation (null -> first id) must not wipe state hydrated from the persisted
-// row.
-watch(() => workflow.activeEvaluationId, (newId, oldId) => {
-  if (newId === oldId) return
-  if (newId === null || newId === undefined) {
+// Evaluation-local state must not leak from D1 into a fresh E2 (in particular
+// the trailing selections and the prepared entryDependency). Resetting is based
+// on the LOCAL bound identity, so a null workflow id no longer hides the change.
+// Activating the same locally-bound evaluation keeps its valid state.
+watch(() => workflow.activeEvaluationId, (newId) => {
+  if (!newId) {
     resetEvaluationLocalState()
+    boundEvaluationId.value = null
     return
   }
-  const identityChanged = oldId !== null && oldId !== undefined
-  if (identityChanged) {
-    const keepPrepared = !!(
-      prepared.value &&
-      prepared.value.evaluation &&
-      prepared.value.evaluation.id === newId
-    )
-    resetEvaluationLocalState({ keepPrepared })
-  }
-  if (workflow.activeEvaluation && workflow.activeEvaluation.id === newId) {
-    evaluation.value = workflow.activeEvaluation
-    hydrateFromEvaluation(workflow.activeEvaluation)
-  }
-  if (store.evaluation && store.evaluation.id === newId) {
-    evaluation.value = store.evaluation
-    hydrateFromEvaluation(store.evaluation)
-  }
+  if (newId === boundEvaluationId.value) return
+  const keepPrepared = !!(
+    prepared.value &&
+    prepared.value.evaluation &&
+    prepared.value.evaluation.id === newId
+  )
+  resetEvaluationLocalState({ keepPrepared })
+  const row =
+    workflow.activeEvaluation && workflow.activeEvaluation.id === newId
+      ? workflow.activeEvaluation
+      : store.evaluation && store.evaluation.id === newId
+        ? store.evaluation
+        : null
+  if (row) bindEvaluation(row)
+  else boundEvaluationId.value = newId
 })
 
 watch(() => store.prepared, (value) => {
-  // A stale prepare response for a superseded evaluation must not hydrate the
-  // explicit active workflow row.
-  if (
-    workflow.activeEvaluationId &&
-    value &&
-    value.evaluation &&
-    value.evaluation.id !== workflow.activeEvaluationId
-  ) {
-    return
-  }
+  // Null-safe scope guard: a stale payload after clear (active null) or for a
+  // superseded evaluation must not hydrate local state.
+  const payloadId = value && value.evaluation && value.evaluation.id
+  if (payloadId !== workflow.activeEvaluationId) return
   prepared.value = value
   if (value) hydrateFromPrepared(value)
 })
@@ -560,11 +565,15 @@ function hydrateFromPrepared(value) {
 
 async function runPrepare() {
   const evaluationId = workflow.activeEvaluationId || (evaluation.value && evaluation.value.id)
+  const guard = workflow.beginRequest({
+    tradeId: props.trade.id,
+    expectedEvaluationId: evaluationId
+  })
   try {
     const payload = await store.prepare(props.trade.id, { evaluationId })
+    if (!workflow.commitProgress(guard, payload && payload.evaluation)) return
     prepared.value = payload
     evaluation.value = payload.evaluation || evaluation.value
-    if (payload.evaluation) workflow.updateActive(payload.evaluation)
   } catch (err) {
     // store.error is already surfaced
   }
@@ -579,6 +588,10 @@ async function runEvaluate() {
     store.error = 'Prepare Management first.'
     return
   }
+  const guard = workflow.beginRequest({
+    tradeId: props.trade.id,
+    expectedEvaluationId: evaluationId
+  })
   const userInputs = {}
   if (requiresActivationAssertion.value && trailingPhase.value) userInputs.trailing_phase = trailingPhase.value
   if (trailingPhase.value === 'activated' && trailingActivationSession.value && !activationSessionLocked.value) {
@@ -589,9 +602,9 @@ async function runEvaluate() {
   }
   try {
     const payload = await store.evaluate(props.trade.id, { evaluationId, userInputs })
+    if (!workflow.commitProgress(guard, payload.evaluation)) return
     evaluation.value = payload.evaluation
     prepared.value = { ...(prepared.value || {}), evaluation: payload.evaluation }
-    if (payload.evaluation) workflow.updateActive(payload.evaluation)
   } catch (err) {
     // store.error is already surfaced
   }
@@ -600,12 +613,16 @@ async function runEvaluate() {
 async function runFinalize() {
   const evaluationId = workflow.activeEvaluationId || (evaluation.value && evaluation.value.id)
   if (!evaluationId) return
+  const guard = workflow.beginRequest({
+    tradeId: props.trade.id,
+    expectedEvaluationId: evaluationId
+  })
   try {
     const payload = await store.finalize(props.trade.id, { evaluationId })
+    // A cleared/trade-changed workflow must not be resurrected by a late
+    // terminal response.
+    if (!workflow.commitProgress(guard, payload.evaluation)) return
     evaluation.value = payload.evaluation
-    // Publishing the terminal row updates History from draft to terminal
-    // without a page reload, and never changes the primary.
-    if (payload.evaluation) workflow.updateActive(payload.evaluation)
   } catch (err) {
     // store.error is already surfaced
   }
@@ -615,19 +632,20 @@ onMounted(async () => {
   try {
     workflow.ensureTrade(props.trade.id)
     const list = await store.fetchEvaluations(props.trade.id)
+    let row
     if (
       workflow.activeEvaluationId &&
       workflow.activeEvaluation &&
       workflow.activeEvaluation.id === workflow.activeEvaluationId
     ) {
-      evaluation.value = workflow.activeEvaluation
+      row = workflow.activeEvaluation
     } else {
       const latestDraft = Array.isArray(list)
         ? list.find((item) => item.status !== 'completed' && item.status !== 'insufficient_data')
         : null
-      evaluation.value = store.evaluation || latestDraft || null
+      row = store.evaluation || latestDraft || null
     }
-    hydrateFromEvaluation(evaluation.value)
+    bindEvaluation(row)
   } catch (err) {
     // The panel shows the Entry gate/CTA instead.
   }

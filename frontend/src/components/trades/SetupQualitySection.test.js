@@ -476,6 +476,148 @@ describe('SetupQualitySection', () => {
     expect(wrapper.find('[data-testid="run-setup"]').exists()).toBe(false)
     expect(wrapper.get('[data-testid="prepare-setup"]').exists()).toBe(true)
   })
+
+  it('resets locally-loaded D1 assertions when History activates a fresh E2 (workflow was null)', async () => {
+    const d1 = evaluationResult({
+      id: 'D1',
+      user_inputs: {
+        leader_confirmed: true,
+        base_start: { date: '2026-03-10', source: 'user_adjusted' },
+        pivot: { price: 103, source: 'user_adjusted' }
+      }
+    })
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([d1])
+    mockStoreInstance.evaluation = d1
+    mockStoreInstance.prepare.mockResolvedValue({
+      ...detectedPayload(),
+      evaluation: { id: 'E2', status: 'draft' }
+    })
+    const workflow = useQualityWorkflowStore()
+    workflow.ensureTrade('trade-1')
+    // Normal page load: the section discovers D1 locally while the workflow has
+    // no active evaluation yet.
+    const wrapper = mountSection()
+    await flushPromises()
+
+    // History "Evaluate with current version" activates a fresh E2.
+    workflow.activate({
+      id: 'E2',
+      trade_id: 'trade-1',
+      status: 'draft',
+      user_inputs: null,
+      results: null,
+      detected_context: null
+    })
+    await flushPromises()
+
+    await wrapper.get('[data-testid="prepare-setup"]').trigger('click')
+    await flushPromises()
+
+    // No D1 semantic field leaked into E2.
+    expect(wrapper.get('[data-testid="leader-yes"]').element.checked).toBe(false)
+    expect(wrapper.find('[data-testid="base-start-date-input"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="pivot-price-input"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="run-setup"]').trigger('click')
+    await flushPromises()
+    expect(mockStoreInstance.evaluate).not.toHaveBeenCalled()
+  })
+
+  it('does not erase locally-bound D1 state when the workflow activates the same D1', async () => {
+    const d1 = evaluationResult({
+      id: 'D1',
+      user_inputs: {
+        leader_confirmed: true,
+        base_start: { date: '2026-03-10', source: 'user_adjusted' }
+      }
+    })
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([d1])
+    mockStoreInstance.evaluation = d1
+    mockStoreInstance.prepare.mockResolvedValue({
+      ...detectedPayload(),
+      evaluation: { id: 'D1', status: 'draft', user_inputs: d1.user_inputs }
+    })
+    const workflow = useQualityWorkflowStore()
+    workflow.ensureTrade('trade-1')
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-setup"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="leader-yes"]').element.checked).toBe(true)
+
+    workflow.activate({
+      id: 'D1',
+      trade_id: 'trade-1',
+      status: 'draft',
+      user_inputs: d1.user_inputs,
+      results: d1.results
+    })
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="leader-yes"]').element.checked).toBe(true)
+    expect(wrapper.get('[data-testid="base-start-date-input"]').element.value).toBe('2026-03-10')
+  })
+
+  it('a clear() while Setup prepare is in flight leaves the workflow cleared', async () => {
+    const d1 = evaluationResult({ id: 'D1' })
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([d1])
+    mockStoreInstance.evaluation = d1
+    const workflow = useQualityWorkflowStore()
+    workflow.activate({ id: 'D1', trade_id: 'trade-1', status: 'draft', results: d1.results })
+
+    let resolvePrepare
+    mockStoreInstance.prepare.mockReturnValue(
+      new Promise((resolve) => {
+        resolvePrepare = resolve
+      })
+    )
+
+    const wrapper = mountSection()
+    await flushPromises()
+    wrapper.get('[data-testid="prepare-setup"]').trigger('click')
+    await flushPromises()
+
+    workflow.clear()
+    await flushPromises()
+
+    resolvePrepare({ ...detectedPayload(), evaluation: { id: 'E2', status: 'draft' } })
+    await flushPromises()
+
+    expect(workflow.activeEvaluationId).toBeNull()
+    expect(workflow.activeEvaluation).toBeNull()
+    // No stale hydration into local state.
+    expect(wrapper.find('[data-testid="leader-yes"]').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="prepare-setup"]').exists()).toBe(true)
+  })
+
+  it('a trade change while Setup prepare is in flight ignores the late Trade-1 response', async () => {
+    const d1 = evaluationResult({ id: 'D1' })
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([d1])
+    mockStoreInstance.evaluation = d1
+    const workflow = useQualityWorkflowStore()
+    workflow.activate({ id: 'D1', trade_id: 'trade-1', status: 'draft', results: d1.results })
+
+    let resolvePrepare
+    mockStoreInstance.prepare.mockReturnValue(
+      new Promise((resolve) => {
+        resolvePrepare = resolve
+      })
+    )
+
+    const wrapper = mountSection()
+    await flushPromises()
+    wrapper.get('[data-testid="prepare-setup"]').trigger('click')
+    await flushPromises()
+
+    workflow.ensureTrade('trade-2')
+    await flushPromises()
+
+    resolvePrepare({ ...detectedPayload(), evaluation: { id: 'E2', status: 'draft' } })
+    await flushPromises()
+
+    expect(workflow.activeTradeId).toBe('trade-2')
+    expect(workflow.activeEvaluationId).toBeNull()
+    expect(wrapper.find('[data-testid="leader-yes"]').exists()).toBe(false)
+  })
 })
 
 describe('SetupQualitySection dynamic execution contract (requiredUserInputs)', () => {

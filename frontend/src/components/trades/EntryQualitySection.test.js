@@ -330,4 +330,79 @@ describe('EntryQualitySection', () => {
     expect(text).toContain('UNKNOWN')
     expect(text).toContain('PASS')
   })
+
+  it('does not leak a locally-loaded D1 intended trigger when History activates a fresh E2', async () => {
+    const d1 = {
+      id: 'D1',
+      status: 'draft',
+      results: { setup: setupResult(), entry: null, management: null },
+      user_inputs: { intended_trigger_type: 'BO-ORH-60' },
+      detected_context: {
+        entry: {
+          allowed_trigger_types: ['BO-PIVOT', 'BO-ORH-60'],
+          intended_trigger: { value: 'BO-ORH-60', source: 'user_asserted' }
+        }
+      }
+    }
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([d1])
+    mockStoreInstance.prepare.mockResolvedValue(preparedPayload())
+    const workflow = useQualityWorkflowStore()
+    workflow.ensureTrade('trade-1')
+    const wrapper = mountSection()
+    await flushPromises()
+
+    // Fresh E2: setup ready, no trigger assertion.
+    workflow.activate({
+      id: 'E2',
+      trade_id: 'trade-1',
+      status: 'draft',
+      results: { setup: setupResult(), entry: null, management: null },
+      user_inputs: null,
+      detected_context: { entry: { allowed_trigger_types: ['BO-PIVOT', 'BO-ORH-60'] } }
+    })
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-entry"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="entry-intended-trigger-locked"]').exists()).toBe(false)
+    const select = wrapper.find('[data-testid="entry-intended-trigger"]')
+    expect(select.exists()).toBe(true)
+    expect(select.element.value).toBe('')
+  })
+
+  it('a clear() while Entry evaluate is in flight leaves the workflow cleared', async () => {
+    const d1 = persistedEvaluation()
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([d1])
+    mockStoreInstance.prepare.mockResolvedValue(preparedPayload())
+    let resolveEvaluate
+    mockStoreInstance.evaluate.mockReturnValue(
+      new Promise((resolve) => {
+        resolveEvaluate = resolve
+      })
+    )
+    const workflow = useQualityWorkflowStore()
+    workflow.activate({
+      id: 'eval-1',
+      trade_id: 'trade-1',
+      status: 'draft',
+      results: d1.results,
+      user_inputs: d1.user_inputs,
+      detected_context: d1.detected_context
+    })
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-entry"]').trigger('click')
+    await flushPromises()
+
+    wrapper.get('[data-testid="run-entry"]').trigger('click')
+    await flushPromises()
+    workflow.clear()
+    await flushPromises()
+
+    resolveEvaluate({ evaluation: { id: 'eval-1', status: 'draft', results: d1.results } })
+    await flushPromises()
+
+    expect(workflow.activeEvaluationId).toBeNull()
+    expect(workflow.activeEvaluation).toBeNull()
+  })
 })

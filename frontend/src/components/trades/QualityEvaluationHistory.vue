@@ -261,18 +261,27 @@ async function setPrimary(row) {
 // evaluations stay visible; primary is never auto-promoted).
 async function evaluateWithCurrent(row) {
   try {
+    // Guard the start request too: a trade change/clear in flight must not let a
+    // stale new draft become active.
+    const startGuard = workflow.beginRequest({
+      tradeId: props.trade.id,
+      expectedEvaluationId: null
+    })
     const evaluation = await store.startEvaluation(props.trade.id, row.current_version_id)
-    if (evaluation) {
-      // Publish the new active row FIRST so Entry/Management follow it, then
-      // prepare Setup on that exact id (the history watcher refreshes the list).
-      workflow.activate(evaluation)
-      const prepared = await setupStore.prepare(props.trade.id, {
-        evaluationId: evaluation.id
-      })
-      // The backend may legitimately return a replacement draft; adopt it only
-      // against the id this request was issued for.
-      workflow.adoptPreparedEvaluation(evaluation.id, prepared && prepared.evaluation)
-    }
+    if (!evaluation || !workflow.isRequestCurrent(startGuard)) return
+    // Publish the new active row FIRST so Entry/Management follow it, then
+    // prepare Setup on that exact id (the history watcher refreshes the list).
+    workflow.activate(evaluation)
+    const guard = workflow.beginRequest({
+      tradeId: props.trade.id,
+      expectedEvaluationId: evaluation.id
+    })
+    const prepared = await setupStore.prepare(props.trade.id, {
+      evaluationId: evaluation.id
+    })
+    // The backend may legitimately return a replacement draft; adopt it only
+    // against the id this request was issued for.
+    workflow.adoptPreparedEvaluation(guard, prepared && prepared.evaluation)
     await store.fetchEvaluations(props.trade.id)
   } catch (err) {
     // surfaced via store.error

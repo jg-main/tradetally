@@ -342,4 +342,81 @@ describe('ManagementQualitySection', () => {
       userInputs: {}
     })
   })
+
+  it('does not leak a locally-loaded D1 trailing selection when History activates a fresh E2', async () => {
+    const d1 = {
+      id: 'D1',
+      status: 'draft',
+      results: { setup: setupResult(), entry: entryResult(), management: null },
+      user_inputs: {
+        trailing_ma_period: 20,
+        trailing_phase: 'activated',
+        trailing_activation_session: '2026-03-11'
+      }
+    }
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([d1])
+    mockStoreInstance.prepare.mockResolvedValue(preparedPayload())
+    const workflow = useQualityWorkflowStore()
+    workflow.ensureTrade('trade-1')
+    const wrapper = mountSection()
+    await flushPromises()
+
+    // Fresh E2 with Entry ready but no trailing assertions.
+    workflow.activate({
+      id: 'E2',
+      trade_id: 'trade-1',
+      status: 'draft',
+      results: { setup: setupResult(), entry: entryResult(), management: null },
+      user_inputs: null,
+      detected_context: null
+    })
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-management"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.find('[data-testid="mgmt-trailing-locked"]').exists()).toBe(false)
+    const select = wrapper.find('[data-testid="mgmt-trailing-select"]')
+    if (select.exists()) {
+      expect(select.element.value).toBe('')
+    }
+  })
+
+  it('a clear() while Management finalize is in flight leaves the workflow cleared', async () => {
+    const d1 = persistedEvaluation()
+    mockStoreInstance.fetchEvaluations.mockResolvedValue([d1])
+    mockStoreInstance.prepare.mockResolvedValue(preparedPayload())
+    mockStoreInstance.evaluate.mockResolvedValue({ evaluation: persistedEvaluation() })
+    let resolveFinalize
+    mockStoreInstance.finalize.mockReturnValue(
+      new Promise((resolve) => {
+        resolveFinalize = resolve
+      })
+    )
+    const workflow = useQualityWorkflowStore()
+    workflow.activate({
+      id: 'eval-1',
+      trade_id: 'trade-1',
+      status: 'draft',
+      results: d1.results,
+      user_inputs: d1.user_inputs,
+      detected_context: d1.detected_context
+    })
+    const wrapper = mountSection()
+    await flushPromises()
+    await wrapper.get('[data-testid="prepare-management"]').trigger('click')
+    await flushPromises()
+    await wrapper.get('[data-testid="run-management"]').trigger('click')
+    await flushPromises()
+
+    wrapper.get('[data-testid="finalize-evaluation"]').trigger('click')
+    await flushPromises()
+    workflow.clear()
+    await flushPromises()
+
+    resolveFinalize({ evaluation: { id: 'eval-1', status: 'completed', results: d1.results } })
+    await flushPromises()
+
+    expect(workflow.activeEvaluationId).toBeNull()
+    expect(workflow.activeEvaluation).toBeNull()
+  })
 })

@@ -188,9 +188,13 @@ describe('Phase 5 active-evaluation coordination (store integration)', () => {
     const v1 = history.evaluations.find((row) => row.id === 'v1')
     workflow.activate(v1)
 
+    const guard = workflow.beginRequest({
+      tradeId: TRADE,
+      expectedEvaluationId: workflow.activeEvaluationId
+    })
     const prepared = await setup.prepare(TRADE, { evaluationId: workflow.activeEvaluationId })
     expect(prepared.evaluation.id).toBe('E2')
-    const adopted = workflow.adoptPreparedEvaluation('v1', prepared.evaluation)
+    const adopted = workflow.adoptPreparedEvaluation(guard, prepared.evaluation)
     expect(adopted).toBe(true)
     expect(workflow.activeEvaluationId).toBe('E2')
     // The replacement row now exists in history.
